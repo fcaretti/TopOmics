@@ -24,8 +24,11 @@ classifiers = [
 ]
 dependencies = [
   "anndata",
+  "muon",
+  "scanpy",
   # for debug logging (referenced from the issue template)
   "session-info2",
+  "torch",
 ]
 optional-dependencies.dev = [
   "pre-commit",
