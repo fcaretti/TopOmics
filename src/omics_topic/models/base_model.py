@@ -110,8 +110,8 @@ class BaseModel:
                 raise ValueError(f"Invalid modality key {k!r}. Must be a string.")
 
         # Define valid groups
-        rna_syn = {"rna", "genes", "transcripts"}
-        prot_syn = {"adt", "protein", "prot", "proteins"}
+        rna_syn = {"rna", "RNA", "genes", "transcripts"}
+        prot_syn = {"adt", "protein", "prot", "proteins", "proteomics"}
         chrom_syn = {"chromatin", "atac"}
 
         seen = set()

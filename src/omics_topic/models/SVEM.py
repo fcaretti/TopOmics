@@ -5,6 +5,7 @@ import math
 import muon as mu
 import torch
 from anndata import AnnData
+from scipy import sparse
 from torch import Tensor
 from torch.utils.data import DataLoader, TensorDataset
 from tqdm import tqdm
@@ -25,8 +26,8 @@ digamma = torch.digamma
 
 MOD_REG = {
     "rna": ("_gamma_poisson_init", "gamma_poisson"),
-    "prot": ("_gamma_poisson_init", "gamma_poisson"),
-    "atac": ("_dirichlet_init", "dirichlet_multinomial"),
+    "protein": ("_gamma_poisson_init", "gamma_poisson"),
+    "chromatin": ("_dirichlet_init", "dirichlet_multinomial"),
 }
 
 
@@ -82,30 +83,26 @@ class SVEM_LDA_Multi(BaseModel):
         self.alpha_scalar = alpha
         self.entropy_penalty = entropy_penalty
 
-        print(self.data_dict)
-
-        # ---------------- unpack data ----------------------------------
-        self.data_dict: dict[str, Tensor] = {}
-        """if isinstance(mdata, MuDataType):
-            for mod in mdata.mod.keys():
-                X = mdata[mod].X
-                if not isinstance(X, torch.Tensor):
-                    X = torch.tensor(X.A if hasattr(X, "A") else X)
-                self.data_dict[mod] = X.long()
-        else:  # dict input
-            for mod, X in mdata.items():
-                if not isinstance(X, torch.Tensor):
-                    X = torch.tensor(X.A if hasattr(X, "A") else X)
-                self.data_dict[mod] = X.long()"""
-
-        # self.modalities: List[str] = list(self.data_dict)
         # sanity: same number of cells across modalities
         n_cells_set = {v.shape[0] for v in self.data_dict.values()}
+
         if len(n_cells_set) != 1:
             raise ValueError("All modalities must share the same cells / order")
         self.C = n_cells_set.pop()
 
-        # ---------------- initialise per‑modality Γ‑params --------------
+        # Running SVEM requires torch
+        for mod, X in list(self.data_dict.items()):
+            if isinstance(X, torch.Tensor):
+                self.data_dict[mod] = X.long()
+                continue
+            if sparse.issparse(X):  # catches csr, csc, coo, …
+                X = torch.as_tensor(X.toarray())
+            else:
+                X = torch.as_tensor(X)
+
+            self.data_dict[mod] = X.long()  # keep counts as integers
+
+        # ---------------- initialise per‑modality gamma‑params --------------
         self.A: dict[str, Tensor] = {}
         self.B: dict[str, Tensor] = {}
         for mod in self.modalities:
@@ -119,7 +116,7 @@ class SVEM_LDA_Multi(BaseModel):
 
         self.mod_weights = dict.fromkeys(self.modalities, 1.0) if mod_weights is None else mod_weights
 
-        # ---------------- Dirichlet γ  (cells × K) ----------------------
+        # ---------------- Dirichlet gamma  (cells × K) ----------------------
         self.gamma = torch.full((self.C, self.K), alpha, device=self.device)
 
         # ---------------- DataLoader: concatenate features -------------
@@ -266,16 +263,12 @@ class SVEM_LDA_Multi(BaseModel):
                         w = self.mod_weights[mod]
                         elbo_epoch += w * (x_full * torch.log(rate.clamp(min=1e-8))).sum().item()
                         token_epoch += int((w * x_full).sum())
-                        """elbo_epoch += (x_full * torch.log(rate.clamp(min=1e-8))).sum().item()
-                        token_epoch += int(x_full.sum())"""
                     elif MOD_REG[mod][1] == "dirichlet_multinomial":
                         phi = self.A[mod] / self.A[mod].sum(1, keepdim=True)  # K × P
                         prob = theta @ phi  # B × P
                         w = self.mod_weights[mod]
                         elbo_epoch += w * (x_full * torch.log(prob.clamp(min=1e-8))).sum().item()
                         token_epoch += int((w * x_full).sum())
-                        """elbo_epoch += (x_full * torch.log(prob.clamp(min=1e-8))).sum().item()
-                        token_epoch += int(x_full.sum())"""
 
             if verbose:
                 ppl = math.exp(-elbo_epoch / max(token_epoch, 1))
