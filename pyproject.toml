@@ -31,7 +31,7 @@ dependencies = [
   "torch",
 ]
 optional-dependencies.amortized = [
-  "pyro",
+  "pyro-ppl",
   "scvi-tools",
 ]
 optional-dependencies.dev = [
