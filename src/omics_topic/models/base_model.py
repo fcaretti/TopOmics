@@ -1,4 +1,6 @@
 import muon as mu
+import numpy as np
+import pandas as pd
 import torch
 from anndata import AnnData
 
@@ -139,3 +141,99 @@ class BaseTopicModel:
             new_dict[std] = self.data_dict[orig]
         self.data_dict = new_dict
         self.modalities = list(self.data_dict.keys())
+
+    def get_cell_topic(self) -> np.ndarray:
+        """
+        Get the cell-topic matrix Θ (C × K).
+
+        Returns
+        -------
+        Θ : np.ndarray
+            Cell-topic matrix, where C is the number of cells and K is the number of topics.
+        """
+        raise NotImplementedError("This method should be overridden by subclasses.")
+
+    def get_feature_topic(self, modality: str) -> np.ndarray | pd.DataFrame:
+        """
+        Get the feature-topic matrix Φ (K × G).
+
+        Parameters
+        ----------
+        modality : str
+            The name of the modality for which to retrieve the feature-topic matrix.
+
+        Returns
+        -------
+        Φ : np.ndarray or pd.DataFrame
+            Feature-topic matrix, where K is the number of topics and G is the number of features.
+            If the modality has feature names, returns a DataFrame with those names.
+        """
+        raise NotImplementedError("This method should be overridden by subclasses.")
+
+    def cross_modality_score(
+        self,
+        mod_a: str,
+        mod_b: str,
+        *,
+        normalise: bool = True,
+        return_df: bool = True,
+    ) -> "np.ndarray | pd.DataFrame":
+        """
+        Compute SHARE-Topic–style cross-modal interaction matrix  P_{a,b}
+
+        Parameters
+        ----------
+        model      : fitted topic model with the two accessors above
+        mod_a      : modality name of *source* features  (e.g. 'rna')
+        mod_b      : modality name of *target* features  (e.g. 'chromatin')
+        normalise  : divide by global max so that scores ∈ [0,1]
+        return_df  : return a DataFrame (keeps feature names) instead of ndarray
+
+        Returns
+        -------
+        P  : shape (|feat_a| , |feat_b|) – interaction score between every
+            feature of `mod_a` and every feature of `mod_b`
+        """
+        # ------------------------------------------------------------------
+        # 1.  Pull matrices from the model
+        # ------------------------------------------------------------------
+        Θ = np.asarray(self.get_cell_topic())  # (C × K)
+        Φa = self.get_feature_topic(mod_a)  # (K × G_a)  — may be DataFrame
+        Φb = self.get_feature_topic(mod_b)  # (K × G_b)
+
+        # keep feature names if they exist
+        names_a = getattr(Φa, "columns", None)
+        names_b = getattr(Φb, "columns", None)
+
+        Φa = np.asarray(Φa, dtype=float)
+        Φb = np.asarray(Φb, dtype=float)
+
+        # ------------------------------------------------------------------
+        # 2.  Normalise across *topics* for every feature   (λ*, φ*)
+        # ------------------------------------------------------------------
+        Φa /= Φa.sum(axis=0, keepdims=True) + 1e-12
+        Φb /= Φb.sum(axis=0, keepdims=True) + 1e-12
+
+        # ------------------------------------------------------------------
+        # 3.  Average topic proportions across cells        ( s_t = 1/C Σ_c θ_ct )
+        # ------------------------------------------------------------------
+        Θ /= Θ.sum(axis=1, keepdims=True) + 1e-12  # θ*  (guarantees rows sum-to-1)
+        s_t = Θ.mean(axis=0)  # shape (K,)
+
+        # ------------------------------------------------------------------
+        # 4.  Interaction matrix         P_{a,b} = Σ_t λ*_ta  φ*_tb  s_t
+        #     → compute in two BLAS calls:   diag(s_t) · Φa  then   (Φa)^T · Φb
+        # ------------------------------------------------------------------
+        Φa_weighted = Φa * s_t[:, None]  # (K × G_a)
+        P = Φa_weighted.T @ Φb  # (G_a × G_b)
+
+        # ------------------------------------------------------------------
+        # 5.  Optional global-max normalisation
+        # ------------------------------------------------------------------
+        if normalise and P.max() > 0:
+            P /= P.max()
+
+        if return_df and (names_a is not None) and (names_b is not None):
+            P = pd.DataFrame(P, index=names_a, columns=names_b)
+
+        return P
