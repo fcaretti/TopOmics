@@ -1,17 +1,9 @@
 from __future__ import annotations
 
-# ---------------------------------------------------------------------
-# OPTIONAL shim: let the code import even if muon is not installed
-# ---------------------------------------------------------------------
-# ---------------------------------------------------------------------
-# standard libs / 3rd-party
-# ---------------------------------------------------------------------
 import pytest
 import torch
 from torch import Tensor
 
-# 🔧 <--- ADJUST THIS IMPORT TO YOUR PACKAGE LAYOUT --------------------
-# e.g. from my_pkg.models.svem_multi import SVEM_LDA_Multi
 from omics_topic.models import SVEM_LDA_Multi
 
 # ---------------------------------------------------------------------
