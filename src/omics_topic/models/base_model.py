@@ -5,7 +5,7 @@ from anndata import AnnData
 MuDataType = mu.MuData
 
 
-class BaseModel:
+class BaseTopicModel:
     """
     Base class for all models in the omics_topic package.
 

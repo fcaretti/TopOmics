@@ -10,7 +10,7 @@ from torch import Tensor
 from torch.utils.data import DataLoader, TensorDataset
 from tqdm import tqdm
 
-from .base_model import BaseModel
+from .base_model import BaseTopicModel
 
 MuDataType = mu.MuData  # type: ignore
 
@@ -32,7 +32,7 @@ MOD_REG = {
 
 
 # -----------------------------------------------------------------------------
-class SVEM_LDA_Multi(BaseModel):
+class SVEM_LDA_Multi(BaseTopicModel):
     """
     Stochastic Variational EM for MuData with shared topics across modalities.
 
