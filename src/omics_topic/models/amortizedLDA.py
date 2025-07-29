@@ -20,13 +20,15 @@ from scvi.utils import setup_anndata_dsp
 
 from omics_topic.module._amortizedLDA import MultimodalAmortizedLDAPyroModule
 
+from .base_model import BaseTopicModel
+
 if TYPE_CHECKING:
     from collections.abc import Sequence as _Seq
 
 logger = logging.getLogger(__name__)
 
 
-class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass):
+class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
     """
     **Multimodal Amortized LDA**
 
