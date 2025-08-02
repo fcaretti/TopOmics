@@ -142,7 +142,7 @@ class BaseTopicModel:
         self.data_dict = new_dict
         self.modalities = list(self.data_dict.keys())
 
-    def get_cell_topic(self) -> np.ndarray:
+    def get_cell_topic_dist(self) -> np.ndarray:
         """
         Get the cell-topic matrix Θ (C × K).
 
@@ -153,7 +153,7 @@ class BaseTopicModel:
         """
         raise NotImplementedError("This method should be overridden by subclasses.")
 
-    def get_feature_topic(self, modality: str) -> np.ndarray | pd.DataFrame:
+    def get_feature_topic_dist(self, modality: str) -> np.ndarray | pd.DataFrame:
         """
         Get the feature-topic matrix Φ (K × G).
 
@@ -197,9 +197,9 @@ class BaseTopicModel:
         # ------------------------------------------------------------------
         # 1.  Pull matrices from the model
         # ------------------------------------------------------------------
-        Θ = np.asarray(self.get_cell_topic())  # (C × K)
-        Φa = self.get_feature_topic(mod_a)  # (K × G_a)  — may be DataFrame
-        Φb = self.get_feature_topic(mod_b)  # (K × G_b)
+        Θ = np.asarray(self.get_cell_topic_dist())  # (C × K)
+        Φa = self.get_feature_topic_dist(mod_a)  # (K × G_a)  — may be DataFrame
+        Φb = self.get_feature_topic_dist(mod_b)  # (K × G_b)
 
         # keep feature names if they exist
         names_a = getattr(Φa, "columns", None)

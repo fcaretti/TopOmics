@@ -183,7 +183,7 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
     # ------------------------------------------------------------------ #
     #                         public helper methods                      #
     # ------------------------------------------------------------------ #
-    def get_feature_by_topic(
+    def get_feature_topic_dist(
         self, n_samples: int = 5_000, as_dict: bool = False
     ) -> dict[int, pd.DataFrame] | pd.DataFrame:
         """
@@ -244,6 +244,43 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
         theta = torch.cat(thetas).cpu().numpy()
 
         return pd.DataFrame(theta, index=adata.obs_names, columns=[f"topic_{k}" for k in range(theta.shape[1])])
+
+    def get_cell_topic_dist(
+        self,
+        adata: AnnData | None = None,
+        indices: _Seq[int] | None = None,
+        batch_size: int | None = None,
+        n_samples: int = 5_000,
+    ) -> np.ndarray:
+        """
+        Get the cell-topic matrix Θ (C × K).
+
+        Parameters
+        ----------
+        adata
+            AnnData object to use (default: self.adata).
+        indices
+            Subset of cells to use.
+        batch_size
+            Batch size for inference.
+        n_samples
+            Number of samples for Monte Carlo estimation.
+
+        Returns
+        -------
+        Θ : np.ndarray
+            Cell-topic matrix, where C is the number of cells and K is the number of topics.
+        """
+        self._check_if_trained(warn=False)
+        adata = self._validate_anndata(adata)
+        self.module.eval()
+        dl = self._make_data_loader(adata=adata, indices=indices, batch_size=batch_size)
+
+        thetas = []
+        for tensors in dl:
+            x = tensors[REGISTRY_KEYS.X_KEY]
+            thetas.append(self.module.get_topic_distribution(x, n_samples))
+        return torch.cat(thetas).cpu().numpy()
 
     # ------------------------------------------------------------------ #
     def _batch_library_tensor(self, x: torch.Tensor) -> torch.Tensor:
