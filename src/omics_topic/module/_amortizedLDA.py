@@ -327,6 +327,8 @@ class MultimodalAmortizedLDAPyroModule(PyroBaseModuleClass):
         n_hidden: int,
         cell_topic_prior: float | Sequence[float] | None = None,
         topic_feature_prior: float | Sequence[float] | None = None,
+        weight_mode: str = "equal",
+        max_n_obs: int | None = None,
     ):
         super().__init__()
         assert len(n_inputs_modalities) == len(likelihoods)
@@ -334,6 +336,8 @@ class MultimodalAmortizedLDAPyroModule(PyroBaseModuleClass):
         self.likelihoods = likelihoods
         self.n_topics = n_topics
         self.n_hidden = n_hidden
+        self.n_modalities = len(n_inputs_modalities)
+        self.weight_mode = weight_mode
 
         if cell_topic_prior is None:
             cell_topic_prior_tensor = torch.full((n_topics,), 1 / n_topics)
@@ -358,7 +362,13 @@ class MultimodalAmortizedLDAPyroModule(PyroBaseModuleClass):
             cell_topic_prior_tensor,
             topic_feature_priors,
         )
-        self._guide = MultimodalLDAPyroGuide(n_inputs_modalities, n_topics, n_hidden)
+        self._guide = MultimodalLDAPyroGuide(
+            n_inputs_modalities,
+            n_topics,
+            n_hidden,
+            weight_mode=weight_mode,
+            max_n_obs=max_n_obs,
+        )
 
         # We need this method so scvi training plan can create data-loader args
         def _args_from_batch(tdict):
