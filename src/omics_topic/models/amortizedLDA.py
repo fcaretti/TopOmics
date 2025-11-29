@@ -30,10 +30,12 @@ logger = logging.getLogger(__name__)
 
 class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
     """
-    **Multimodal Amortized LDA**
+    **Multimodal Amortized LDA with Mixture-of-Experts (MoE)**
 
     Extends :class:`scvi.model.AmortizedLDA` to *M* modalities with
-    modality-specific likelihoods (``"multinomial"`` or ``"gamma_poisson"``).
+    modality-specific encoders and likelihoods. Each modality is encoded
+    separately, and representations are mixed via weighted Gaussian combination
+    before inferring the shared cell-topic distribution θₙ.
 
     Parameters
     ----------
@@ -51,6 +53,18 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
         Dirichlet concentration for θₙ.  ``None`` ⇒ symmetric 1/K.
     topic_feature_prior
         Dirichlet concentration for each ϕₖ,ₘ.  ``None`` ⇒ symmetric 1/K.
+    weight_mode
+        How to weight modality-specific representations:
+        - ``"equal"``: All modalities weighted equally (default)
+        - ``"universal"``: Learn a single weight per modality
+        - ``"cell"``: Learn per-cell, per-modality weights
+
+    Notes
+    -----
+    The Mixture-of-Experts architecture processes each modality through a
+    separate encoder network, then combines their latent representations
+    using learned or fixed weights. This allows the model to handle
+    heterogeneous data types and missing modalities.
     ```
     """
 
@@ -68,7 +82,42 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
         n_hidden: int = 128,
         cell_topic_prior: float | Sequence[float] | None = None,
         topic_feature_prior: float | Sequence[float] | None = None,
+        modality_names: list[str] | None = None,
+        weight_mode: str = "equal",
     ):
+        """
+        Initialize MultimodalAmortizedLDA with Mixture-of-Experts (MoE) architecture.
+
+        Parameters
+        ----------
+        adata
+            AnnData with concatenated features (for scvi compatibility).
+        n_inputs_modalities
+            List of feature counts per modality.
+        likelihoods
+            List of likelihood strings per modality ("multinomial" or "gamma_poisson").
+        n_topics
+            Number of topics.
+        n_hidden
+            Hidden units in encoder networks.
+        cell_topic_prior
+            Dirichlet concentration for θₙ.
+        topic_feature_prior
+            Dirichlet concentration for ϕₖ,ₘ.
+        modality_names
+            Optional list of modality names (e.g., ["rna", "protein"]). If None, uses indices.
+        weight_mode
+            How to weight modality-specific representations when mixing:
+            - "equal": All modalities weighted equally (default, simplest)
+            - "universal": Learn a single weight per modality across all cells
+            - "cell": Learn per-cell, per-modality weights (most flexible)
+
+        Notes
+        -----
+        The model uses Mixture-of-Experts architecture where each modality is encoded
+        separately and then mixed via weighted Gaussian combination before sampling
+        the shared cell-topic distribution θₙ.
+        """
         pyro.clear_param_store()
         super().__init__(adata)
 
@@ -81,6 +130,29 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
                 f"(got {sum(n_inputs_modalities)} vs {self.summary_stats.n_vars})"
             )
 
+        # Validate weight_mode
+        valid_modes = {"equal", "universal", "cell"}
+        if weight_mode not in valid_modes:
+            raise ValueError(f"weight_mode must be one of {valid_modes}, got '{weight_mode}'")
+
+        # Store modality information
+        self.n_modalities = len(n_inputs_modalities)
+        self.n_inputs_modalities = n_inputs_modalities
+        self.likelihoods = likelihoods
+        self.modality_names = modality_names if modality_names is not None else [str(i) for i in range(self.n_modalities)]
+        self.weight_mode = weight_mode
+
+        # Inform user about the MoE architecture
+        if self.n_modalities > 1:
+            logger.info(
+                f"Using {self.n_modalities} modalities with Mixture-of-Experts (MoE) architecture. "
+                f"Weight mode: '{weight_mode}'. Each modality is encoded separately and mixed via "
+                "weighted Gaussian combination."
+            )
+
+        # Determine max_n_obs for cell-specific weights
+        max_n_obs = self.summary_stats.n_cells if weight_mode == "cell" else None
+
         self.module = self._module_cls(
             n_inputs_modalities=n_inputs_modalities,
             likelihoods=likelihoods,
@@ -88,8 +160,9 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
             n_hidden=n_hidden,
             cell_topic_prior=cell_topic_prior,
             topic_feature_prior=topic_feature_prior,
+            weight_mode=weight_mode,
+            max_n_obs=max_n_obs,
         )
-        self.n_modalities = len(n_inputs_modalities)
         self.init_params_ = self._get_init_params(locals())
 
     # ------------------------------------------------------------------ #
@@ -125,24 +198,77 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
         modality_order: list[str] | None = None,
         layer_dict: dict[str, str] | None = None,
         **kwargs,
-    ) -> tuple[AnnData, list[int]]:
+    ) -> tuple[MuData, list[str], list[int]]:
         """
-        Flatten *mdata* into a single AnnData.
+        Setup MuData for multimodal AmortizedLDA.
 
-        Register it with
-        ``cls.setup_anndata`` **and return it** so the user can pass it
-        straight into the constructor.
+        This method stores modality metadata in ``mdata.uns`` and prepares
+        the data for the model without concatenating features.
 
-        Stores helper metadata in
-        ``mdata.uns`` (feature counts, flattened AnnData reference).
+        Parameters
+        ----------
+        mdata
+            MuData object containing multiple modalities.
+        modality_order
+            Order of modalities to use. If None, uses all modalities in mdata.mod.keys().
+        layer_dict
+            Dictionary mapping modality names to layer names to use for each modality.
+        **kwargs
+            Additional arguments passed to setup_anndata.
+
+        Returns
+        -------
+        mdata
+            The input MuData object with metadata stored in .uns.
+        modality_names
+            List of modality names in the order they will be processed.
+        feat_counts
+            List of feature counts per modality.
+
+        Notes
+        -----
+        This is a new implementation that does NOT concatenate features.
+        Modality-specific data is kept separate for MoE/PoE architecture.
         """
-        adata_flat, feat_counts = mudata_to_concat_adata(mdata, modality_order)
-        mdata.uns["_feat_counts"] = feat_counts
+        if modality_order is None:
+            modality_order = list(mdata.mod.keys())
+
+        feat_counts = []
+        modality_names = []
+
+        # Validate modalities and collect feature counts
+        n_cells_ref = mdata.n_obs
+        for mod in modality_order:
+            if mod not in mdata.mod:
+                raise ValueError(f"Modality '{mod}' not found in MuData. Available: {list(mdata.mod.keys())}")
+
+            adata_mod = mdata.mod[mod]
+            if adata_mod.n_obs != n_cells_ref:
+                raise ValueError(
+                    f"Modality '{mod}' has {adata_mod.n_obs} cells, "
+                    f"but MuData has {n_cells_ref} cells. All modalities must be aligned."
+                )
+
+            feat_counts.append(adata_mod.n_vars)
+            modality_names.append(mod)
+
+        # Store metadata in mdata.uns for later retrieval
+        mdata.uns["_multimodal_setup"] = {
+            "modality_order": modality_names,
+            "feat_counts": feat_counts,
+            "layer_dict": layer_dict or {},
+            "setup_method": "separate_modalities",  # Flag for new implementation
+        }
+
+        # For now, we still need to create a concatenated AnnData for scvi registration
+        # but we'll store the modality information for the module to use
+        adata_flat, _ = mudata_to_concat_adata(mdata, modality_order)
         mdata.uns["_flattened_ann_data"] = adata_flat
 
-        # the usual registration — you may pass `layer_dict` if you want
+        # Register with scvi
         cls.setup_anndata(adata_flat, layer=layer_dict.get("rna") if layer_dict else None, **kwargs)
-        return adata_flat, feat_counts
+
+        return mdata, modality_names, feat_counts
 
     # -- one-shot convenience (exactly like MultiVI) -------------
     @classmethod
@@ -154,31 +280,70 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
         **model_kwargs,
     ):
         """
-        High-level constructor::
+        High-level constructor for multimodal AmortizedLDA from MuData.
 
-            model = MultimodalAmortizedLDA.from_mudata(
-                        mdata,
-                        modality_order=["rna", "protein", "atac"],
-                        layer_dict={"rna": "counts", "protein": "counts"},
-                        n_topics=10,
-                        ...
-                    )
+        Parameters
+        ----------
+        mdata
+            MuData object containing multiple modalities.
+        modality_order
+            Order of modalities to use. If None, uses all modalities in mdata.mod.keys().
+        layer_dict
+            Dictionary mapping modality names to layer names to use for each modality.
+        **model_kwargs
+            Additional arguments passed to the model constructor.
+            Common arguments include:
+            - n_topics: Number of topics (default: 20)
+            - n_hidden: Hidden units in encoders (default: 128)
+            - weight_mode: "equal", "universal", or "cell" (default: "equal")
+            - likelihoods: List of likelihoods per modality (auto-inferred if not provided)
+
+        Returns
+        -------
+        model
+            Instance of MultimodalAmortizedLDA.
+
+        Examples
+        --------
+        >>> # Equal weighting (default MoE)
+        >>> model = MultimodalAmortizedLDA.from_mudata(
+        ...     mdata,
+        ...     modality_order=["rna", "protein"],
+        ...     n_topics=10,
+        ...     n_hidden=128
+        ... )
+        >>>
+        >>> # With learned universal weights
+        >>> model = MultimodalAmortizedLDA.from_mudata(
+        ...     mdata,
+        ...     modality_order=["rna", "protein"],
+        ...     n_topics=10,
+        ...     weight_mode="universal"
+        ... )
         """
         if modality_order is None:
             modality_order = list(mdata.mod.keys())
 
-        adata_flat, feat_counts = cls.setup_mudata(
+        mdata, modality_names, feat_counts = cls.setup_mudata(
             mdata,
             modality_order=modality_order,
             layer_dict=layer_dict,
         )
 
-        # infer default likelihoods if the caller didn’t pass them
+        # infer default likelihoods if the caller didn't pass them
         if "likelihoods" not in model_kwargs:
-            default_like = ["gamma_poisson" if mod == "rna" else "multinomial" for mod in modality_order]
+            default_like = ["gamma_poisson" if mod == "rna" else "multinomial" for mod in modality_names]
             model_kwargs["likelihoods"] = default_like
 
-        return cls(adata_flat, n_inputs_modalities=feat_counts, **model_kwargs)
+        # Get the flattened AnnData for scvi compatibility
+        adata_flat = mdata.uns["_flattened_ann_data"]
+
+        return cls(
+            adata_flat,
+            n_inputs_modalities=feat_counts,
+            modality_names=modality_names,
+            **model_kwargs
+        )
 
     # ------------------------------------------------------------------ #
     #                         public helper methods                      #
