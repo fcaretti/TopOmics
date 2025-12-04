@@ -2076,16 +2076,14 @@ dependencies = [
     { name = "anndata" },
     { name = "muon" },
     { name = "numpy" },
+    { name = "pyro-ppl" },
     { name = "scanpy" },
+    { name = "scvi-tools" },
     { name = "session-info2" },
     { name = "torch" },
 ]
 
 [package.optional-dependencies]
-amortized = [
-    { name = "pyro-ppl" },
-    { name = "scvi-tools" },
-]
 dev = [
     { name = "pre-commit" },
     { name = "twine" },
@@ -2122,10 +2120,10 @@ requires-dist = [
     { name = "numpy", specifier = ">=1.24,<2.3" },
     { name = "pandas", marker = "extra == 'doc'" },
     { name = "pre-commit", marker = "extra == 'dev'" },
-    { name = "pyro-ppl", marker = "extra == 'amortized'" },
+    { name = "pyro-ppl" },
     { name = "pytest", marker = "extra == 'test'" },
     { name = "scanpy", specifier = ">=1.9.8" },
-    { name = "scvi-tools", marker = "extra == 'amortized'" },
+    { name = "scvi-tools" },
     { name = "session-info2" },
     { name = "setuptools", marker = "extra == 'doc'" },
     { name = "sphinx", marker = "extra == 'doc'", specifier = ">=8.1" },
@@ -2138,7 +2136,7 @@ requires-dist = [
     { name = "torch" },
     { name = "twine", marker = "extra == 'dev'", specifier = ">=4.0.2" },
 ]
-provides-extras = ["amortized", "dev", "doc", "test"]
+provides-extras = ["dev", "doc", "test"]
 
 [[package]]
 name = "opt-einsum"
