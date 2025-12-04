@@ -34,13 +34,23 @@ pip install omics-topic
 pip install git+https://github.com/fcaretti/omics-topic.git@main
 ```
 
+Or even better, download, activate your environment, enter the repo and then run
+```bash
+pip install -e .'[spatial, amortized, test, docs]'
+```
+or a subset of these if you prefer a lighter installation.
+
+## Suggest changes
+
+For now, simply add points or subpoints to ROADMAP.md.
+
 ## Release notes
 
 See the [changelog][].
 
 ## Contact
 
-For questions and help requests, you can reach out in the [scverse discourse][].
+For questions and help requests, you can reach out.
 If you found a bug, please use the [issue tracker][].
 
 ## Citation
