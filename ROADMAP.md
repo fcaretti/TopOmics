@@ -15,9 +15,17 @@ So basically every model is going to inherit the class BaseTopicModel, that cont
   - [ ] Test on the same datasets of SHARE-Topic
 - [ ] Implement evaluation metrics
 - [ ] Add support for spatial data in AmortizedLDA
-  - [ ] Make it check if a connectivity graph is present
-  - [ ] Implement GCN encoder
-  - [ ] Implement function to get topic x location/coordinate
+  - [ ] Add `attach_spatial_graph` + `validate_spatial_graph` helpers in `src/omics_topic/pp/spatial.py` to pick a user-provided obsp key (per-modality or global), confirm shapes, and persist metadata (`metric`, `k`, `directed`, `key`) assuming Scanpy already produced the graph
+  - [X] Update `MultimodalAmortizedLDA.setup_anndata/setup_mudata/from_mudata` in `src/omics_topic/models/amortizedLDA.py` to accept `spatial_key`/`spatial_modality_keys`, call the helper, and store resolved graph + metadata in `adata.uns` / `mdata.uns`
+  - [X] Let `MultimodalAmortizedLDA.__init__` (same file) pick up the stored graph handle and propagate adjacency to the Pyro module; error if the requested `spatial_key` is missing
+  - [X] Add GCN encoder branch in `MultimodalLDAPyroGuide` (in `src/omics_topic/module/_amortizedLDA.py`) that is automatically used when spatial graphs are present (no user flag), otherwise fall back to MLP encoders
+  - [ ] Convert stored CSR adjacency from `adata.uns["_spatial_graph"]` / `["_spatial_graphs"]` into device-ready `edge_index` (+ weights) tensors for the guide; support modality-specific graphs
+  - [ ] Ensure the data loader / guide path passes adjacency to the GCN (full-batch or documented constraint) and raises if spatial graph is missing when required
+  - [X] Add dependency handling for GCN backend (`torch_geometric` or minimal torch-sparse stack) under the spatial extra in `pyproject.toml`
+  - [X] Add tests for GCN path (toy graph)
+  - [ ] Implement `get_topic_by_location` (in `MultimodalAmortizedLDA`, same file) to aggregate θ over spatial neighborhoods or coordinates using the chosen `spatial_key`
+  - [ ] Add unit tests in `tests/test_spatial_graph.py` covering helper validation, key selection for AnnData/MuData, and end-to-end model init with a stub adjacency
+  - [ ] Add entropy term to avoid topic collapse
 - [ ] Implement different distribution choices
   - [ ] Standard Gamma-Poisson
   - [ ] Standard Dirichlet

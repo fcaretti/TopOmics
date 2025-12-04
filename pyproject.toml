@@ -39,6 +39,7 @@ spatial = [
   "spatialdata>=0.6.1",
   "squidpy>=1.6.6",
   "spatialdata-plot>=0.2.13",
+  "torch-geometric",
 ]
 optional-dependencies.dev = [
   "pre-commit",
