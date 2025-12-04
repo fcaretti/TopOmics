@@ -26,6 +26,7 @@ So basically every model is going to inherit the class BaseTopicModel, that cont
   - [ ] Implement `get_topic_by_location` (in `MultimodalAmortizedLDA`, same file) to aggregate θ over spatial neighborhoods or coordinates using the chosen `spatial_key`
   - [ ] **Add entropy term to avoid topic collapse**
   - [ ] **Implement train/test set in the presence of graph (semi-supervised learning)**
+  - [ ] **Add library size param in Gamma-Poisson**
 - [ ] Implement different distribution choices
   - [X] Standard Gamma-Poisson
   - [X] Standard Dirichlet
