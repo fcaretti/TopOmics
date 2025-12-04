@@ -15,6 +15,8 @@ class BaseTopicModel:
     It can be extended by specific model implementations.
     """
 
+    spatial: bool = False  # set True when spatial connectivities are provided
+
     def __init__(
         self,
         mdata: MuDataType | dict[str, AnnData] | list[AnnData] | AnnData,
@@ -31,10 +33,11 @@ class BaseTopicModel:
                 - single AnnData object (requires `modalities`).
             modalities: Names corresponding to each AnnData in a list input.
         Initializes:
-            - `self.data_dict`: Dictionary mapping modality names to tensors.
-            - `self.modalities`: List of modality names.
-            - `self.n_cells`: Number of cells (assumed to be the same across modalities).
+                - `self.data_dict`: Dictionary mapping modality names to tensors.
+                - `self.modalities`: List of modality names.
+                - `self.n_cells`: Number of cells (assumed to be the same across modalities).
         """
+        self.spatial = False
         self.check_input(mdata, modalities)
 
         self.check_modalities_names()

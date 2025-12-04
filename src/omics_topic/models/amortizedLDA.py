@@ -28,6 +28,71 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _resolve_spatial_graph_from_adata(adata: AnnData, spatial_key: str | None):
+    """
+    Fetch a precomputed spatial graph from ``adata.obsp`` when provided.
+
+    Assumes Scanpy already built the graph; we only check basic shape alignment.
+    """
+    if spatial_key is None:
+        return None
+    if spatial_key not in adata.obsp:
+        raise KeyError(f"spatial_key '{spatial_key}' not found in adata.obsp")
+
+    graph = adata.obsp[spatial_key]
+    if graph.shape != (adata.n_obs, adata.n_obs):
+        raise ValueError(
+            f"Spatial graph at obsp['{spatial_key}'] has shape {graph.shape}, expected ({adata.n_obs}, {adata.n_obs})"
+        )
+    return {"adjacency": graph, "key": spatial_key}
+
+
+def _normalize_to_torch_sparse(adj) -> torch.Tensor:
+    """Convert (and normalise) a CSR/COO adjacency to torch sparse with self-loops."""
+    if sp.issparse(adj):
+        coo = adj.tocoo()
+    else:
+        coo = sp.coo_matrix(adj)
+
+    # add self-loops
+    coo = (coo + sp.eye(coo.shape[0], format="coo")).tocoo()
+    row, col, data = coo.row, coo.col, coo.data
+    deg = np.asarray(coo.sum(axis=1)).flatten()
+    deg[deg == 0] = 1.0
+    norm = 1.0 / np.sqrt(deg)
+    norm_data = data * norm[row] * norm[col]
+
+    indices = torch.tensor(np.vstack([row, col]), dtype=torch.long)
+    values = torch.tensor(norm_data, dtype=torch.float32)
+    return torch.sparse_coo_tensor(indices, values, size=coo.shape).coalesce()
+
+
+def _prepare_adjacency_tensors(spatial_uns, modality_names: list[str] | None = None):
+    """Build torch sparse adjacency tensor(s) from stored spatial graph metadata."""
+    if spatial_uns is None:
+        return None
+
+    def convert(entry):
+        adj = entry.get("adjacency")
+        if adj is None:
+            raise ValueError("Spatial graph entry missing 'adjacency'.")
+        return _normalize_to_torch_sparse(adj)
+
+    if isinstance(spatial_uns, dict) and "adjacency" in spatial_uns:
+        return convert(spatial_uns)
+
+    if not isinstance(spatial_uns, dict):
+        raise ValueError("Expected spatial graph metadata as dict or mapping.")
+
+    order = modality_names or list(spatial_uns.keys())
+    tensors = []
+    for mod in order:
+        if mod not in spatial_uns:
+            continue
+        tensors.append(convert(spatial_uns[mod]))
+    return tensors if tensors else None
+
+
 class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
     """
     **Multimodal Amortized LDA with Mixture-of-Experts (MoE)**
@@ -121,6 +186,13 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
         pyro.clear_param_store()
         super().__init__(adata)
 
+        # Resolve spatial metadata early so module/guide can consume it
+        spatial_uns = self.adata.uns.get("_spatial_graph") or self.adata.uns.get("_spatial_graphs")
+        self.spatial = bool(spatial_uns)
+        # Modality names are established once we know modality count (below); set a placeholder here
+        modality_names = modality_names if modality_names is not None else []
+        adjacency = None
+
         if len(n_inputs_modalities) != len(likelihoods):
             raise ValueError("`n_inputs_modalities` and `likelihoods` must be same length")
 
@@ -139,8 +211,11 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
         self.n_modalities = len(n_inputs_modalities)
         self.n_inputs_modalities = n_inputs_modalities
         self.likelihoods = likelihoods
-        self.modality_names = modality_names if modality_names is not None else [str(i) for i in range(self.n_modalities)]
+        self.modality_names = modality_names if modality_names else [str(i) for i in range(self.n_modalities)]
         self.weight_mode = weight_mode
+
+        if self.spatial:
+            adjacency = _prepare_adjacency_tensors(spatial_uns, self.modality_names)
 
         # Inform user about the MoE architecture
         if self.n_modalities > 1:
@@ -162,8 +237,19 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
             topic_feature_prior=topic_feature_prior,
             weight_mode=weight_mode,
             max_n_obs=max_n_obs,
+            spatial=self.spatial,
+            adjacency=adjacency,
         )
         self.init_params_ = self._get_init_params(locals())
+
+        if self.spatial:
+            if isinstance(spatial_uns, dict) and "adjacency" in spatial_uns:
+                keys_info = spatial_uns.get("key")
+            elif isinstance(spatial_uns, dict):
+                keys_info = list(spatial_uns.keys())
+            else:
+                keys_info = spatial_uns
+            logger.info("Spatial graph provided (keys: %s); GCN encoder path enabled.", keys_info)
 
     # ------------------------------------------------------------------ #
     #                            anndata setup                           #
@@ -174,6 +260,7 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
         cls,
         adata: AnnData,
         layer: str | None = None,
+        spatial_key: str | None = None,
         **kwargs,
     ):
         """%(summary)s.
@@ -182,7 +269,17 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
         ----------
         %(param_adata)s
         %(param_layer)s
+        spatial_key
+            Optional key in ``adata.obsp`` pointing to a precomputed spatial graph.
         """
+        spatial_info = _resolve_spatial_graph_from_adata(adata, spatial_key)
+        if spatial_info is not None:
+            adata.uns["_spatial_graph"] = spatial_info
+            logger.info(
+                "Spatial graph provided via obsp['%s']; GCN encoder not implemented yet, graph will be ignored.",
+                spatial_key,
+            )
+
         setup_args = cls._get_setup_method_args(**locals())
         adata_manager = AnnDataManager(
             fields=[LayerField(REGISTRY_KEYS.X_KEY, layer, is_count_data=True)],
@@ -197,6 +294,8 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
         mdata: MuData,
         modality_order: list[str] | None = None,
         layer_dict: dict[str, str] | None = None,
+        spatial_key: str | None = None,
+        spatial_modality_keys: dict[str, str] | None = None,
         **kwargs,
     ) -> tuple[MuData, list[str], list[int]]:
         """
@@ -213,6 +312,10 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
             Order of modalities to use. If None, uses all modalities in mdata.mod.keys().
         layer_dict
             Dictionary mapping modality names to layer names to use for each modality.
+        spatial_key
+            Single obsp key applied to all modalities (if spatial_modality_keys is not provided).
+        spatial_modality_keys
+            Mapping of modality -> obsp key for modality-specific spatial graphs.
         **kwargs
             Additional arguments passed to setup_anndata.
 
@@ -235,6 +338,7 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
 
         feat_counts = []
         modality_names = []
+        spatial_graphs: dict[str, dict[str, object]] = {}
 
         # Validate modalities and collect feature counts
         n_cells_ref = mdata.n_obs
@@ -252,6 +356,11 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
             feat_counts.append(adata_mod.n_vars)
             modality_names.append(mod)
 
+            key_for_mod = (spatial_modality_keys or {}).get(mod, spatial_key)
+            spatial_info = _resolve_spatial_graph_from_adata(adata_mod, key_for_mod)
+            if spatial_info is not None:
+                spatial_graphs[mod] = spatial_info
+
         # Store metadata in mdata.uns for later retrieval
         mdata.uns["_multimodal_setup"] = {
             "modality_order": modality_names,
@@ -259,14 +368,27 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
             "layer_dict": layer_dict or {},
             "setup_method": "separate_modalities",  # Flag for new implementation
         }
+        if spatial_graphs:
+            mdata.uns["_spatial_graphs"] = spatial_graphs
 
         # For now, we still need to create a concatenated AnnData for scvi registration
         # but we'll store the modality information for the module to use
         adata_flat, _ = mudata_to_concat_adata(mdata, modality_order)
         mdata.uns["_flattened_ann_data"] = adata_flat
+        if spatial_graphs:
+            adata_flat.uns["_spatial_graphs"] = spatial_graphs
+            logger.info(
+                "Spatial graph(s) provided (keys: %s); GCN encoder not implemented yet, graph will be ignored.",
+                list(spatial_graphs.keys()),
+            )
 
         # Register with scvi
-        cls.setup_anndata(adata_flat, layer=layer_dict.get("rna") if layer_dict else None, **kwargs)
+        cls.setup_anndata(
+            adata_flat,
+            layer=layer_dict.get("rna") if layer_dict else None,
+            spatial_key=None,
+            **kwargs,
+        )
 
         return mdata, modality_names, feat_counts
 
@@ -277,6 +399,8 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
         mdata: MuData,
         modality_order: list[str] | None = None,
         layer_dict: dict[str, str] | None = None,
+        spatial_key: str | None = None,
+        spatial_modality_keys: dict[str, str] | None = None,
         **model_kwargs,
     ):
         """
@@ -290,6 +414,10 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
             Order of modalities to use. If None, uses all modalities in mdata.mod.keys().
         layer_dict
             Dictionary mapping modality names to layer names to use for each modality.
+        spatial_key
+            Single obsp key applied to all modalities (if spatial_modality_keys is not provided).
+        spatial_modality_keys
+            Mapping of modality -> obsp key for modality-specific spatial graphs.
         **model_kwargs
             Additional arguments passed to the model constructor.
             Common arguments include:
@@ -328,6 +456,8 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
             mdata,
             modality_order=modality_order,
             layer_dict=layer_dict,
+            spatial_key=spatial_key,
+            spatial_modality_keys=spatial_modality_keys,
         )
 
         # infer default likelihoods if the caller didn't pass them

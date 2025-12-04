@@ -30,6 +30,7 @@ from collections.abc import Sequence
 import pyro
 import pyro.distributions as dist
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from pyro import poutine
 from pyro.infer import Trace_ELBO
@@ -57,6 +58,38 @@ def masked_softmax(weights: torch.Tensor, mask: torch.Tensor, dim: int = 0):
     """Softmax **ignoring** masked entries (mask == 0)."""
     weights = weights.masked_fill(~mask.bool(), -1e9)
     return torch.softmax(weights, dim=dim)
+
+
+class GraphConv(nn.Module):
+    """Lightweight graph convolution using a pre-normalised sparse adjacency."""
+
+    def __init__(self, in_features: int, out_features: int) -> None:
+        super().__init__()
+        self.linear = nn.Linear(in_features, out_features)
+
+    def forward(self, x: torch.Tensor, adj: torch.Tensor) -> torch.Tensor:
+        support = self.linear(x)
+        if support.shape[0] != adj.shape[0]:
+            raise ValueError(f"Adjacency nodes ({adj.shape[0]}) must match batch rows ({support.shape[0]}).")
+        if adj.is_sparse:
+            return torch.sparse.mm(adj, support)
+        return adj @ support
+
+
+class GCNEncoder(nn.Module):
+    """Two-layer GCN encoder producing a Gaussian posterior."""
+
+    def __init__(self, n_in: int, n_topics: int, n_hidden: int) -> None:
+        super().__init__()
+        self.conv1 = GraphConv(n_in, n_hidden)
+        self.conv2 = GraphConv(n_hidden, 2 * n_topics)
+
+    def forward(self, x: torch.Tensor, adj: torch.Tensor):
+        h = F.relu(self.conv1(x, adj))
+        h = self.conv2(h, adj)
+        mu, raw_scale = h.chunk(2, dim=-1)
+        scale = F.softplus(raw_scale) + 1e-4
+        return dist.Normal(mu, scale), None
 
 
 class CategoricalBoW(dist.Multinomial):
@@ -204,11 +237,14 @@ class MultimodalLDAPyroGuide(PyroModule):
         n_hidden: int,
         weight_mode: str = "equal",
         max_n_obs: int | None = None,
+        spatial: bool = False,
+        adjacency: torch.Tensor | Sequence[torch.Tensor] | None = None,
     ) -> None:
         super().__init__("multimodal_lda_guide")
         self.n_modalities = len(n_inputs_modalities)
         self.n_inputs_modalities = n_inputs_modalities
         self.n_topics = n_topics
+        self.use_gcn = spatial
 
         self.encoders = torch.nn.ModuleList(
             [
@@ -216,6 +252,17 @@ class MultimodalLDAPyroGuide(PyroModule):
                 for n_in in n_inputs_modalities
             ]
         )
+        if self.use_gcn:
+            if adjacency is None:
+                raise ValueError("GCN encoder requested (spatial=True) but no adjacency was provided.")
+            self.gcn_encoders = torch.nn.ModuleList(
+                [GCNEncoder(n_in, n_topics, n_hidden) for n_in in n_inputs_modalities]
+            )
+            # Store adjacency per modality or shared
+            self.adjacency = adjacency
+        else:
+            self.gcn_encoders = None
+            self.adjacency = None
 
         # per-modality topic-feature posterior params
         self.topic_feature_posterior_mu = torch.nn.ParameterList()
@@ -298,8 +345,12 @@ class MultimodalLDAPyroGuide(PyroModule):
         # θₙ variational
         xs = torch.split(x, self.n_inputs_modalities, dim=1)  # (B,Fₘ)
         mus, vars_, masks = [], [], []
-        for enc, x_m in zip(self.encoders, xs, strict=False):
-            q_m, _ = enc(x_m)  # q(z|x)
+        for idx, (enc, x_m) in enumerate(zip(self.encoders, xs, strict=False)):
+            if self.use_gcn:
+                adj = self._get_adjacency(idx, device=x.device, expected_n=B)
+                q_m, _ = self.gcn_encoders[idx](x_m, adj)  # q(z|x, A)
+            else:
+                q_m, _ = enc(x_m)  # q(z|x)
             mus.append(q_m.loc)
             vars_.append(q_m.scale**2)
             masks.append((x_m.sum(1) > 0).float())
@@ -311,6 +362,17 @@ class MultimodalLDAPyroGuide(PyroModule):
 
         with pyro.plate("cells", size=n_obs or self.n_obs, subsample_size=B), poutine.scale(None, kl_weight):
             pyro.sample("log_cell_topic_dist", dist.Normal(muθ, torch.sqrt(varθ)).to_event(1))
+
+    def _get_adjacency(self, idx: int, device: torch.device, expected_n: int) -> torch.Tensor:
+        if self.adjacency is None:
+            raise ValueError("Adjacency not set on guide but GCN path was requested.")
+        adj = self.adjacency[idx] if isinstance(self.adjacency, (list, tuple)) else self.adjacency
+        adj = adj.to(device)
+        if adj.shape[0] != expected_n:
+            raise ValueError(
+                f"GCN encoder requires full-batch adjacency of shape ({expected_n}, {expected_n}); got {adj.shape}."
+            )
+        return adj
 
 
 # --------------------------------------------------------------------------------------------------
@@ -329,6 +391,8 @@ class MultimodalAmortizedLDAPyroModule(PyroBaseModuleClass):
         topic_feature_prior: float | Sequence[float] | None = None,
         weight_mode: str = "equal",
         max_n_obs: int | None = None,
+        spatial: bool = False,
+        adjacency: torch.Tensor | Sequence[torch.Tensor] | None = None,
     ):
         super().__init__()
         assert len(n_inputs_modalities) == len(likelihoods)
@@ -338,6 +402,7 @@ class MultimodalAmortizedLDAPyroModule(PyroBaseModuleClass):
         self.n_hidden = n_hidden
         self.n_modalities = len(n_inputs_modalities)
         self.weight_mode = weight_mode
+        self.spatial = spatial
 
         if cell_topic_prior is None:
             cell_topic_prior_tensor = torch.full((n_topics,), 1 / n_topics)
@@ -368,6 +433,8 @@ class MultimodalAmortizedLDAPyroModule(PyroBaseModuleClass):
             n_hidden,
             weight_mode=weight_mode,
             max_n_obs=max_n_obs,
+            spatial=spatial,
+            adjacency=adjacency,
         )
 
         # We need this method so scvi training plan can create data-loader args
@@ -414,8 +481,12 @@ class MultimodalAmortizedLDAPyroModule(PyroBaseModuleClass):
         xs = torch.split(x, self.model.n_inputs_modalities, dim=1)
         # run encoders
         mus, vars_, masks = [], [], []
-        for enc, x_m in zip(self.guide.encoders, xs, strict=False):
-            q_m, _ = enc(x_m)
+        for idx, (enc, x_m) in enumerate(zip(self.guide.encoders, xs, strict=False)):
+            if self.guide.use_gcn:
+                adj = self.guide._get_adjacency(idx, device=x.device, expected_n=B)
+                q_m, _ = self.guide.gcn_encoders[idx](x_m, adj)
+            else:
+                q_m, _ = enc(x_m)
             mus.append(q_m.loc)
             vars_.append(q_m.scale**2)
             masks.append((x_m.sum(1) > 0).float())
