@@ -436,29 +436,6 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
             - n_hidden: Hidden units in encoders (default: 128)
             - weight_mode: "equal", "universal", or "cell" (default: "equal")
             - likelihoods: List of likelihoods per modality (auto-inferred if not provided)
-
-        Returns
-        -------
-        model
-            Instance of MultimodalAmortizedLDA.
-
-        Examples
-        --------
-        >>> # Equal weighting (default MoE)
-        >>> model = MultimodalAmortizedLDA.from_mudata(
-        ...     mdata,
-        ...     modality_order=["rna", "protein"],
-        ...     n_topics=10,
-        ...     n_hidden=128
-        ... )
-        >>>
-        >>> # With learned universal weights
-        >>> model = MultimodalAmortizedLDA.from_mudata(
-        ...     mdata,
-        ...     modality_order=["rna", "protein"],
-        ...     n_topics=10,
-        ...     weight_mode="universal"
-        ... )
         """
         if modality_order is None:
             modality_order = list(mdata.mod.keys())
@@ -484,6 +461,154 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
             n_inputs_modalities=feat_counts,
             modality_names=modality_names,
             **model_kwargs
+        )
+
+    # -- universal constructor with type detection -------------
+    @classmethod
+    def from_data(
+        cls,
+        data,  # AnnData | MuData | SpatialData | dict[str, AnnData]
+        modalities: list[str] | None = None,
+        layers: dict[str, str | None] | str | None = None,
+        spatial_keys: dict[str, str] | str | None = None,
+        table_key: str = "table",  # for SpatialData only
+        **model_kwargs,
+    ):
+        """
+        Universal constructor with automatic type detection.
+
+        Automatically detects input type and routes to appropriate preprocessing.
+        This is the recommended way to create a model with flexible data input.
+
+        Parameters
+        ----------
+        data
+            Input data - can be:
+            - AnnData: Single or concatenated modalities
+            - MuData: Multiple modalities
+            - SpatialData: Spatial omics data
+            - dict[str, AnnData]: Dictionary mapping modality names to AnnData
+        modalities : list[str] | None
+            Modalities to use. For MuData/SpatialData, subset selection.
+            For AnnData, provide single modality name (default: "rna").
+            For dict, uses dict keys if None.
+        layers : dict[str, str | None] | str | None
+            Layer specification:
+            - dict: Per-modality layers {"rna": "counts", "protein": None}
+            - str: Same layer for all modalities
+            - None: Use .X for all
+        spatial_keys : dict[str, str] | str | None
+            Spatial graph keys in .obsp:
+            - dict: Per-modality spatial keys
+            - str: Same key for all modalities
+            - None: No spatial data
+        table_key : str
+            For SpatialData only: which table to use (default: "table")
+        **model_kwargs
+            Additional arguments passed to model constructor:
+            - n_topics: Number of topics (required)
+            - n_hidden: Hidden units (default: 128)
+            - weight_mode: "equal", "universal", or "cell" (default: "equal")
+            - likelihoods: List of likelihoods (auto-inferred if not provided)
+
+        Returns
+        -------
+        MultimodalAmortizedLDA
+            Initialized model ready for training
+
+        Examples
+        --------
+        >>> # From MuData with layer selection
+        >>> model = MultimodalAmortizedLDA.from_data(
+        ...     mdata,
+        ...     modalities=["rna", "protein"],
+        ...     layers={"rna": "counts"},
+        ...     n_topics=20
+        ... )
+
+        >>> # From SpatialData
+        >>> model = MultimodalAmortizedLDA.from_data(
+        ...     sdata,
+        ...     table_key="table",
+        ...     layers="counts",
+        ...     spatial_keys="spatial_connectivities",
+        ...     n_topics=20
+        ... )
+
+        >>> # From dict of AnnData
+        >>> model = MultimodalAmortizedLDA.from_data(
+        ...     {"rna": adata_rna, "protein": adata_protein},
+        ...     layers={"rna": "counts"},
+        ...     n_topics=20
+        ... )
+
+        >>> # From single AnnData
+        >>> model = MultimodalAmortizedLDA.from_data(
+        ...     adata,
+        ...     modalities=["rna"],
+        ...     layers="counts",
+        ...     n_topics=20
+        ... )
+        """
+        from omics_topic.data import (
+            detect_data_type,
+            extract_from_adata_dict,
+            extract_from_anndata,
+            extract_from_mudata,
+            extract_from_spatialdata,
+            validate_data_type,
+        )
+
+        # Validate input type
+        validate_data_type(data)
+        data_type = detect_data_type(data)
+
+        # Route to appropriate extractor
+        if data_type == "mudata":
+            adata_concat, metadata = extract_from_mudata(data, modalities, layers, spatial_keys)
+        elif data_type == "dict":
+            adata_concat, metadata = extract_from_adata_dict(data, layers, spatial_keys)
+        elif data_type == "anndata":
+            modality_name = modalities[0] if modalities else "rna"
+            layer = layers if isinstance(layers, str) else None
+            spatial_key = spatial_keys if isinstance(spatial_keys, str) else None
+            adata_concat, metadata = extract_from_anndata(data, modality_name, layer, spatial_key)
+        elif data_type == "spatialdata":
+            adata_concat, metadata = extract_from_spatialdata(data, table_key, modalities, layers, spatial_keys)
+        else:
+            raise TypeError(f"Unsupported data type: {data_type}")
+
+        # Add spatial info to adata.uns if present
+        if metadata["spatial_info"] is not None:
+            if isinstance(metadata["spatial_info"], dict) and len(metadata["spatial_info"]) > 1:
+                # Multiple spatial graphs
+                adata_concat.uns["_spatial_graphs"] = metadata["spatial_info"]
+            else:
+                # Single spatial graph
+                adata_concat.uns["_spatial_graph"] = metadata["spatial_info"]
+
+        # Setup anndata with scvi
+        # Note: Data is already in .X (extracted from layers if specified)
+        # so we pass layer=None to setup_anndata
+        cls.setup_anndata(
+            adata_concat,
+            layer=None,  # Data already in .X
+            spatial_key=None,  # Already handled in metadata
+        )
+
+        # Infer likelihoods if not provided
+        if "likelihoods" not in model_kwargs:
+            likelihoods = [
+                "gamma_poisson" if mod == "rna" else "multinomial" for mod in metadata["modality_names"]
+            ]
+            model_kwargs["likelihoods"] = likelihoods
+
+        # Create model
+        return cls(
+            adata_concat,
+            n_inputs_modalities=metadata["feature_counts"],
+            modality_names=metadata["modality_names"],
+            **model_kwargs,
         )
 
     # ------------------------------------------------------------------ #
