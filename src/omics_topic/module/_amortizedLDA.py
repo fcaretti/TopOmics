@@ -28,7 +28,7 @@ from pyro.nn import PyroModule
 from scvi._constants import REGISTRY_KEYS
 from scvi.module.base import PyroBaseModuleClass, auto_move_data
 from scvi.nn import Encoder
-from torch_geometric.nn import GCNConv
+from torch_geometric.nn import GCNConv, GATv2Conv
 
 logger = logging.getLogger(__name__)
 
@@ -72,10 +72,6 @@ def adjacency_to_edge_index(adj: torch.Tensor) -> torch.Tensor:
         return adj.nonzero().t().contiguous()
 
 
-# --------------------------------------------------------------------------------------------------
-# GCNEncoder with TRANSDUCTIVE LEARNING
-# --------------------------------------------------------------------------------------------------
-
 
 class GCNEncoder(nn.Module):
     """
@@ -89,26 +85,37 @@ class GCNEncoder(nn.Module):
         n_hidden: int,
         dropout: float = 0.1,
         add_self_loops: bool = True,
-        normalize: bool = True
+        conv_type: str = 'GATv2Conv', # can also be GCNConv
+        heads = 4, # used only by GAT
+        normalize: bool = True, # used only by GCN
+        concat: bool = True, #multi-head strategy for GAT
     ) -> None:
         super().__init__()
         
         # Single graph convolution (spatial aggregation)
-        self.conv = GCNConv(
-            n_in, 
-            n_hidden,
-            add_self_loops=add_self_loops,
-            normalize=normalize
-        )
+        if conv_type == 'GATv2Conv':
+            self.conv = GATv2Conv(
+                in_channels=n_in,
+                out_channels=n_hidden if not concat else n_hidden // heads,
+                heads=heads,
+                add_self_loops=add_self_loops,
+                dropout=dropout,
+                concat=concat,
+            )
+        else:
+            self.conv = GCNConv(
+                n_in, 
+                n_hidden,
+                add_self_loops=add_self_loops,
+                normalize=normalize, 
+                dropout=dropout,
+            )
         
         # Two-layer MLP (feature transformation)
         self.mlp_hidden = nn.Linear(n_hidden, n_hidden)
         self.mlp_out = nn.Linear(n_hidden, 2 * n_topics)
         self.dropout = nn.Dropout(dropout)
         
-        # ═══════════════════════════════════════════════════════════════
-        # NEW: Buffers for full graph data (transductive learning)
-        # ═══════════════════════════════════════════════════════════════
         self.register_buffer("x_full", torch.empty(0, n_in))
         self.register_buffer("edge_index_full", torch.empty(2, 0, dtype=torch.long))
         self._graph_initialized = False
@@ -163,12 +170,12 @@ class GCNEncoder(nn.Module):
             # STEP 1: Compute on FULL graph
             h_full = self.conv(self.x_full, self.edge_index_full)
             h_full = F.relu(h_full)
-            h_full = self.dropout(h_full)
+            #h_full = self.dropout(h_full)
             
             # MLP layers on full graph
             h_full = self.mlp_hidden(h_full)
             h_full = F.relu(h_full)
-            h_full = self.dropout(h_full)
+            #h_full = self.dropout(h_full)
             h_full = self.mlp_out(h_full)
             
             # STEP 2: Subset to batch
@@ -222,7 +229,7 @@ class MultimodalLDAPyroModel(PyroModule):
         n_topics: int,
         cell_topic_prior: torch.Tensor,
         topic_feature_priors: list[torch.Tensor],  # one tensor per modality (len = M)
-        dispersion_rna: float = 10.0,  # global NB dispersion for Gamma-Poisson modalities
+        dispersion_rna: float = 1.,  # global NB dispersion for Gamma-Poisson modalities
     ) -> None:
         super().__init__("multimodal_lda")
 
