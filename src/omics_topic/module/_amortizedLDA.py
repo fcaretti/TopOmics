@@ -240,6 +240,15 @@ class MultimodalLDAPyroModel(PyroModule):
         self.likelihoods = likelihoods
         self.dispersion_rna = dispersion_rna  # used for Gamma-Poisson / NB
 
+        # Normalise/expand cell_topic_prior to length-K tensor
+        cell_topic_prior = torch.as_tensor(cell_topic_prior)
+        if cell_topic_prior.ndim == 0:  # scalar -> repeat for each topic
+            cell_topic_prior = cell_topic_prior.expand(n_topics)
+        elif cell_topic_prior.numel() == 1 and cell_topic_prior.ndim == 1:
+            cell_topic_prior = cell_topic_prior.repeat(n_topics)
+        elif cell_topic_prior.numel() != n_topics:
+            raise ValueError(f"cell_topic_prior must have length {n_topics} (got {cell_topic_prior.numel()})")
+
         # Pre-compute Logistic-Normal approximations for priors
         cell_mu, cell_sigma = logistic_normal_approximation(cell_topic_prior)
         self.register_buffer("cell_mu", cell_mu)
@@ -248,6 +257,9 @@ class MultimodalLDAPyroModel(PyroModule):
         self.topic_prior_mus = torch.nn.ParameterList()
         self.topic_prior_sigmas = torch.nn.ParameterList()
         for t_prior in topic_feature_priors:
+            t_prior = torch.as_tensor(t_prior)
+            if t_prior.ndim == 0:
+                t_prior = t_prior.expand(1)  # fallback; should be length = n_features_m
             mu_m, sig_m = logistic_normal_approximation(t_prior)
             self.topic_prior_mus.append(torch.nn.Parameter(mu_m, requires_grad=False))
             self.topic_prior_sigmas.append(torch.nn.Parameter(sig_m, requires_grad=False))
