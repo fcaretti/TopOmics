@@ -1,15 +1,5 @@
 # multimodal_lda_module.py
-"""Multimodal Amortized Latent Dirichlet Allocation (MM-LDA)
-
-================================================================
-A full Pyro / **scvi-tools** implementation that
-* keeps **one shared topic mixture** per cell, *θₙ*,
-* gives **each modality its own topic-by-feature distribution** ϕₖ,ₘ and its **own likelihood**
-  (Multinomial for sparse discrete counts, Gamma-Poisson/Negative Binomial for RNA, etc.),
-* uses the **encode-then-mix** inference strategy (one encoder per modality, mixed Gaussian
-  parameters),
-* is drop-in compatible with the scvi-tools training loop (inherits `PyroBaseModuleClass`).
-
+"""
 The file declares three public objects
 -------------------------------------
 * `MultimodalLDAPyroModel`   – generative process with modality plate & mixed likelihoods.
@@ -82,16 +72,14 @@ def adjacency_to_edge_index(adj: torch.Tensor) -> torch.Tensor:
         return adj.nonzero().t().contiguous()
 
 
+# --------------------------------------------------------------------------------------------------
+# GCNEncoder with TRANSDUCTIVE LEARNING
+# --------------------------------------------------------------------------------------------------
+
+
 class GCNEncoder(nn.Module):
     """
-    GCN encoder using PyTorch Geometric.
-    
-    Architecture:
-    - Single GCNConv layer (spatial aggregation, avoids over-squashing)
-    - Two-layer MLP (feature transformation)
-    - Outputs parameters for Normal distribution (mu, sigma)
-    
-    This design avoids over-squashing from stacking multiple graph convolutions.
+    GCN encoder using PyTorch Geometric used with spatial data.
     """
     
     def __init__(
@@ -118,30 +106,78 @@ class GCNEncoder(nn.Module):
         self.mlp_out = nn.Linear(n_hidden, 2 * n_topics)
         self.dropout = nn.Dropout(dropout)
         
-    def forward(self, x: torch.Tensor, edge_index: torch.Tensor):
+        # ═══════════════════════════════════════════════════════════════
+        # NEW: Buffers for full graph data (transductive learning)
+        # ═══════════════════════════════════════════════════════════════
+        self.register_buffer("x_full", torch.empty(0, n_in))
+        self.register_buffer("edge_index_full", torch.empty(2, 0, dtype=torch.long))
+        self._graph_initialized = False
+        
+    def set_full_graph_data(self, x_full: torch.Tensor, edge_index_full: torch.Tensor):
         """
+        Initialize full graph data for transductive learning.
+        
+        Must be called after model initialization and before training.
+        
+        Parameters
+        ----------
+        x_full : torch.Tensor
+            Full gene expression matrix for ALL cells [n_obs, n_features]
+        edge_index_full : torch.Tensor
+            Full graph edge indices in COO format [2, n_edges]
+        """
+        self.x_full = x_full
+        self.edge_index_full = edge_index_full
+        self._graph_initialized = True
+        logger.info(f"GCN graph initialized: {x_full.shape[0]} cells, {edge_index_full.shape[1]} edges")
+        
+    def forward(self, x: torch.Tensor, edge_index: torch.Tensor, batch_indices: torch.Tensor | None = None):
+        """
+        Forward pass with transductive learning.
+        
         Parameters
         ----------
         x : torch.Tensor
-            Node features (batch_size, n_in)
+            Node features (batch_size, n_in) - IGNORED for transductive learning
         edge_index : torch.Tensor
-            Graph connectivity in COO format (2, num_edges)
+            Graph connectivity - IGNORED for transductive learning
+        batch_indices : torch.Tensor, optional
+            Indices of cells in current batch [batch_size]
+            Required for transductive learning (when graph is initialized)
         
         Returns
         -------
         distribution : pyro.distributions.Normal
             Variational posterior q(z|x, A)
+        None
+            Placeholder for compatibility
         """
-        # Graph convolution
-        h = self.conv(x, edge_index)
-        h = F.relu(h)
-        h = self.dropout(h)
-        
-        # MLP layers
-        h = self.mlp_hidden(h)
-        h = F.relu(h)
-        h = self.dropout(h)
-        h = self.mlp_out(h)
+
+        if self._graph_initialized:
+            if batch_indices is None:
+                raise ValueError(
+                    "batch_indices required for semi-supervised learning. "
+                    "This should be provided automatically by the guide."
+                )
+            
+            # STEP 1: Compute on FULL graph
+            h_full = self.conv(self.x_full, self.edge_index_full)
+            h_full = F.relu(h_full)
+            h_full = self.dropout(h_full)
+            
+            # MLP layers on full graph
+            h_full = self.mlp_hidden(h_full)
+            h_full = F.relu(h_full)
+            h_full = self.dropout(h_full)
+            h_full = self.mlp_out(h_full)
+            
+            # STEP 2: Subset to batch
+            h = h_full[batch_indices]  # [batch_size, 2 * n_topics]
+            
+        else:
+            raise ValueError(
+                "Graph should be precomputer"
+            )
         
         # Split into mean and scale
         mu, raw_scale = h.chunk(2, dim=-1)
@@ -281,7 +317,7 @@ class MultimodalLDAPyroModel(PyroModule):
 
 
 # --------------------------------------------------------------------------------------------------
-# Guide with encode-then-mix
+# Guide with Mixture of Experts
 # --------------------------------------------------------------------------------------------------
 
 
@@ -301,6 +337,7 @@ class MultimodalLDAPyroGuide(PyroModule):
         self.n_inputs_modalities = n_inputs_modalities
         self.n_topics = n_topics
         self.use_gcn = spatial
+        self.adjacency = adjacency  # keep reference for downstream checks/tests
 
         # Regular encoders (always present)
         self.encoders = torch.nn.ModuleList(
@@ -401,6 +438,47 @@ class MultimodalLDAPyroGuide(PyroModule):
     def topic_feature_posterior_sigma(self) -> list[torch.Tensor]:
         return [self._softplus(u) for u in self.unconstrained_topic_feature_posterior_sigma]
 
+    # ═══════════════════════════════════════════════════════════════════════
+    # NEW METHOD: Initialize full graph data for semi-supervised learning
+    # ═══════════════════════════════════════════════════════════════════════
+    def set_full_graph_data(
+        self, 
+        x_full_modalities: list[torch.Tensor] | torch.Tensor,
+    ):
+        """
+        Initialize GCN encoders with full graph data for transductive learning.
+        
+        Must be called after model initialization and before training when spatial=True.
+        
+        Parameters
+        ----------
+        x_full_modalities : list[torch.Tensor] or torch.Tensor
+            Either:
+            - List of full feature matrices, one per modality [n_obs, n_features_m]
+            - Single concatenated matrix [n_obs, sum(n_features)] (will be split)
+        
+        Notes
+        -----
+        Edge indices are already stored as buffers in __init__.
+        This method only needs to initialize the feature data.
+        """
+        if not self.use_gcn:
+            logger.warning("set_full_graph_data() called but spatial=False. No effect.")
+            return
+        
+        # Split concatenated features if needed
+        if isinstance(x_full_modalities, torch.Tensor):
+            x_full_list = torch.split(x_full_modalities, self.n_inputs_modalities, dim=1)
+        else:
+            x_full_list = x_full_modalities
+        
+        # Initialize each GCN encoder with its modality's full data
+        for idx, (gcn_enc, x_full_m) in enumerate(zip(self.gcn_encoders, x_full_list)):
+            edge_index = self._get_edge_index(idx)
+            gcn_enc.set_full_graph_data(x_full_m, edge_index)
+        
+        logger.info("All GCN encoders initialized with full graph data for transductive learning")
+
     # ---------- forward ----------
     @auto_move_data
     def forward(
@@ -411,7 +489,10 @@ class MultimodalLDAPyroGuide(PyroModule):
         kl_weight: float = 1.0,
     ):
         B = x.shape[0]
-        cell_idx = torch.arange(B, device=x.device)  # needed only if weight_mode=="cell"
+        
+        batch_indices = torch.arange(B, device=x.device)
+        
+        cell_idx = batch_indices  # for weight mixing (if weight_mode=="cell")
 
         # ϕₖ,ₘ variational dists
         for m in range(self.n_modalities):
@@ -429,8 +510,8 @@ class MultimodalLDAPyroGuide(PyroModule):
         mus, vars_, masks = [], [], []
         for idx, (enc, x_m) in enumerate(zip(self.encoders, xs, strict=False)):
             if self.use_gcn:
-                edge_index = self._get_edge_index(idx)  # ← Just retrieves stored buffer
-                q_m, _ = self.gcn_encoders[idx](x_m, edge_index)  # q(z|x, A)
+                edge_index = self._get_edge_index(idx)
+                q_m, _ = self.gcn_encoders[idx](x_m, edge_index, batch_indices=batch_indices)
             else:
                 q_m, _ = enc(x_m)  # q(z|x)
             mus.append(q_m.loc)
@@ -447,7 +528,7 @@ class MultimodalLDAPyroGuide(PyroModule):
 
 
 # --------------------------------------------------------------------------------------------------
-# Wrapper module pairing model & guide
+# Wrapper module pairing model & guide with TRANSDUCTIVE LEARNING support
 # --------------------------------------------------------------------------------------------------
 
 
@@ -524,6 +605,26 @@ class MultimodalAmortizedLDAPyroModule(PyroBaseModuleClass):
     def guide(self):
         return self._guide
 
+
+    def set_full_graph_data(self, x_full: torch.Tensor):
+        """
+        Initialize GCN encoders with full graph data for semi-supervised learning.
+        
+        Must be called after model initialization and before training when spatial=True.
+        
+        Parameters
+        ----------
+        x_full : torch.Tensor
+            Full concatenated feature matrix for ALL cells [n_obs, sum(n_features)]
+            Will be automatically split by modality
+        """
+        if not self.spatial:
+            logger.warning("set_full_graph_data() called but spatial=False. No effect.")
+            return
+        
+        self._guide.set_full_graph_data(x_full)
+        logger.info("Module initialized for transductive learning with full graph data")
+
     # utilities
     def topic_by_feature(self, n_samples: int = 5_000):
         out = {}
@@ -543,12 +644,15 @@ class MultimodalAmortizedLDAPyroModule(PyroBaseModuleClass):
 
         B = x.shape[0]
         xs = torch.split(x, self.model.n_inputs_modalities, dim=1)
+        
+        batch_indices = torch.arange(B, device=x.device)
+        
         # run encoders
         mus, vars_, masks = [], [], []
         for idx, (enc, x_m) in enumerate(zip(self.guide.encoders, xs, strict=False)):
             if self.guide.use_gcn:
                 edge_index = self.guide._get_edge_index(idx)
-                q_m, _ = self.guide.gcn_encoders[idx](x_m, edge_index)
+                q_m, _ = self.guide.gcn_encoders[idx](x_m, edge_index, batch_indices=batch_indices)
             else:
                 q_m, _ = enc(x_m)
             mus.append(q_m.loc)

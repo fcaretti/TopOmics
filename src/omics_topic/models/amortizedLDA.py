@@ -19,6 +19,7 @@ from scvi.model.base import BaseModelClass, PyroSviTrainMixin
 from scvi.utils import setup_anndata_dsp
 
 from omics_topic.module._amortizedLDA import MultimodalAmortizedLDAPyroModule
+from omics_topic.utils.training_plan import MultimodalLDAPyroTrainingPlan
 
 from .base_model import BaseTopicModel
 
@@ -134,6 +135,7 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
     """
 
     _module_cls = MultimodalAmortizedLDAPyroModule  # type: ignore
+    _training_plan_cls = MultimodalLDAPyroTrainingPlan
 
     # --------------------------------------------------------------------- #
     #                                init                                   #
@@ -240,6 +242,15 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
             spatial=self.spatial,
             adjacency=adjacency,
         )
+
+        # For spatial models, initialise GCN encoders with full-graph data
+        if self.spatial:
+            X_full = self.adata.X
+            if sp.issparse(X_full):
+                X_full = X_full.toarray()
+            x_tensor = torch.as_tensor(np.asarray(X_full), dtype=torch.float32)
+            self.module.set_full_graph_data(x_tensor)
+
         self.init_params_ = self._get_init_params(locals())
 
         if self.spatial:
@@ -625,6 +636,32 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
         total_counts = sum(tensors[REGISTRY_KEYS.X_KEY].sum().item() for tensors in dl)
 
         return float(np.exp(-self.get_elbo(adata, indices, batch_size) / total_counts))
+
+    # ------------------------------------------------------------------ #
+    # Training plan hook
+    # ------------------------------------------------------------------ #
+    def _create_training_plan(self, **kwargs):
+        """
+        Use custom training plan that logs validation ELBO when a val split exists.
+        """
+        return MultimodalLDAPyroTrainingPlan(self.module, **kwargs)
+
+    # ------------------------------------------------------------------ #
+    # Ensure validation runs when requested
+    # ------------------------------------------------------------------ #
+    def train(self, *args, validation_size=None, **kwargs):  # type: ignore[override]
+        """
+        Override to default to running validation when a split is requested.
+
+        scvi's Trainer defaults to `check_val_every_n_epoch = sys.maxsize` unless
+        early stopping or checkpointing is enabled, which effectively disables
+        the validation loop. Here we set it to 1 when a validation set is present
+        so that `elbo_val` is logged every epoch.
+        """
+        if "check_val_every_n_epoch" not in kwargs:
+            if validation_size is None or validation_size > 0:
+                kwargs["check_val_every_n_epoch"] = 1
+        return super().train(*args, validation_size=validation_size, **kwargs)
 
 
 def mudata_to_concat_adata(

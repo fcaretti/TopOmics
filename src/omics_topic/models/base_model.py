@@ -39,8 +39,8 @@ class BaseTopicModel:
         """
         self.spatial = False
         self.check_input(mdata, modalities)
-
         self.check_modalities_names()
+        self.n_modalities = len(self.modalities)
 
         n_cells_set = {v.shape[0] for v in self.data_dict.values()}
         if len(n_cells_set) != 1:
@@ -197,6 +197,9 @@ class BaseTopicModel:
         P  : shape (|feat_a| , |feat_b|) – interaction score between every
             feature of `mod_a` and every feature of `mod_b`
         """
+
+        if self.n_modalities == 1:
+            raise ValueError("This function is available only with more than one modality")
         # ------------------------------------------------------------------
         # 1.  Pull matrices from the model
         # ------------------------------------------------------------------

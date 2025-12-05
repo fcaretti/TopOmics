@@ -25,8 +25,10 @@ So basically every model is going to inherit the class BaseTopicModel, that cont
   - [X] Add tests for GCN path (toy graph)
   - [ ] Implement `get_topic_by_location` (in `MultimodalAmortizedLDA`, same file) to aggregate θ over spatial neighborhoods or coordinates using the chosen `spatial_key`
   - [ ] **Add entropy term to avoid topic collapse**
-  - [ ] **Implement train/test set in the presence of graph (semi-supervised learning)**
   - [ ] **Add library size param in Gamma-Poisson**
+  - [X] **Implement train/test set in the presence of graph (semi-supervised learning)**
+    - [X] Track validation ELBO during training
+  - [ ] Use GAT instead of GCN
 - [ ] Implement different distribution choices
   - [X] Standard Gamma-Poisson
   - [X] Standard Dirichlet
