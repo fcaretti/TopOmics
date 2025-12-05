@@ -15,6 +15,8 @@ class BaseTopicModel:
     It can be extended by specific model implementations.
     """
 
+    spatial: bool = False  # set True when spatial connectivities are provided
+
     def __init__(
         self,
         mdata: MuDataType | dict[str, AnnData] | list[AnnData] | AnnData,
@@ -31,13 +33,14 @@ class BaseTopicModel:
                 - single AnnData object (requires `modalities`).
             modalities: Names corresponding to each AnnData in a list input.
         Initializes:
-            - `self.data_dict`: Dictionary mapping modality names to tensors.
-            - `self.modalities`: List of modality names.
-            - `self.n_cells`: Number of cells (assumed to be the same across modalities).
+                - `self.data_dict`: Dictionary mapping modality names to tensors.
+                - `self.modalities`: List of modality names.
+                - `self.n_cells`: Number of cells (assumed to be the same across modalities).
         """
+        self.spatial = False
         self.check_input(mdata, modalities)
-
         self.check_modalities_names()
+        self.n_modalities = len(self.modalities)
 
         n_cells_set = {v.shape[0] for v in self.data_dict.values()}
         if len(n_cells_set) != 1:
@@ -194,6 +197,9 @@ class BaseTopicModel:
         P  : shape (|feat_a| , |feat_b|) – interaction score between every
             feature of `mod_a` and every feature of `mod_b`
         """
+
+        if self.n_modalities == 1:
+            raise ValueError("This function is available only with more than one modality")
         # ------------------------------------------------------------------
         # 1.  Pull matrices from the model
         # ------------------------------------------------------------------

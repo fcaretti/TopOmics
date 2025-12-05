@@ -14,30 +14,36 @@ maintainers = [
 authors = [
   { name = "Federico Caretti" },
 ]
-requires-python = ">=3.10"
+requires-python = ">=3.12, <3.14" #unfortunately numba breaks with 3.14
 classifiers = [
   "Programming Language :: Python :: 3 :: Only",
-  "Programming Language :: Python :: 3.10",
-  "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
   "Programming Language :: Python :: 3.13",
 ]
 dependencies = [
-  "anndata",
+  "anndata>=0.12.0",
   "muon",
-  "scanpy",
+  "scanpy>=1.9.8",
   # for debug logging (referenced from the issue template)
   "session-info2",
   "torch",
-]
-optional-dependencies.amortized = [
+  "numpy>=1.24,<2.3",
   "pyro-ppl",
   "scvi-tools",
 ]
+
+optional-dependencies.spatial = [
+  "spatialdata>=0.6.1",
+  "squidpy>=1.6.6",
+  "spatialdata-plot>=0.2.13",
+  "torch-geometric",
+]
+
 optional-dependencies.dev = [
   "pre-commit",
   "twine>=4.0.2",
 ]
+
 optional-dependencies.doc = [
   "docutils>=0.8,!=0.18.*,!=0.19.*",
   "ipykernel",
@@ -76,7 +82,7 @@ scripts.clean = "git clean -fdX -- {args:docs}"
 # Test the lowest and highest supported Python versions with normal deps
 [[tool.hatch.envs.hatch-test.matrix]]
 deps = [ "stable" ]
-python = [ "3.10", "3.13" ]
+python = [ "3.12", "3.13" ]
 
 # Test the newest supported Python version also with pre-release deps
 [[tool.hatch.envs.hatch-test.matrix]]
@@ -84,7 +90,7 @@ deps = [ "pre" ]
 python = [ "3.13" ]
 
 [tool.hatch.envs.hatch-test]
-features = [ "test", "amortized" ]
+features = [ "test", "spatial" ]
 
 [tool.hatch.envs.hatch-test.overrides]
 # If the matrix variable `deps` is set to "pre",
