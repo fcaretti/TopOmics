@@ -250,11 +250,9 @@ def extract_from_anndata(
             raise KeyError(
                 f"Layer '{layer}' not found. " f"Available layers: {list(adata.layers.keys())}"
             )
-        X = adata.layers[layer]
-        # Create new AnnData with layer as .X
-        adata_processed = AnnData(X, obs=adata.obs.copy(), var=adata.var.copy())
-    else:
-        adata_processed = adata
+        # Reuse the same AnnData object but move the selected layer into .X
+        adata.X = adata.layers[layer]
+    adata_processed = adata
 
     # Extract spatial graph if specified
     from omics_topic.models.amortizedLDA import _resolve_spatial_graph_from_adata

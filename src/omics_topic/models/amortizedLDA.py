@@ -159,6 +159,7 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
         ----------
         adata
             AnnData with concatenated features (for scvi compatibility).
+            Can also be MuData if setup_mudata() or setup_data() was called.
         n_inputs_modalities
             List of feature counts per modality.
         likelihoods
@@ -185,6 +186,16 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
         separately and then mixed via weighted Gaussian combination before sampling
         the shared cell-topic distribution θₙ.
         """
+        # If MuData provided, extract flattened AnnData
+        if hasattr(adata, 'mod'):  # MuData check
+            if "_flattened_ann_data" in adata.uns:
+                adata = adata.uns["_flattened_ann_data"]
+            else:
+                raise ValueError(
+                    "MuData must be setup with setup_mudata() or setup_data() first. "
+                    "Call MultimodalAmortizedLDA.setup_data(mdata, ...) before instantiation."
+                )
+
         pyro.clear_param_store()
         super().__init__(adata)
 
@@ -215,6 +226,7 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
         self.likelihoods = likelihoods
         self.modality_names = modality_names if modality_names else [str(i) for i in range(self.n_modalities)]
         self.weight_mode = weight_mode
+        self.n_topics = n_topics
 
         if self.spatial:
             adjacency = _prepare_adjacency_tensors(spatial_uns, self.modality_names)
@@ -272,6 +284,9 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
         adata: AnnData,
         layer: str | None = None,
         spatial_key: str | None = None,
+        modalities: list[str] | None = None,
+        layers: dict[str, str | None] | str | None = None,
+        spatial_keys: dict[str, str] | str | None = None,
         **kwargs,
     ):
         """%(summary)s.
@@ -282,14 +297,44 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
         %(param_layer)s
         spatial_key
             Optional key in ``adata.obsp`` pointing to a precomputed spatial graph.
+        modalities
+            List of modality names (for new API). If None, defaults to ["rna"].
+        layers
+            Layer specifications (for new API). Can be string or dict.
+        spatial_keys
+            Spatial graph keys (for new API). Can be string or dict.
         """
-        spatial_info = _resolve_spatial_graph_from_adata(adata, spatial_key)
-        if spatial_info is not None:
-            adata.uns["_spatial_graph"] = spatial_info
-            logger.info(
-                "Spatial graph provided via obsp['%s']; GCN encoder not implemented yet, graph will be ignored.",
-                spatial_key,
+        # Handle new API with data extraction
+        if modalities is not None or layers is not None or spatial_keys is not None:
+            from omics_topic.data import extract_from_anndata
+
+            # Normalize parameters
+            modality_name = modalities[0] if modalities else "rna"
+            layer_to_extract = layers if isinstance(layers, str) else (layers.get(modality_name) if isinstance(layers, dict) else None)
+            spatial_key_to_use = spatial_keys if isinstance(spatial_keys, str) else (spatial_keys.get(modality_name) if isinstance(spatial_keys, dict) else None)
+
+            # Extract data using utilities
+            adata_processed, metadata = extract_from_anndata(
+                adata, modality_name, layer_to_extract, spatial_key_to_use
             )
+
+            # Store spatial info if present
+            if metadata["spatial_info"] is not None:
+                adata_processed.uns["_spatial_graph"] = metadata["spatial_info"]
+
+            # Use processed data for registration
+            adata = adata_processed
+            layer = None  # Already extracted to .X
+            spatial_key = None  # Already in metadata
+        else:
+            # Old API - spatial graph resolution
+            spatial_info = _resolve_spatial_graph_from_adata(adata, spatial_key)
+            if spatial_info is not None:
+                adata.uns["_spatial_graph"] = spatial_info
+                logger.info(
+                    "Spatial graph provided via obsp['%s']; GCN encoder not implemented yet, graph will be ignored.",
+                    spatial_key,
+                )
 
         setup_args = cls._get_setup_method_args(**locals())
         adata_manager = AnnDataManager(
@@ -298,6 +343,103 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
         )
         adata_manager.register_fields(adata, **kwargs)
         cls.register_manager(adata_manager)
+        return adata
+
+    @classmethod
+    def setup_data(
+        cls,
+        data,
+        modalities: list[str] | None = None,
+        layers: dict[str, str | None] | str | None = None,
+        spatial_keys: dict[str, str] | str | None = None,
+        table_key: str = "table",
+        **kwargs,
+    ):
+        """Universal setup method with automatic type detection.
+
+        Detects the type of input data (AnnData, MuData, SpatialData, or dict[str, AnnData])
+        and routes to the appropriate type-specific setup method.
+
+        This method follows scvi-tools conventions, performing data registration as a side effect.
+        After calling this method, instantiate the model with the same data object.
+
+        Parameters
+        ----------
+        data
+            Input data of any supported type:
+            - AnnData: single modality data
+            - MuData: multi-modal data
+            - SpatialData: spatial omics data
+            - dict[str, AnnData]: dictionary mapping modality names to AnnData objects
+        modalities
+            List of modality names to use. If None, uses all available modalities.
+        layers
+            Layer specifications for data extraction. Can be:
+            - None: use .X for all modalities
+            - str: use same layer for all modalities (e.g., "counts")
+            - dict: per-modality layer specification (e.g., {"rna": "counts", "protein": "raw"})
+        spatial_keys
+            Spatial graph keys in .obsp. Can be:
+            - None: no spatial graphs
+            - str: use same key for all modalities
+            - dict: per-modality spatial keys
+        table_key
+            For SpatialData only: key in sdata.tables to extract. Default: "table".
+        **kwargs
+            Additional arguments passed to scvi registration.
+
+        Examples
+        --------
+        >>> # With MuData
+        >>> MultimodalAmortizedLDA.setup_data(
+        ...     mdata,
+        ...     modalities=["rna", "protein"],
+        ...     layers="counts",
+        ...     spatial_keys="connectivities"
+        ... )
+        >>> model = MultimodalAmortizedLDA(mdata, n_topics=20)
+
+        >>> # With AnnData
+        >>> MultimodalAmortizedLDA.setup_data(
+        ...     adata,
+        ...     modalities=["rna"],
+        ...     layers="counts"
+        ... )
+        >>> model = MultimodalAmortizedLDA(adata, n_topics=20)
+
+        >>> # With dict[str, AnnData]
+        >>> adata_dict = {"rna": adata_rna, "protein": adata_protein}
+        >>> MultimodalAmortizedLDA.setup_data(
+        ...     adata_dict,
+        ...     layers={"rna": "counts", "protein": "raw"}
+        ... )
+        >>> # For dict, get the processed AnnData from the return value
+        >>> adata_concat = MultimodalAmortizedLDA.setup_data(adata_dict, layers="counts")
+        >>> model = MultimodalAmortizedLDA(adata_concat, n_topics=20)
+        """
+        from omics_topic.data import detect_data_type, validate_data_type
+
+        # Validate and detect type
+        validate_data_type(data)
+        data_type = detect_data_type(data)
+
+        # Route to type-specific setup method
+        if data_type == "anndata":
+            return cls.setup_anndata(
+                data, modalities=modalities, layers=layers, spatial_keys=spatial_keys, **kwargs
+            )
+        elif data_type == "mudata":
+            return cls.setup_mudata(
+                data, modalities=modalities, layers=layers, spatial_keys=spatial_keys, **kwargs
+            )
+        elif data_type == "spatialdata":
+            return cls.setup_spatialdata(
+                data, table_key=table_key, modalities=modalities, layers=layers, spatial_keys=spatial_keys, **kwargs
+            )
+        elif data_type == "dict":
+            return cls.setup_adata_dict(data, layers=layers, spatial_keys=spatial_keys, **kwargs)
+        else:
+            raise TypeError(f"Unsupported data type: {type(data)}")
 
     @classmethod
     def setup_mudata(
@@ -307,6 +449,9 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
         layer_dict: dict[str, str] | None = None,
         spatial_key: str | None = None,
         spatial_modality_keys: dict[str, str] | None = None,
+        modalities: list[str] | None = None,
+        layers: dict[str, str | None] | str | None = None,
+        spatial_keys: dict[str, str] | str | None = None,
         **kwargs,
     ) -> tuple[MuData, list[str], list[int]]:
         """
@@ -321,12 +466,28 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
             MuData object containing multiple modalities.
         modality_order
             Order of modalities to use. If None, uses all modalities in mdata.mod.keys().
+            (Old parameter name, prefer `modalities`)
         layer_dict
             Dictionary mapping modality names to layer names to use for each modality.
+            (Old parameter name, prefer `layers`)
         spatial_key
             Single obsp key applied to all modalities (if spatial_modality_keys is not provided).
+            (Old parameter name, prefer `spatial_keys`)
         spatial_modality_keys
             Mapping of modality -> obsp key for modality-specific spatial graphs.
+            (Old parameter name, prefer `spatial_keys`)
+        modalities
+            List of modality names to use (new parameter name, alias for modality_order).
+        layers
+            Layer specifications (new parameter name). Can be:
+            - None: use .X for all modalities
+            - str: use same layer for all modalities
+            - dict: per-modality layer specification
+        spatial_keys
+            Spatial graph keys (new parameter name). Can be:
+            - None: no spatial graphs
+            - str: use same key for all modalities
+            - dict: per-modality spatial keys
         **kwargs
             Additional arguments passed to setup_anndata.
 
@@ -341,67 +502,178 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
 
         Notes
         -----
-        This is a new implementation that does NOT concatenate features.
-        Modality-specific data is kept separate for MoE/PoE architecture.
+        This method uses extraction utilities for flexible layer and spatial graph handling.
         """
-        if modality_order is None:
-            modality_order = list(mdata.mod.keys())
+        from omics_topic.data import extract_from_mudata
 
-        feat_counts = []
-        modality_names = []
-        spatial_graphs: dict[str, dict[str, object]] = {}
+        # Normalize parameters (merge old and new API)
+        if modalities is None:
+            modalities = modality_order
+        if layers is None:
+            layers = layer_dict
+        if spatial_keys is None:
+            if spatial_modality_keys is not None:
+                spatial_keys = spatial_modality_keys
+            elif spatial_key is not None:
+                spatial_keys = spatial_key
 
-        # Validate modalities and collect feature counts
-        n_cells_ref = mdata.n_obs
-        for mod in modality_order:
-            if mod not in mdata.mod:
-                raise ValueError(f"Modality '{mod}' not found in MuData. Available: {list(mdata.mod.keys())}")
-
-            adata_mod = mdata.mod[mod]
-            if adata_mod.n_obs != n_cells_ref:
-                raise ValueError(
-                    f"Modality '{mod}' has {adata_mod.n_obs} cells, "
-                    f"but MuData has {n_cells_ref} cells. All modalities must be aligned."
-                )
-
-            feat_counts.append(adata_mod.n_vars)
-            modality_names.append(mod)
-
-            key_for_mod = (spatial_modality_keys or {}).get(mod, spatial_key)
-            spatial_info = _resolve_spatial_graph_from_adata(adata_mod, key_for_mod)
-            if spatial_info is not None:
-                spatial_graphs[mod] = spatial_info
-
-        # Store metadata in mdata.uns for later retrieval
-        mdata.uns["_multimodal_setup"] = {
-            "modality_order": modality_names,
-            "feat_counts": feat_counts,
-            "layer_dict": layer_dict or {},
-            "setup_method": "separate_modalities",  # Flag for new implementation
-        }
-        if spatial_graphs:
-            mdata.uns["_spatial_graphs"] = spatial_graphs
-
-        # For now, we still need to create a concatenated AnnData for scvi registration
-        # but we'll store the modality information for the module to use
-        adata_flat, _ = mudata_to_concat_adata(mdata, modality_order)
-        mdata.uns["_flattened_ann_data"] = adata_flat
-        if spatial_graphs:
-            adata_flat.uns["_spatial_graphs"] = spatial_graphs
-            logger.info(
-                "Spatial graph(s) provided (keys: %s); GCN encoder not implemented yet, graph will be ignored.",
-                list(spatial_graphs.keys()),
-            )
-
-        # Register with scvi
-        cls.setup_anndata(
-            adata_flat,
-            layer=layer_dict.get("rna") if layer_dict else None,
-            spatial_key=None,
-            **kwargs,
+        # Use extraction utilities
+        adata_concat, metadata = extract_from_mudata(
+            mdata, modalities=modalities, layers=layers, spatial_keys=spatial_keys
         )
 
-        return mdata, modality_names, feat_counts
+        # Store metadata in mdata.uns (existing behavior)
+        mdata.uns["_multimodal_setup"] = {
+            "modality_order": metadata["modality_names"],
+            "feat_counts": metadata["feature_counts"],
+            "layer_dict": metadata["layer_dict"],
+            "setup_method": "separate_modalities",
+        }
+
+        # Store flattened data (existing behavior)
+        mdata.uns["_flattened_ann_data"] = adata_concat
+
+        # Store spatial info
+        if metadata["spatial_info"] is not None:
+            if isinstance(metadata["spatial_info"], dict) and len(metadata["spatial_info"]) > 1:
+                adata_concat.uns["_spatial_graphs"] = metadata["spatial_info"]
+                mdata.uns["_spatial_graphs"] = metadata["spatial_info"]
+                logger.info(
+                    "Spatial graph(s) provided (keys: %s); GCN encoder not implemented yet, graph will be ignored.",
+                    list(metadata["spatial_info"].keys()),
+                )
+            else:
+                # Single spatial graph
+                spatial_graph = metadata["spatial_info"] if not isinstance(metadata["spatial_info"], dict) else list(metadata["spatial_info"].values())[0]
+                adata_concat.uns["_spatial_graph"] = spatial_graph
+
+        # Register with scvi using this class (data already in .X after extraction)
+        cls.setup_anndata(adata_concat, layer=None, spatial_key=None, **kwargs)
+
+        return mdata, metadata["modality_names"], metadata["feature_counts"]
+
+    @classmethod
+    def setup_spatialdata(
+        cls,
+        sdata,
+        table_key: str = "table",
+        modalities: list[str] | None = None,
+        layers: dict[str, str | None] | str | None = None,
+        spatial_keys: dict[str, str] | str | None = None,
+        **kwargs,
+    ):
+        """Setup method for SpatialData input.
+
+        Extracts the specified table from SpatialData and processes it for model training.
+
+        Parameters
+        ----------
+        sdata
+            SpatialData object containing spatial omics data.
+        table_key
+            Key in sdata.tables to extract. Default: "table".
+        modalities
+            List of modality names to use. If None, uses all available.
+        layers
+            Layer specifications (per-modality dict, or string for all).
+        spatial_keys
+            Spatial graph keys (per-modality dict, or string for all).
+        **kwargs
+            Additional arguments passed to scvi registration.
+
+        Returns
+        -------
+        adata_concat
+            The processed and registered AnnData object.
+        """
+        from omics_topic.data import extract_from_spatialdata
+
+        # Extract data from SpatialData
+        adata_concat, metadata = extract_from_spatialdata(
+            sdata, table_key, modalities, layers, spatial_keys
+        )
+
+        # Store spatial info
+        if metadata["spatial_info"] is not None:
+            if isinstance(metadata["spatial_info"], dict) and len(metadata["spatial_info"]) > 1:
+                adata_concat.uns["_spatial_graphs"] = metadata["spatial_info"]
+                logger.info(
+                    "Spatial graph(s) provided (keys: %s); GCN encoder not implemented yet, graph will be ignored.",
+                    list(metadata["spatial_info"].keys()),
+                )
+            else:
+                adata_concat.uns["_spatial_graph"] = metadata["spatial_info"]
+
+        # Store metadata
+        adata_concat.uns["_spatialdata_setup"] = {
+            "table_key": table_key,
+            "modality_names": metadata["modality_names"],
+            "feature_counts": metadata["feature_counts"],
+            "layer_dict": metadata["layer_dict"],
+        }
+
+        # Register with scvi using this class (data already in .X)
+        cls.setup_anndata(adata_concat, layer=None, spatial_key=None, **kwargs)
+
+        return adata_concat
+
+    @classmethod
+    def setup_adata_dict(
+        cls,
+        adata_dict: dict[str, AnnData],
+        layers: dict[str, str | None] | str | None = None,
+        spatial_keys: dict[str, str] | str | None = None,
+        **kwargs,
+    ):
+        """Setup method for dict[str, AnnData] input.
+
+        Converts dictionary to concatenated AnnData and processes it for model training.
+
+        Parameters
+        ----------
+        adata_dict
+            Dictionary mapping modality names to AnnData objects.
+        layers
+            Layer specifications (per-modality dict, or string for all).
+        spatial_keys
+            Spatial graph keys (per-modality dict, or string for all).
+        **kwargs
+            Additional arguments passed to scvi registration.
+
+        Returns
+        -------
+        adata_concat
+            The processed and registered AnnData object.
+        """
+        from omics_topic.data import extract_from_adata_dict
+
+        # Extract data
+        adata_concat, metadata = extract_from_adata_dict(
+            adata_dict, layers, spatial_keys
+        )
+
+        # Store spatial info
+        if metadata["spatial_info"] is not None:
+            if isinstance(metadata["spatial_info"], dict) and len(metadata["spatial_info"]) > 1:
+                adata_concat.uns["_spatial_graphs"] = metadata["spatial_info"]
+                logger.info(
+                    "Spatial graph(s) provided (keys: %s); GCN encoder not implemented yet, graph will be ignored.",
+                    list(metadata["spatial_info"].keys()),
+                )
+            else:
+                adata_concat.uns["_spatial_graph"] = metadata["spatial_info"]
+
+        # Store metadata
+        adata_concat.uns["_adata_dict_setup"] = {
+            "modality_names": metadata["modality_names"],
+            "feature_counts": metadata["feature_counts"],
+            "layer_dict": metadata["layer_dict"],
+        }
+
+        # Register with scvi using this class (data already in .X)
+        cls.setup_anndata(adata_concat, layer=None, spatial_key=None, **kwargs)
+
+        return adata_concat
 
     # -- one-shot convenience (exactly like MultiVI) -------------
     @classmethod
@@ -475,10 +747,10 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
         **model_kwargs,
     ):
         """
-        Universal constructor with automatic type detection.
+        Convenience constructor: setup + instantiation in one call.
 
-        Automatically detects input type and routes to appropriate preprocessing.
-        This is the recommended way to create a model with flexible data input.
+        This is equivalent to calling setup_data() followed by the model constructor.
+        Automatically detects input type and handles all preprocessing.
 
         Parameters
         ----------
@@ -550,64 +822,50 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
         ...     n_topics=20
         ... )
         """
-        from omics_topic.data import (
-            detect_data_type,
-            extract_from_adata_dict,
-            extract_from_anndata,
-            extract_from_mudata,
-            extract_from_spatialdata,
-            validate_data_type,
+        from omics_topic.data import detect_data_type
+
+        # Call setup_data to handle all preprocessing and registration
+        result = cls.setup_data(
+            data,
+            modalities=modalities,
+            layers=layers,
+            spatial_keys=spatial_keys,
+            table_key=table_key,
         )
 
-        # Validate input type
-        validate_data_type(data)
+        # Detect data type to know how to extract metadata
         data_type = detect_data_type(data)
 
-        # Route to appropriate extractor
+        # Extract metadata for instantiation based on data type
         if data_type == "mudata":
-            adata_concat, metadata = extract_from_mudata(data, modalities, layers, spatial_keys)
-        elif data_type == "dict":
-            adata_concat, metadata = extract_from_adata_dict(data, layers, spatial_keys)
-        elif data_type == "anndata":
-            modality_name = modalities[0] if modalities else "rna"
-            layer = layers if isinstance(layers, str) else None
-            spatial_key = spatial_keys if isinstance(spatial_keys, str) else None
-            adata_concat, metadata = extract_from_anndata(data, modality_name, layer, spatial_key)
-        elif data_type == "spatialdata":
-            adata_concat, metadata = extract_from_spatialdata(data, table_key, modalities, layers, spatial_keys)
-        else:
-            raise TypeError(f"Unsupported data type: {data_type}")
+            # MuData stores metadata in .uns
+            modality_names = data.uns["_multimodal_setup"]["modality_order"]
+            feature_counts = data.uns["_multimodal_setup"]["feat_counts"]
+            adata_for_model = data.uns["_flattened_ann_data"]
+        elif data_type in ["spatialdata", "dict"]:
+            # These return processed AnnData with metadata in .uns
+            adata_for_model = result
+            setup_dict = adata_for_model.uns.get("_spatialdata_setup") or adata_for_model.uns.get("_adata_dict_setup")
+            modality_names = setup_dict["modality_names"]
+            feature_counts = setup_dict["feature_counts"]
+        else:  # anndata
+            # Single modality case
+            modality_names = [modalities[0]] if modalities else ["rna"]
+            adata_for_model = result if isinstance(result, AnnData) else data
+            feature_counts = [adata_for_model.n_vars]
 
-        # Add spatial info to adata.uns if present
-        if metadata["spatial_info"] is not None:
-            if isinstance(metadata["spatial_info"], dict) and len(metadata["spatial_info"]) > 1:
-                # Multiple spatial graphs
-                adata_concat.uns["_spatial_graphs"] = metadata["spatial_info"]
-            else:
-                # Single spatial graph
-                adata_concat.uns["_spatial_graph"] = metadata["spatial_info"]
-
-        # Setup anndata with scvi
-        # Note: Data is already in .X (extracted from layers if specified)
-        # so we pass layer=None to setup_anndata
-        cls.setup_anndata(
-            adata_concat,
-            layer=None,  # Data already in .X
-            spatial_key=None,  # Already handled in metadata
-        )
-
-        # Infer likelihoods if not provided
+        # Auto-infer likelihoods if not provided
         if "likelihoods" not in model_kwargs:
             likelihoods = [
-                "gamma_poisson" if mod == "rna" else "multinomial" for mod in metadata["modality_names"]
+                "gamma_poisson" if mod == "rna" else "multinomial" for mod in modality_names
             ]
             model_kwargs["likelihoods"] = likelihoods
 
-        # Create model
+        # Instantiate model
         return cls(
-            adata_concat,
-            n_inputs_modalities=metadata["feature_counts"],
-            modality_names=metadata["modality_names"],
+            adata_for_model,
+            n_inputs_modalities=feature_counts,
+            modality_names=modality_names,
             **model_kwargs,
         )
 
