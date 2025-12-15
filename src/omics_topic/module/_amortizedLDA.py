@@ -45,6 +45,56 @@ def logistic_normal_approximation(alpha: torch.Tensor) -> tuple[torch.Tensor, to
     return mu, sigma
 
 
+def horseshoe_shrinkage(
+    caux: torch.Tensor,     # scalar
+    tau: torch.Tensor,      # (K, 1)
+    delta: torch.Tensor,    # (F,)
+    lambda_: torch.Tensor,  # (K, F)
+) -> torch.Tensor:
+    """
+    Compute regularized horseshoe shrinkage multiplier.
+
+    Based on Carvalho et al. (2010) and Piironen & Vehtari (2017).
+    This implements the Finnish horseshoe prior which adds a regularization
+    component (caux) to prevent over-shrinkage.
+
+    Parameters
+    ----------
+    caux : scalar
+        Global auxiliary variable for regularization (prevents over-shrinkage)
+    tau : (K, 1)
+        Per-topic local shrinkage parameter
+    delta : (F,)
+        Per-feature local shrinkage parameter
+    lambda_ : (K, F)
+        Per-topic-feature interaction shrinkage parameter
+
+    Returns
+    -------
+    lambda_tilde : (K, F)
+        Effective shrinkage multipliers in [0, 1]
+
+    Notes
+    -----
+    The formula combines hierarchical shrinkage with regularization:
+    λ̃² = (c² * τ² * δ² * λ²) / (c² + τ² * δ² * λ²)
+
+    When τ²δ²λ² >> c²: λ̃ → 1 (no shrinkage, signal preserved)
+    When τ²δ²λ² << c²: λ̃ → 0 (strong shrinkage, noise removed)
+    """
+    caux_sq = caux ** 2
+    tau_sq = tau ** 2              # (K, 1)
+    delta_sq = delta.unsqueeze(0) ** 2   # (1, F)
+    lambda_sq = lambda_ ** 2       # (K, F)
+
+    numerator = caux_sq * tau_sq * delta_sq * lambda_sq
+    denominator = caux_sq + tau_sq * delta_sq * lambda_sq
+
+    # Add epsilon for numerical stability
+    lambda_tilde = torch.sqrt(numerator / (denominator + 1e-8))
+    return lambda_tilde  # (K, F)
+
+
 def masked_softmax(weights: torch.Tensor, mask: torch.Tensor, dim: int = 0):
     """Softmax **ignoring** masked entries (mask == 0)."""
     weights = weights.masked_fill(~mask.bool(), -1e9)
@@ -230,6 +280,9 @@ class MultimodalLDAPyroModel(PyroModule):
         cell_topic_prior: torch.Tensor,
         topic_feature_priors: list[torch.Tensor],  # one tensor per modality (len = M)
         dispersion_rna: float = 1.,  # global NB dispersion for Gamma-Poisson modalities
+        topic_feature_prior_type: str = "logistic_normal",
+        use_feature_background: bool = True,
+        init_bg_mean: list[torch.Tensor | None] | None = None,
     ) -> None:
         super().__init__("multimodal_lda")
 
@@ -239,6 +292,8 @@ class MultimodalLDAPyroModel(PyroModule):
         self.n_inputs_modalities = n_inputs_modalities
         self.likelihoods = likelihoods
         self.dispersion_rna = dispersion_rna  # used for Gamma-Poisson / NB
+        self.topic_feature_prior_type = topic_feature_prior_type
+        self.use_feature_background = use_feature_background
 
         # Normalise/expand cell_topic_prior to length-K tensor
         cell_topic_prior = torch.as_tensor(cell_topic_prior)
@@ -249,20 +304,45 @@ class MultimodalLDAPyroModel(PyroModule):
         elif cell_topic_prior.numel() != n_topics:
             raise ValueError(f"cell_topic_prior must have length {n_topics} (got {cell_topic_prior.numel()})")
 
-        # Pre-compute Logistic-Normal approximations for priors
+        # Cell-topic prior always uses Logistic-Normal
         cell_mu, cell_sigma = logistic_normal_approximation(cell_topic_prior)
         self.register_buffer("cell_mu", cell_mu)
         self.register_buffer("cell_sigma", cell_sigma)
 
-        self.topic_prior_mus = torch.nn.ParameterList()
-        self.topic_prior_sigmas = torch.nn.ParameterList()
-        for t_prior in topic_feature_priors:
-            t_prior = torch.as_tensor(t_prior)
-            if t_prior.ndim == 0:
-                t_prior = t_prior.expand(1)  # fallback; should be length = n_features_m
-            mu_m, sig_m = logistic_normal_approximation(t_prior)
-            self.topic_prior_mus.append(torch.nn.Parameter(mu_m, requires_grad=False))
-            self.topic_prior_sigmas.append(torch.nn.Parameter(sig_m, requires_grad=False))
+        # Topic-feature priors: Logistic-Normal or Horseshoe
+        if topic_feature_prior_type == "logistic_normal":
+            # Pre-compute Logistic-Normal approximations for priors
+            self.topic_prior_mus = torch.nn.ParameterList()
+            self.topic_prior_sigmas = torch.nn.ParameterList()
+            for t_prior in topic_feature_priors:
+                t_prior = torch.as_tensor(t_prior)
+                if t_prior.ndim == 0:
+                    t_prior = t_prior.expand(1)  # fallback; should be length = n_features_m
+                mu_m, sig_m = logistic_normal_approximation(t_prior)
+                self.topic_prior_mus.append(torch.nn.Parameter(mu_m, requires_grad=False))
+                self.topic_prior_sigmas.append(torch.nn.Parameter(sig_m, requires_grad=False))
+
+        elif topic_feature_prior_type == "horseshoe":
+            # No pre-computed topic-feature priors for horseshoe
+            # (sampling happens dynamically in forward())
+            self.topic_prior_mus = None
+            self.topic_prior_sigmas = None
+
+        else:
+            raise ValueError(f"Unknown topic_feature_prior_type: {topic_feature_prior_type}")
+
+        # Feature background initialization (scTM-style)
+        # Register as buffers (not trainable, just for initialization)
+        if use_feature_background and init_bg_mean is not None:
+            for m, bg_mean_m in enumerate(init_bg_mean):
+                if bg_mean_m is not None:
+                    self.register_buffer(f"init_bg_mean_{m}", bg_mean_m)
+                else:
+                    self.register_buffer(f"init_bg_mean_{m}", torch.zeros(1))  # Placeholder
+        else:
+            # No background
+            for m in range(self.n_modalities):
+                self.register_buffer(f"init_bg_mean_{m}", torch.zeros(1))
 
         # Populated by training plan for full-batch ELBO scaling
         self.n_obs = None
@@ -290,14 +370,120 @@ class MultimodalLDAPyroModel(PyroModule):
     ):
         # ----- topic-feature distributions (per modality) -----
         topic_feature_dists = []  # will store φₖ,ₘ tensors
-        with pyro.plate("topics", self.n_topics):
-            for m in range(self.n_modalities):
-                mu_m = self.topic_prior_mus[m].unsqueeze(0).expand(self.n_topics, -1)
-                sig_m = self.topic_prior_sigmas[m].unsqueeze(0).expand(self.n_topics, -1)
 
+        if self.topic_feature_prior_type == "logistic_normal":
+            # EXISTING: Logistic-Normal prior
+            # First, sample backgrounds outside of topics plate (per-feature, not per-topic)
+            bg_samples = []
+            for m in range(self.n_modalities):
+                if self.use_feature_background and self.likelihoods[m] == "gamma_poisson":
+                    init_bg = getattr(self, f"init_bg_mean_{m}")
+                    if init_bg.numel() > 1:  # Not a placeholder
+                        with poutine.scale(scale=kl_weight):
+                            bg_m = pyro.sample(
+                                f"bg_{m}",
+                                dist.Normal(torch.zeros_like(init_bg), torch.ones_like(init_bg)).to_event(1)
+                            )
+                        bg_m = bg_m + init_bg  # Add empirical baseline
+                        bg_samples.append(bg_m)
+                    else:
+                        bg_samples.append(None)
+                else:
+                    bg_samples.append(None)
+
+            # Now sample topic-feature distributions
+            with pyro.plate("topics", self.n_topics):
+                for m in range(self.n_modalities):
+                    mu_m = self.topic_prior_mus[m].unsqueeze(0).expand(self.n_topics, -1)
+                    sig_m = self.topic_prior_sigmas[m].unsqueeze(0).expand(self.n_topics, -1)
+
+                    with poutine.scale(scale=kl_weight):
+                        log_phi = pyro.sample(f"log_topic_feature_dist_{m}", dist.Normal(mu_m, sig_m).to_event(1))
+
+                    # Add background if available
+                    if bg_samples[m] is not None:
+                        log_phi = log_phi + bg_samples[m].unsqueeze(0)  # (K, F_m) + (1, F_m) -> (K, F_m)
+
+                    topic_feature_dists.append(F.softmax(log_phi, dim=-1))  # (K, Fₘ)
+
+        elif self.topic_feature_prior_type == "horseshoe":
+            # NEW: Horseshoe prior (following scTM)
+            for m in range(self.n_modalities):
+                F_m = self.n_inputs_modalities[m]
+
+                # 1. Global auxiliary variable (regularization)
                 with poutine.scale(scale=kl_weight):
-                    log_phi = pyro.sample(f"log_topic_feature_dist_{m}", dist.Normal(mu_m, sig_m).to_event(1))
-                topic_feature_dists.append(F.softmax(log_phi, dim=-1))  # (K, Fₘ)
+                    caux_m = pyro.sample(
+                        f"caux_{m}",
+                        dist.InverseGamma(
+                            torch.ones(1, device=self._dummy.device) * 0.5,
+                            torch.ones(1, device=self._dummy.device) * 0.5
+                        )
+                    )
+
+                # 2. Per-topic local shrinkage
+                with pyro.plate(f"topics_tau_{m}", self.n_topics):
+                    with poutine.scale(scale=kl_weight):
+                        tau_m = pyro.sample(
+                            f"tau_{m}",
+                            dist.HalfCauchy(torch.ones(1, device=self._dummy.device))
+                        )
+                tau_m = tau_m.unsqueeze(-1)  # (K, 1)
+
+                # 3. Per-feature local shrinkage
+                with pyro.plate(f"features_delta_{m}", F_m):
+                    with poutine.scale(scale=kl_weight):
+                        delta_m = pyro.sample(
+                            f"delta_{m}",
+                            dist.HalfCauchy(torch.ones(1, device=self._dummy.device))
+                        )
+                # delta_m is (F_m,)
+
+                # 4. Per-topic-feature interaction shrinkage
+                # Note: Nested plates add dimensions from left, so outer plate -> inner dimension
+                with pyro.plate(f"features_lambda_{m}", F_m):
+                    with pyro.plate(f"topics_lambda_{m}", self.n_topics):
+                        with poutine.scale(scale=kl_weight):
+                            lambda_m = pyro.sample(
+                                f"lambda_{m}",
+                                dist.HalfCauchy(torch.ones(1, device=self._dummy.device))
+                            )
+                # lambda_m is now (K, F_m) after plate ordering
+
+                # 5. Compute horseshoe shrinkage multiplier
+                lambda_tilde_m = horseshoe_shrinkage(caux_m, tau_m, delta_m, lambda_m)  # (K, F_m)
+
+                # 6. Sample standard normal coefficients
+                with pyro.plate(f"features_beta_{m}", F_m):
+                    with pyro.plate(f"topics_beta_{m}", self.n_topics):
+                        with poutine.scale(scale=kl_weight):
+                            beta_m = pyro.sample(
+                                f"beta_{m}",
+                                dist.Normal(torch.zeros(1, device=self._dummy.device),
+                                           torch.ones(1, device=self._dummy.device))
+                            )
+                # beta_m is now (K, F_m) after plate ordering
+
+                # 7. Apply shrinkage and convert to log-probabilities
+                beta_shrunk_m = beta_m * lambda_tilde_m  # (K, F_m)
+
+                # Feature background (scTM-style) - only for gamma_poisson
+                if self.use_feature_background and self.likelihoods[m] == "gamma_poisson":
+                    init_bg = getattr(self, f"init_bg_mean_{m}")
+                    if init_bg.numel() > 1:  # Not a placeholder
+                        with poutine.scale(scale=kl_weight):
+                            bg_m = pyro.sample(
+                                f"bg_{m}",
+                                dist.Normal(torch.zeros_like(init_bg), torch.ones_like(init_bg)).to_event(1)
+                            )
+                        bg_m = bg_m + init_bg  # Add empirical baseline
+                        beta_shrunk_m = beta_shrunk_m + bg_m.unsqueeze(0)  # (K, F_m) + (1, F_m) -> (K, F_m)
+
+                # Register as named sample for guide to match
+                pyro.deterministic(f"log_topic_feature_dist_{m}", beta_shrunk_m)
+
+                # 8. Convert to probability simplex
+                topic_feature_dists.append(F.softmax(beta_shrunk_m, dim=-1))
 
         # ----- cells plate -----
         with pyro.plate("cells", size=n_obs or self.n_obs, subsample_size=x.shape[0]):
@@ -350,6 +536,9 @@ class MultimodalLDAPyroGuide(PyroModule):
         max_n_obs: int | None = None,
         spatial: bool = False,
         adjacency: torch.Tensor | Sequence[torch.Tensor] | None = None,
+        topic_feature_prior_type: str = "logistic_normal",
+        use_feature_background: bool = True,
+        likelihoods: list[str] | None = None,
     ) -> None:
         super().__init__("multimodal_lda_guide")
         self.n_modalities = len(n_inputs_modalities)
@@ -357,6 +546,9 @@ class MultimodalLDAPyroGuide(PyroModule):
         self.n_topics = n_topics
         self.use_gcn = spatial
         self.adjacency = adjacency  # keep reference for downstream checks/tests
+        self.topic_feature_prior_type = topic_feature_prior_type
+        self.use_feature_background = use_feature_background
+        self.likelihoods = likelihoods if likelihoods is not None else ["gamma_poisson"] * self.n_modalities
 
         # Regular encoders (always present)
         self.encoders = torch.nn.ModuleList(
@@ -393,12 +585,77 @@ class MultimodalLDAPyroGuide(PyroModule):
             self.multiple_adjacencies = False
 
         # per-modality topic-feature posterior params
-        self.topic_feature_posterior_mu = torch.nn.ParameterList()
-        self.unconstrained_topic_feature_posterior_sigma = torch.nn.ParameterList()
-        for F_m in n_inputs_modalities:
-            mu_m, sig_m = logistic_normal_approximation(torch.ones(F_m))
-            self.topic_feature_posterior_mu.append(torch.nn.Parameter(mu_m.repeat(n_topics, 1)))
-            self.unconstrained_topic_feature_posterior_sigma.append(torch.nn.Parameter(sig_m.repeat(n_topics, 1)))
+        if topic_feature_prior_type == "logistic_normal":
+            # Existing: per-modality topic-feature posterior params
+            self.topic_feature_posterior_mu = torch.nn.ParameterList()
+            self.unconstrained_topic_feature_posterior_sigma = torch.nn.ParameterList()
+            for F_m in n_inputs_modalities:
+                mu_m, sig_m = logistic_normal_approximation(torch.ones(F_m))
+                self.topic_feature_posterior_mu.append(torch.nn.Parameter(mu_m.repeat(n_topics, 1)))
+                self.unconstrained_topic_feature_posterior_sigma.append(torch.nn.Parameter(sig_m.repeat(n_topics, 1)))
+
+        elif topic_feature_prior_type == "horseshoe":
+            # NEW: Horseshoe variational parameters (LogNormal distributions)
+            # Following scTM convention: xxx_loc and xxx_scale
+
+            # Per modality: caux (scalar)
+            self.caux_loc = torch.nn.ParameterList()
+            self.caux_scale = torch.nn.ParameterList()
+
+            # Per modality: tau (K,)
+            self.tau_loc = torch.nn.ParameterList()
+            self.tau_scale = torch.nn.ParameterList()
+
+            # Per modality: delta (F_m,)
+            self.delta_loc = torch.nn.ParameterList()
+            self.delta_scale = torch.nn.ParameterList()
+
+            # Per modality: lambda (K, F_m)
+            self.lambda_loc = torch.nn.ParameterList()
+            self.lambda_scale = torch.nn.ParameterList()
+
+            # Per modality: beta (K, F_m)
+            self.beta_loc = torch.nn.ParameterList()
+            self.beta_scale = torch.nn.ParameterList()
+
+            for F_m in n_inputs_modalities:
+                # Initialize caux
+                self.caux_loc.append(torch.nn.Parameter(torch.ones(1)))
+                self.caux_scale.append(torch.nn.Parameter(torch.ones(1)))
+
+                # Initialize tau (per-topic)
+                self.tau_loc.append(torch.nn.Parameter(torch.zeros(n_topics)))
+                self.tau_scale.append(torch.nn.Parameter(torch.ones(n_topics)))
+
+                # Initialize delta (per-feature)
+                self.delta_loc.append(torch.nn.Parameter(torch.zeros(F_m)))
+                self.delta_scale.append(torch.nn.Parameter(torch.ones(F_m)))
+
+                # Initialize lambda (per-topic-feature)
+                self.lambda_loc.append(torch.nn.Parameter(torch.zeros(n_topics, F_m)))
+                self.lambda_scale.append(torch.nn.Parameter(torch.ones(n_topics, F_m)))
+
+                # Initialize beta (per-topic-feature)
+                self.beta_loc.append(torch.nn.Parameter(torch.zeros(n_topics, F_m)))
+                self.beta_scale.append(torch.nn.Parameter(torch.ones(n_topics, F_m)))
+
+        # Feature background variational parameters (scTM-style)
+        # Only for gamma_poisson modalities when use_feature_background=True
+        if use_feature_background:
+            self.bg_loc = torch.nn.ParameterList()
+            self.bg_scale = torch.nn.ParameterList()
+            for m, (F_m, likelihood) in enumerate(zip(n_inputs_modalities, self.likelihoods)):
+                if likelihood == "gamma_poisson":
+                    # Create background parameters for gamma_poisson modalities
+                    self.bg_loc.append(torch.nn.Parameter(torch.zeros(F_m)))
+                    self.bg_scale.append(torch.nn.Parameter(torch.ones(F_m)))
+                else:
+                    # Placeholder for multinomial modalities (won't be used)
+                    self.bg_loc.append(None)
+                    self.bg_scale.append(None)
+        else:
+            self.bg_loc = None
+            self.bg_scale = None
 
         if weight_mode == "equal":
             self.mod_w = None
@@ -455,7 +712,13 @@ class MultimodalLDAPyroGuide(PyroModule):
     # property for sigmas
     @property
     def topic_feature_posterior_sigma(self) -> list[torch.Tensor]:
-        return [self._softplus(u) for u in self.unconstrained_topic_feature_posterior_sigma]
+        if self.topic_feature_prior_type == "logistic_normal":
+            return [self._softplus(u) for u in self.unconstrained_topic_feature_posterior_sigma]
+        elif self.topic_feature_prior_type == "horseshoe":
+            # For horseshoe, return beta posterior scales
+            return [self._softplus(s) for s in self.beta_scale]
+        else:
+            raise ValueError(f"Unknown prior type: {self.topic_feature_prior_type}")
 
     # ═══════════════════════════════════════════════════════════════════════
     # NEW METHOD: Initialize full graph data for semi-supervised learning
@@ -513,16 +776,87 @@ class MultimodalLDAPyroGuide(PyroModule):
         
         cell_idx = batch_indices  # for weight mixing (if weight_mode=="cell")
 
-        # ϕₖ,ₘ variational dists
-        for m in range(self.n_modalities):
-            with pyro.plate(f"topics_{m}", self.n_topics):
+        # ϕₖ,ₘ variational distributions
+        if self.topic_feature_prior_type == "logistic_normal":
+            # EXISTING: Logistic-Normal posterior
+            for m in range(self.n_modalities):
+                with pyro.plate(f"topics_{m}", self.n_topics):
+                    with poutine.scale(scale=kl_weight):
+                        pyro.sample(
+                            f"log_topic_feature_dist_{m}",
+                            dist.Normal(
+                                self.topic_feature_posterior_mu[m],
+                                self.topic_feature_posterior_sigma[m]
+                            ).to_event(1),
+                        )
+
+                # Feature background variational posterior (scTM-style)
+                if self.use_feature_background and self.bg_loc is not None and self.bg_loc[m] is not None:
+                    with poutine.scale(scale=kl_weight):
+                        pyro.sample(
+                            f"bg_{m}",
+                            dist.Normal(self.bg_loc[m], self._softplus(self.bg_scale[m])).to_event(1)
+                        )
+
+        elif self.topic_feature_prior_type == "horseshoe":
+            # NEW: Horseshoe variational posteriors (LogNormal)
+            for m in range(self.n_modalities):
+                F_m = self.n_inputs_modalities[m]
+
+                # 1. caux variational posterior
                 with poutine.scale(scale=kl_weight):
                     pyro.sample(
-                        f"log_topic_feature_dist_{m}",
-                        dist.Normal(self.topic_feature_posterior_mu[m], self.topic_feature_posterior_sigma[m]).to_event(
-                            1
-                        ),
+                        f"caux_{m}",
+                        dist.LogNormal(self.caux_loc[m], self._softplus(self.caux_scale[m]))
                     )
+
+                # 2. tau variational posterior
+                with pyro.plate(f"topics_tau_{m}", self.n_topics):
+                    with poutine.scale(scale=kl_weight):
+                        pyro.sample(
+                            f"tau_{m}",
+                            dist.LogNormal(self.tau_loc[m], self._softplus(self.tau_scale[m]))
+                        )
+
+                # 3. delta variational posterior
+                with pyro.plate(f"features_delta_{m}", F_m):
+                    with poutine.scale(scale=kl_weight):
+                        pyro.sample(
+                            f"delta_{m}",
+                            dist.LogNormal(self.delta_loc[m], self._softplus(self.delta_scale[m]))
+                        )
+
+                # 4. lambda variational posterior
+                with pyro.plate(f"features_lambda_{m}", F_m):
+                    with pyro.plate(f"topics_lambda_{m}", self.n_topics):
+                        with poutine.scale(scale=kl_weight):
+                            pyro.sample(
+                                f"lambda_{m}",
+                                dist.LogNormal(
+                                    self.lambda_loc[m],
+                                    self._softplus(self.lambda_scale[m])
+                                )
+                            )
+
+                # 5. beta variational posterior
+                with pyro.plate(f"features_beta_{m}", F_m):
+                    with pyro.plate(f"topics_beta_{m}", self.n_topics):
+                        with poutine.scale(scale=kl_weight):
+                            pyro.sample(
+                                f"beta_{m}",
+                                dist.Normal(
+                                    self.beta_loc[m],
+                                    self._softplus(self.beta_scale[m])
+                                )
+                            )
+
+                # Feature background variational posterior (scTM-style)
+                if self.use_feature_background and self.bg_loc is not None and self.bg_loc[m] is not None:
+                    with poutine.scale(scale=kl_weight):
+                        pyro.sample(
+                            f"bg_{m}",
+                            dist.Normal(self.bg_loc[m], self._softplus(self.bg_scale[m])).to_event(1)
+                        )
 
         # θₙ variational
         xs = torch.split(x, self.n_inputs_modalities, dim=1)  # (B,Fₘ)
@@ -560,6 +894,9 @@ class MultimodalAmortizedLDAPyroModule(PyroBaseModuleClass):
         n_hidden: int,
         cell_topic_prior: float | Sequence[float] | None = None,
         topic_feature_prior: float | Sequence[float] | None = None,
+        topic_feature_prior_type: str = "logistic_normal",
+        use_feature_background: bool = True,
+        init_bg_mean: list[torch.Tensor | None] | None = None,
         weight_mode: str = "equal",
         max_n_obs: int | None = None,
         spatial: bool = False,
@@ -574,6 +911,8 @@ class MultimodalAmortizedLDAPyroModule(PyroBaseModuleClass):
         self.n_modalities = len(n_inputs_modalities)
         self.weight_mode = weight_mode
         self.spatial = spatial
+        self.topic_feature_prior_type = topic_feature_prior_type
+        self.use_feature_background = use_feature_background
 
         if cell_topic_prior is None:
             cell_topic_prior_tensor = torch.full((n_topics,), 1 / n_topics)
@@ -597,6 +936,9 @@ class MultimodalAmortizedLDAPyroModule(PyroBaseModuleClass):
             n_topics,
             cell_topic_prior_tensor,
             topic_feature_priors,
+            topic_feature_prior_type=topic_feature_prior_type,
+            use_feature_background=use_feature_background,
+            init_bg_mean=init_bg_mean,
         )
         self._guide = MultimodalLDAPyroGuide(
             n_inputs_modalities,
@@ -606,6 +948,9 @@ class MultimodalAmortizedLDAPyroModule(PyroBaseModuleClass):
             max_n_obs=max_n_obs,
             spatial=spatial,
             adjacency=adjacency,
+            topic_feature_prior_type=topic_feature_prior_type,
+            use_feature_background=use_feature_background,
+            likelihoods=likelihoods,
         )
 
         # We need this method so scvi training plan can create data-loader args
@@ -646,15 +991,49 @@ class MultimodalAmortizedLDAPyroModule(PyroBaseModuleClass):
 
     # utilities
     def topic_by_feature(self, n_samples: int = 5_000):
+        """
+        Compute E[ϕₖ,ₘ] via Monte Carlo sampling from variational posterior.
+
+        Parameters
+        ----------
+        n_samples : int
+            Number of Monte Carlo samples (default: 5000)
+
+        Returns
+        -------
+        dict
+            Dictionary mapping modality index to topic-feature distribution tensor (K, F_m)
+        """
         out = {}
-        for m, (mu, sig) in enumerate(
-            zip(self.guide.topic_feature_posterior_mu, self.guide.topic_feature_posterior_sigma, strict=False)
-        ):
-            tbf = torch.mean(
-                F.softmax(dist.Normal(mu.detach().cpu(), sig.detach().cpu()).sample((n_samples,)), dim=2),
-                dim=0,
-            )
-            out[m] = tbf  # user can map index→ modality name externally
+
+        if self.guide.topic_feature_prior_type == "logistic_normal":
+            for m, (mu, sig) in enumerate(
+                zip(self.guide.topic_feature_posterior_mu,
+                    self.guide.topic_feature_posterior_sigma,
+                    strict=False)
+            ):
+                tbf = torch.mean(
+                    F.softmax(
+                        dist.Normal(mu.detach().cpu(), sig.detach().cpu()).sample((n_samples,)),
+                        dim=2
+                    ),
+                    dim=0,
+                )
+                out[m] = tbf  # (K, F_m)
+
+        elif self.guide.topic_feature_prior_type == "horseshoe":
+            # Sample from beta posterior and apply softmax
+            for m, (mu, sig) in enumerate(
+                zip(self.guide.beta_loc, self.guide.beta_scale, strict=False)
+            ):
+                beta_samples = dist.Normal(
+                    mu.detach().cpu(),
+                    self.guide._softplus(sig).detach().cpu()
+                ).sample((n_samples,))  # (n_samples, K, F_m)
+
+                tbf = torch.mean(F.softmax(beta_samples, dim=2), dim=0)  # (K, F_m)
+                out[m] = tbf
+
         return out
 
     def get_topic_distribution(self, x: torch.Tensor, n_samples: int = 5_000) -> torch.Tensor:

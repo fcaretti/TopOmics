@@ -149,6 +149,8 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
         n_hidden: int = 128,
         cell_topic_prior: float | Sequence[float] | None = None,
         topic_feature_prior: float | Sequence[float] | None = None,
+        topic_feature_prior_type: str = "logistic_normal",
+        use_feature_background: bool = True,
         modality_names: list[str] | None = None,
         weight_mode: str = "equal",
     ):
@@ -172,10 +174,26 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
             Dirichlet concentration for θₙ.
         topic_feature_prior
             Dirichlet concentration for ϕₖ,ₘ.
+        topic_feature_prior_type
+            Type of prior for topic-feature distributions ϕₖ,ₘ (default: "logistic_normal"):
+
+            - ``"logistic_normal"``: Logistic-Normal approximation of Dirichlet (current behavior)
+            - ``"horseshoe"``: Regularized horseshoe prior for adaptive sparsity (scTM-style)
+
+            The horseshoe prior induces sparsity in topic-feature associations, making topics
+            more interpretable by pushing many features toward zero while preserving important
+            features. Useful for high-dimensional feature spaces (genes, proteins, peaks).
+        use_feature_background
+            Whether to use feature-specific background terms (default: True).
+            Only applies to modalities with ``likelihood="gamma_poisson"``.
+            Following scTM, this separates baseline feature expression from topic-specific
+            variation by adding a learned background term bg_m to log-probabilities.
+            Ignored for ``likelihood="multinomial"`` modalities.
         modality_names
             Optional list of modality names (e.g., ["rna", "protein"]). If None, uses indices.
         weight_mode
             How to weight modality-specific representations when mixing:
+
             - "equal": All modalities weighted equally (default, simplest)
             - "universal": Learn a single weight per modality across all cells
             - "cell": Learn per-cell, per-modality weights (most flexible)
@@ -220,6 +238,14 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
         if weight_mode not in valid_modes:
             raise ValueError(f"weight_mode must be one of {valid_modes}, got '{weight_mode}'")
 
+        # Validate topic_feature_prior_type
+        valid_prior_types = {"logistic_normal", "horseshoe"}
+        if topic_feature_prior_type not in valid_prior_types:
+            raise ValueError(
+                f"topic_feature_prior_type must be one of {valid_prior_types}, "
+                f"got '{topic_feature_prior_type}'"
+            )
+
         # Store modality information
         self.n_modalities = len(n_inputs_modalities)
         self.n_inputs_modalities = n_inputs_modalities
@@ -227,6 +253,55 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
         self.modality_names = modality_names if modality_names else [str(i) for i in range(self.n_modalities)]
         self.weight_mode = weight_mode
         self.n_topics = n_topics
+        self.topic_feature_prior_type = topic_feature_prior_type
+        self.use_feature_background = use_feature_background
+
+        # Log horseshoe usage
+        if topic_feature_prior_type == "horseshoe":
+            logger.info(
+                "Using regularized horseshoe prior for topic-feature distributions. "
+                "This induces sparsity for more interpretable topics."
+            )
+
+        # Compute feature background initialization (scTM-style)
+        # Only for gamma_poisson modalities when use_feature_background=True
+        init_bg_mean_list = []
+        if use_feature_background:
+            # Get data
+            X_full = self.adata.X
+            if sp.issparse(X_full):
+                X_full = X_full.toarray()
+            X_full = np.asarray(X_full, dtype=np.float32)
+
+            # Extract per-modality data and compute background
+            start_idx = 0
+            for m, (n_features, likelihood) in enumerate(zip(n_inputs_modalities, likelihoods)):
+                end_idx = start_idx + n_features
+
+                if likelihood == "gamma_poisson":
+                    # Extract modality data
+                    X_m = X_full[:, start_idx:end_idx]
+
+                    # Compute mean expression per feature (scTM approach)
+                    # Use log(mean + 1) to get baseline expression in log-space
+                    mean_expr = X_m.mean(axis=0)  # (F_m,)
+                    init_bg_mean_m = np.log(mean_expr + 1.0)  # (F_m,)
+
+                    # Convert to tensor
+                    init_bg_mean_list.append(torch.as_tensor(init_bg_mean_m, dtype=torch.float32))
+
+                    logger.info(
+                        f"Modality {m} ({likelihood}): Computed feature background "
+                        f"(mean={init_bg_mean_m.mean():.3f}, std={init_bg_mean_m.std():.3f})"
+                    )
+                else:
+                    # No background for multinomial
+                    init_bg_mean_list.append(None)
+
+                start_idx = end_idx
+        else:
+            # No background
+            init_bg_mean_list = [None] * self.n_modalities
 
         if self.spatial:
             adjacency = _prepare_adjacency_tensors(spatial_uns, self.modality_names)
@@ -249,6 +324,9 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
             n_hidden=n_hidden,
             cell_topic_prior=cell_topic_prior,
             topic_feature_prior=topic_feature_prior,
+            topic_feature_prior_type=topic_feature_prior_type,
+            use_feature_background=use_feature_background,
+            init_bg_mean=init_bg_mean_list,
             weight_mode=weight_mode,
             max_n_obs=max_n_obs,
             spatial=self.spatial,
