@@ -374,9 +374,11 @@ class MultimodalLDAPyroModel(PyroModule):
         if self.topic_feature_prior_type == "logistic_normal":
             # EXISTING: Logistic-Normal prior
             # First, sample backgrounds outside of topics plate (per-feature, not per-topic)
+            # Note: Background terms only apply to count-based likelihoods (gamma_poisson, nb).
+            # Bernoulli and multinomial likelihoods do not use feature backgrounds.
             bg_samples = []
             for m in range(self.n_modalities):
-                if self.use_feature_background and self.likelihoods[m] == "gamma_poisson":
+                if self.use_feature_background and self.likelihoods[m] in {"gamma_poisson", "nb"}:
                     init_bg = getattr(self, f"init_bg_mean_{m}")
                     if init_bg.numel() > 1:  # Not a placeholder
                         with poutine.scale(scale=kl_weight):
@@ -467,8 +469,8 @@ class MultimodalLDAPyroModel(PyroModule):
                 # 7. Apply shrinkage and convert to log-probabilities
                 beta_shrunk_m = beta_m * lambda_tilde_m  # (K, F_m)
 
-                # Feature background (scTM-style) - only for gamma_poisson
-                if self.use_feature_background and self.likelihoods[m] == "gamma_poisson":
+                # Feature background (scTM-style) - only for count-based likelihoods
+                if self.use_feature_background and self.likelihoods[m] in {"gamma_poisson", "nb"}:
                     init_bg = getattr(self, f"init_bg_mean_{m}")
                     if init_bg.numel() > 1:  # Not a placeholder
                         with poutine.scale(scale=kl_weight):
@@ -514,6 +516,17 @@ class MultimodalLDAPyroModel(PyroModule):
                     pyro.sample(
                         f"feature_counts_{m}",
                         dist.NegativeBinomial(total_count=r, probs=mu / (mu + r)).to_event(1),
+                        obs=x_m,
+                    )
+                elif L_m == "bernoulli":
+                    # Library size scaling (depth normalization)
+                    lib_ratio = lib_m / lib_m.mean()  # (B,) - relative depth
+                    p_m = rate_m * lib_ratio.unsqueeze(-1)  # (B, F_m) - scale by depth
+                    p_m = torch.clamp(p_m, max=1.0)  # Ensure valid probability
+                    # Sample Bernoulli observations
+                    pyro.sample(
+                        f"feature_counts_{m}",
+                        dist.Bernoulli(probs=p_m).to_event(1),
                         obs=x_m,
                     )
                 else:

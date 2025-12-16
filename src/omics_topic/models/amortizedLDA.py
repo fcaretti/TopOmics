@@ -165,7 +165,11 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
         n_inputs_modalities
             List of feature counts per modality.
         likelihoods
-            List of likelihood strings per modality ("multinomial" or "gamma_poisson").
+            List of likelihood models, one per modality.
+            Options:
+                - "multinomial": For discrete count data (RNA-seq)
+                - "gamma_poisson" or "nb": For overdispersed count data (scRNA-seq, protein)
+                - "bernoulli": For binary presence/absence data (ATAC-seq peaks, methylation)
         n_topics
             Number of topics.
         n_hidden
@@ -245,6 +249,27 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
                 f"topic_feature_prior_type must be one of {valid_prior_types}, "
                 f"got '{topic_feature_prior_type}'"
             )
+
+        # Validate that Bernoulli modalities contain only binary values {0, 1}
+        for m, likelihood_m in enumerate(likelihoods):
+            if likelihood_m == "bernoulli":
+                # Get modality data from adata
+                cursor = sum(n_inputs_modalities[:m])
+                n_features = n_inputs_modalities[m]
+
+                # Check if data is binary
+                x_modality = adata.X[:, cursor:cursor + n_features]
+                if hasattr(x_modality, 'toarray'):
+                    x_modality = x_modality.toarray()
+
+                unique_vals = np.unique(x_modality)
+                if not np.all(np.isin(unique_vals, [0, 1])):
+                    raise ValueError(
+                        f"Modality {m} (likelihood='bernoulli') contains non-binary values. "
+                        f"Found values: {unique_vals}. Bernoulli likelihood requires data "
+                        f"to be strictly 0 or 1. For binarized ATAC-seq data, ensure peaks "
+                        f"are encoded as presence/absence (not counts)."
+                    )
 
         # Store modality information
         self.n_modalities = len(n_inputs_modalities)
@@ -785,7 +810,7 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
             - n_topics: Number of topics (default: 20)
             - n_hidden: Hidden units in encoders (default: 128)
             - weight_mode: "equal", "universal", or "cell" (default: "equal")
-            - likelihoods: List of likelihoods per modality (auto-inferred if not provided)
+            - likelihoods: List of likelihoods per modality ("multinomial", "gamma_poisson"/"nb", "bernoulli"; auto-inferred if not provided)
         """
         if modality_order is None:
             modality_order = list(mdata.mod.keys())
@@ -859,7 +884,7 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
             - n_topics: Number of topics (required)
             - n_hidden: Hidden units (default: 128)
             - weight_mode: "equal", "universal", or "cell" (default: "equal")
-            - likelihoods: List of likelihoods (auto-inferred if not provided)
+            - likelihoods: List of likelihoods per modality ("multinomial", "gamma_poisson"/"nb", "bernoulli"; auto-inferred if not provided)
 
         Returns
         -------

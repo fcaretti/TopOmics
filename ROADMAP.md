@@ -18,7 +18,7 @@ So basically every model is going to inherit the class BaseTopicModel, that cont
     - [ ] Entropy
     - [ ] Coherence with paths
     - [ ] Cross-Modality correlations
-- [ ] Add support for spatial data in AmortizedLDA
+- [X] Add support for spatial data in AmortizedLDA
   - [X] Update `MultimodalAmortizedLDA.setup_anndata/setup_mudata/from_mudata` in `src/omics_topic/models/amortizedLDA.py` to accept `spatial_key`/`spatial_modality_keys`, call the helper, and store resolved graph + metadata in `adata.uns` / `mdata.uns`
   - [X] Let `MultimodalAmortizedLDA.__init__` (same file) pick up the stored graph handle and propagate adjacency to the Pyro module; error if the requested `spatial_key` is missing
   - [X] Add GCN encoder branch in `MultimodalLDAPyroGuide` (in `src/omics_topic/module/_amortizedLDA.py`) that is automatically used when spatial graphs are present (no user flag), otherwise fall back to MLP encoders
@@ -29,11 +29,17 @@ So basically every model is going to inherit the class BaseTopicModel, that cont
   - [ ] Implement `get_topic_by_location` (in `MultimodalAmortizedLDA`, same file) to aggregate θ over spatial neighborhoods or coordinates using the chosen `spatial_key`
   - [X] **Implement train/test set in the presence of graph (semi-supervised learning)**
     - [X] Track validation ELBO during training
-  - [ ] Use GAT instead of GCN
+  - [X] Use GAT instead of GCN
 - [ ] Implement different distribution choices
   - [X] Standard Gamma-Poisson
   - [X] Standard Dirichlet
-  - [ ] Horseshoe prior Gamma-Poisson
-  - [ ] Horseshoe prior Dirichlet
+  - [X] Horseshoe prior Gamma-Poisson
+  - [X] Horseshoe prior Dirichlet
+
+  - [X] **Add feature background term (bg) - STAMP style**
+
+      
+- [X] **Add Bernoulli likelihood for binary data (ATAC-seq, methylation)**
+  - [X] Rescaling parameter due to library size
+
 - [ ] **Add entropy term to avoid topic collapse**
-- [ ] **Add library size param in Gamma-Poisson**
