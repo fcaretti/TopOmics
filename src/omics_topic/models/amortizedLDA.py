@@ -152,7 +152,10 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
         topic_feature_prior_type: str = "logistic_normal",
         use_feature_background: bool = True,
         modality_names: list[str] | None = None,
-        weight_mode: str = "equal",
+        weight_mode: str = "cell",
+        normalize_encoder_inputs: bool = True,
+        encoder_scale_factor: float = 1e6,
+        entropy_weight: float = 0.0,
     ):
         """
         Initialize MultimodalAmortizedLDA with Mixture-of-Experts (MoE) architecture.
@@ -201,6 +204,22 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
             - "equal": All modalities weighted equally (default, simplest)
             - "universal": Learn a single weight per modality across all cells
             - "cell": Learn per-cell, per-modality weights (most flexible)
+        normalize_encoder_inputs
+            If ``True``, normalize counts by library size and apply log1p before encoding.
+            Each modality is normalized to its own median sequencing depth:
+            ``log(counts / library_size * median_depth + 1)``
+            This is standard preprocessing in scRNA-seq analysis. Default: ``True``.
+        encoder_scale_factor
+            Deprecated. Scale factor is now computed dynamically as the median depth
+            per modality. This parameter is kept for backward compatibility but is ignored.
+        entropy_weight
+            Weight for entropy regularization term (default: 0.0).
+            When > 0, adds an entropy bonus to the ELBO objective to encourage diverse
+            topic usage and prevent topic collapse:
+            ``Objective = ELBO + entropy_weight * Σ_n H(θ_n)``
+            where H(θ_n) = -Σ_k θ_n,k * log(θ_n,k) is the entropy of cell-topic distribution.
+            Typical values: 0.001-0.1. Higher values → more uniform topic distributions.
+            Trade-off: too high can hurt reconstruction quality.
 
         Notes
         -----
@@ -276,10 +295,14 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
         self.n_inputs_modalities = n_inputs_modalities
         self.likelihoods = likelihoods
         self.modality_names = modality_names if modality_names else [str(i) for i in range(self.n_modalities)]
+        self.modalities = self.modality_names  # alias for BaseTopicModel utilities
         self.weight_mode = weight_mode
         self.n_topics = n_topics
         self.topic_feature_prior_type = topic_feature_prior_type
         self.use_feature_background = use_feature_background
+        self.normalize_encoder_inputs = normalize_encoder_inputs
+        self.encoder_scale_factor = encoder_scale_factor
+        self.entropy_weight = entropy_weight
 
         # Log horseshoe usage
         if topic_feature_prior_type == "horseshoe":
@@ -356,6 +379,9 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
             max_n_obs=max_n_obs,
             spatial=self.spatial,
             adjacency=adjacency,
+            normalize_encoder_inputs=normalize_encoder_inputs,
+            encoder_scale_factor=encoder_scale_factor,
+            entropy_weight=entropy_weight,
         )
 
         # For spatial models, initialise GCN encoders with full-graph data
@@ -367,6 +393,9 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
             self.module.set_full_graph_data(x_tensor)
 
         self.init_params_ = self._get_init_params(locals())
+
+        # Initialize metric cache (from BaseTopicModel pattern)
+        self._cached_metrics = {}
 
         if self.spatial:
             if isinstance(spatial_uns, dict) and "adjacency" in spatial_uns:
@@ -976,13 +1005,19 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
     #                         public helper methods                      #
     # ------------------------------------------------------------------ #
     def get_feature_topic_dist(
-        self, n_samples: int = 5_000, as_dict: bool = False
+        self,
+        modality: str | int | None = None,
+        n_samples: int = 5_000,
+        as_dict: bool = False,
     ) -> dict[int, pd.DataFrame] | pd.DataFrame:
         """
         Monte-Carlo estimate of E[ϕₖ,ₘ].
 
         Parameters
         ----------
+        modality
+            Modality name or index. If provided, return only that modality's
+            topic-feature distribution; otherwise return all.
         n_samples
             MC samples from variational posterior.
         as_dict
@@ -1006,8 +1041,61 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
 
         if as_dict:
             return dfs
+        if modality is not None:
+            # Allow modality name or index
+            if isinstance(modality, str):
+                if modality not in self.modality_names:
+                    raise ValueError(f"Unknown modality '{modality}'. Valid modalities: {self.modality_names}")
+                mod_idx = self.modality_names.index(modality)
+            else:
+                mod_idx = int(modality)
+            if mod_idx not in dfs:
+                raise KeyError(f"Topic-feature distribution missing for modality index {mod_idx}.")
+            return dfs[mod_idx]
         # concat to mimic original signature
         return pd.concat(dfs.values(), axis=0)
+
+    # ------------------------------------------------------------------ #
+    def get_topic_diversity(self, modality: str | None = None) -> float:
+        """
+        Compute topic diversity (average pairwise cosine distance) per modality or overall.
+        """
+        if modality is None:
+            cache_key = "topic_diversity_all_modalities"
+            if hasattr(self, "_cached_metrics") and cache_key in self._cached_metrics:
+                return self._cached_metrics[cache_key]
+
+            diversities = [self.get_topic_diversity(mod) for mod in self.modality_names]
+            result = float(np.mean(diversities))
+            if hasattr(self, "_cached_metrics"):
+                self._cached_metrics[cache_key] = result
+            return result
+
+        cache_key = f"topic_diversity_modality={modality}"
+        if hasattr(self, "_cached_metrics") and cache_key in self._cached_metrics:
+            return self._cached_metrics[cache_key]
+
+        if modality not in self.modality_names:
+            raise ValueError(f"Unknown modality '{modality}'. Valid modalities: {self.modality_names}")
+        mod_idx = self.modality_names.index(modality)
+
+        phi_dict = self.get_feature_topic_dist(as_dict=True)
+        if mod_idx not in phi_dict:
+            raise KeyError(f"Topic-feature distribution missing for modality index {mod_idx}.")
+        phi_df = phi_dict[mod_idx]
+
+        phi = phi_df.values.T if isinstance(phi_df, pd.DataFrame) else np.asarray(phi_df).T
+        phi_norm = phi / (np.linalg.norm(phi, axis=1, keepdims=True) + 1e-12)
+        cosine_sim = phi_norm @ phi_norm.T
+
+        K = phi.shape[0]
+        upper_tri_indices = np.triu_indices(K, k=1)
+        similarities = cosine_sim[upper_tri_indices]
+        result = float(1 - similarities.mean())
+
+        if hasattr(self, "_cached_metrics"):
+            self._cached_metrics[cache_key] = result
+        return result
 
     # ------------------------------------------------------------------ #
     def get_latent_representation(
@@ -1084,7 +1172,8 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
         libs = []
         cursor = 0
         for F_m in self.module.n_inputs_modalities:
-            libs.append(x[:, cursor : cursor + F_m].sum(dim=1))
+            lib_m = x[:, cursor : cursor + F_m].sum(dim=1)
+            libs.append(torch.clamp(lib_m, min=0.0))  # guard against negative/centered inputs
             cursor += F_m
         return torch.stack(libs, dim=1)  # (B, M)
 
@@ -1122,6 +1211,370 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
         total_counts = sum(tensors[REGISTRY_KEYS.X_KEY].sum().item() for tensors in dl)
 
         return float(np.exp(-self.get_elbo(adata, indices, batch_size) / total_counts))
+
+    # ------------------------------------------------------------------ #
+    def get_entropy(
+        self,
+        adata: AnnData | None = None,
+        indices: _Seq[int] | None = None,
+        batch_size: int | None = None,
+        normalised: bool = True,
+    ) -> float:
+        """
+        Compute mean entropy of cell-topic distributions.
+
+        Higher entropy means topics are more evenly distributed across cells.
+
+        Parameters
+        ----------
+        adata
+            AnnData object to use (default: self.adata).
+        indices
+            Subset of cells to use.
+        batch_size
+            Batch size for inference.
+        normalised
+            Whether to normalize cell-topic distributions before computing entropy.
+
+        Returns
+        -------
+        float
+            Mean entropy across cells
+        """
+        cache_key = f"entropy_normalised={normalised}"
+        if hasattr(self, "_cached_metrics") and cache_key in self._cached_metrics:
+            return self._cached_metrics[cache_key]
+
+        # Get cell-topic distributions
+        theta = self.get_cell_topic_dist(adata=adata, indices=indices, batch_size=batch_size)
+
+        if normalised:
+            # Normalize to ensure rows sum to 1
+            theta = theta / (theta.sum(axis=1, keepdims=True) + 1e-12)
+
+        # Compute entropy per cell: -Σ_k θ_ck * log(θ_ck)
+        entropy_per_cell = -(theta * np.log(np.clip(theta, 1e-8, None))).sum(axis=1)
+
+        # Return mean entropy across cells
+        result = float(entropy_per_cell.mean())
+
+        # Cache result
+        if hasattr(self, "_cached_metrics"):
+            self._cached_metrics[cache_key] = result
+
+        return result
+
+    # ------------------------------------------------------------------ #
+    def get_likelihood_per_modality(
+        self,
+        adata: AnnData | None = None,
+        indices: _Seq[int] | None = None,
+        batch_size: int | None = None,
+    ) -> dict[str, float]:
+        """
+        Compute log-likelihood for each modality separately.
+
+        Higher is better.
+
+        Parameters
+        ----------
+        adata
+            AnnData object to use (default: self.adata).
+        indices
+            Subset of cells to use.
+        batch_size
+            Batch size for inference.
+
+        Returns
+        -------
+        dict[str, float]
+            Dictionary mapping modality names to log-likelihood values
+        """
+        cache_key = "likelihood_per_modality"
+        if hasattr(self, "_cached_metrics") and cache_key in self._cached_metrics:
+            return self._cached_metrics[cache_key]
+
+        # Compute per-modality log-likelihood
+        self._check_if_trained(warn=False)
+        adata = self._validate_anndata(adata)
+        self.module.eval()
+        dl = self._make_data_loader(adata=adata, indices=indices, batch_size=batch_size)
+
+        # Accumulate per-modality log-probs across batches
+        per_mod_logprob_total = {m: 0.0 for m in range(self.n_modalities)}
+
+        for tensors in dl:
+            x = tensors[REGISTRY_KEYS.X_KEY]
+            libs = self._batch_library_tensor(x)
+            batch_logprobs = self.module.get_per_modality_log_prob(x, libs, len(dl.indices))
+
+            for m, logprob in batch_logprobs.items():
+                per_mod_logprob_total[m] += logprob
+
+        # Convert modality indices to names
+        result = {
+            self.modality_names[m]: logprob
+            for m, logprob in per_mod_logprob_total.items()
+        }
+
+        # Cache result
+        if hasattr(self, "_cached_metrics"):
+            self._cached_metrics[cache_key] = result
+
+        return result
+
+    # ------------------------------------------------------------------ #
+    def get_perplexity_per_modality(
+        self,
+        adata: AnnData | None = None,
+        indices: _Seq[int] | None = None,
+        batch_size: int | None = None,
+    ) -> dict[str, float]:
+        """
+        Compute perplexity for each modality separately.
+
+        Lower is better. Perplexity = exp(-log_likelihood / N_tokens)
+
+        Parameters
+        ----------
+        adata
+            AnnData object to use (default: self.adata).
+        indices
+            Subset of cells to use.
+        batch_size
+            Batch size for inference.
+
+        Returns
+        -------
+        dict[str, float]
+            Dictionary mapping modality names to perplexity values
+        """
+        cache_key = "perplexity_per_modality"
+        if hasattr(self, "_cached_metrics") and cache_key in self._cached_metrics:
+            return self._cached_metrics[cache_key]
+
+        # Get log-likelihoods
+        log_liks = self.get_likelihood_per_modality(adata, indices, batch_size)
+
+        # Compute total counts per modality
+        adata = self._validate_anndata(adata)
+        dl = self._make_data_loader(adata=adata, indices=indices, batch_size=batch_size)
+
+        per_mod_counts = {m: 0 for m in range(self.n_modalities)}
+        for tensors in dl:
+            x = tensors[REGISTRY_KEYS.X_KEY]
+            cursor = 0
+            for m, F_m in enumerate(self.n_inputs_modalities):
+                per_mod_counts[m] += x[:, cursor:cursor + F_m].sum().item()
+                cursor += F_m
+
+        # Compute perplexities
+        result = {
+            mod_name: float(np.exp(-log_lik / per_mod_counts[m]))
+            for m, (mod_name, log_lik) in enumerate(log_liks.items())
+        }
+
+        # Cache result
+        if hasattr(self, "_cached_metrics"):
+            self._cached_metrics[cache_key] = result
+
+        return result
+
+    # ------------------------------------------------------------------ #
+    def get_modality_weights(
+        self,
+        adata: AnnData | None = None,
+        indices: _Seq[int] | None = None,
+        batch_size: int | None = None,
+        return_format: str = "dataframe",
+    ) -> pd.DataFrame | dict[str, np.ndarray]:
+        """
+        Get normalized mixing weights showing how much each modality contributes to topic assignments.
+
+        The mixing weights control how much each modality's encoder output contributes to the
+        final cell-topic distribution (θ) in the Mixture-of-Experts architecture.
+
+        Returns weights in range [0, 1] that sum to 1 per cell (or globally for "universal" mode).
+        Higher weight = model relies more on that modality for inferring topics.
+
+        Parameters
+        ----------
+        adata : AnnData, optional
+            AnnData object to compute weights for. If None, uses the registered dataset.
+        indices : Sequence[int], optional
+            Indices of cells to include. If None, uses all cells.
+        batch_size : int, optional
+            Batch size for inference.
+        return_format : str
+            Output format: "dataframe" returns pd.DataFrame (cells × modalities),
+            "dict" returns dict mapping modality names to 1D arrays.
+
+        Returns
+        -------
+        pd.DataFrame or dict[str, np.ndarray]
+            Normalized mixing weights for each cell and modality.
+            For "universal" mode: returns single row with global weights.
+            For "equal" mode: returns uniform weights (1/n_modalities).
+            For "cell" mode: returns per-cell learned weights.
+        """
+        cache_key = "modality_weights"
+        if hasattr(self, "_cached_metrics") and cache_key in self._cached_metrics:
+            cached = self._cached_metrics[cache_key]
+            if return_format == "dataframe":
+                return cached if isinstance(cached, pd.DataFrame) else pd.DataFrame(cached)
+            else:
+                return cached if isinstance(cached, dict) else cached.to_dict("list")
+
+        # Validate inputs
+        self._check_if_trained(warn=False)
+        adata = self._validate_anndata(adata)
+        self.module.eval()
+
+        # Handle different weight modes
+        if self.weight_mode == "equal":
+            # Equal weights for all modalities: 1/M
+            n_cells = adata.n_obs if indices is None else len(indices)
+            weights_array = np.ones((n_cells, self.n_modalities)) / self.n_modalities
+
+        elif self.weight_mode == "universal":
+            # Single learned weight per modality (same across all cells)
+            # Extract raw weights and compute softmax
+            raw_weights = self.module.guide.mod_w.detach().cpu().numpy()
+
+            # Create dummy mask (all modalities present)
+            mask = np.ones(self.n_modalities)
+
+            # Apply softmax
+            weights_normalized = self._masked_softmax_np(raw_weights, mask)
+
+            # Broadcast to all cells
+            n_cells = adata.n_obs if indices is None else len(indices)
+            weights_array = np.tile(weights_normalized, (n_cells, 1))
+
+        else:  # weight_mode == "cell"
+            # Per-cell learned weights - need to extract from data loader
+            dl = self._make_data_loader(adata=adata, indices=indices, batch_size=batch_size)
+
+            all_weights = []
+            n_cells_processed = 0
+
+            for tensors in dl:
+                x = tensors[REGISTRY_KEYS.X_KEY]
+                B = x.shape[0]
+
+                # Split by modality and compute masks
+                xs = torch.split(x, self.n_inputs_modalities, dim=1)
+                masks = torch.stack([(x_m.sum(1) > 0).float() for x_m in xs])  # (M, B)
+
+                # Get batch indices for cell-specific weights
+                batch_indices = torch.arange(n_cells_processed, n_cells_processed + B, device=x.device)
+
+                # Extract raw weights for this batch
+                raw_w = self.module.guide.mod_w[batch_indices, :].T  # (M, B)
+
+                # Apply masked softmax
+                from omics_topic.module._amortizedLDA import masked_softmax
+                masks = masks.to(raw_w.device, non_blocking=True)
+                weights_batch = masked_softmax(raw_w, masks, dim=0)  # (M, B)
+
+                # Transpose to (B, M) and store
+                all_weights.append(weights_batch.T.detach().cpu().numpy())
+
+                n_cells_processed += B
+
+            weights_array = np.vstack(all_weights)
+
+        # Convert to desired output format
+        if return_format == "dataframe":
+            cell_indices = indices if indices is not None else np.arange(adata.n_obs)
+            result = pd.DataFrame(
+                weights_array,
+                index=cell_indices,
+                columns=self.modality_names,
+            )
+        else:  # dict format
+            result = {
+                mod_name: weights_array[:, i]
+                for i, mod_name in enumerate(self.modality_names)
+            }
+
+        # Cache result (store DataFrame for consistency)
+        if hasattr(self, "_cached_metrics"):
+            if isinstance(result, pd.DataFrame):
+                self._cached_metrics[cache_key] = result
+            else:
+                self._cached_metrics[cache_key] = pd.DataFrame(result)
+
+        return result
+
+    def get_entropy_weight(self) -> float:
+        """
+        Get the entropy regularization weight.
+
+        Returns
+        -------
+        float
+            Current entropy_weight value used for regularization
+        """
+        return self.entropy_weight
+
+    def get_last_entropy(self) -> float | None:
+        """
+        Get the mean entropy from the last forward pass through the model.
+
+        Returns
+        -------
+        float | None
+            Mean cell-topic entropy from last forward pass, or None if not available
+        """
+        return self.module.get_last_entropy()
+
+    def get_cell_entropy(
+        self,
+        adata: AnnData | None = None,
+        indices: _Seq[int] | None = None,
+        batch_size: int | None = None,
+        n_samples: int = 100,
+    ) -> np.ndarray:
+        """
+        Compute per-cell entropy of cell-topic distributions.
+
+        Parameters
+        ----------
+        adata
+            AnnData object with data. If None, uses the training data.
+        indices
+            Indices of cells to compute entropy for. If None, uses all cells.
+        batch_size
+            Batch size for computation. If None, processes all cells at once.
+        n_samples
+            Number of posterior samples for Monte Carlo estimation (default: 100)
+
+        Returns
+        -------
+        np.ndarray
+            Per-cell entropy values, shape (n_cells,)
+            H(θ_n) = -Σ_k θ_n,k * log(θ_n,k) for each cell n
+        """
+        adata = self._validate_anndata(adata)
+        dl = self._make_data_loader(adata=adata, indices=indices, batch_size=batch_size)
+
+        all_entropies = []
+        for tensors in dl:
+            x = tensors[REGISTRY_KEYS.X_KEY]
+            libs = self._batch_library_tensor(x)
+            entropy_batch = self.module.get_cell_entropy(x, libs, n_samples=n_samples)
+            all_entropies.append(entropy_batch.detach().cpu().numpy())
+
+        return np.concatenate(all_entropies)
+
+    @staticmethod
+    def _masked_softmax_np(weights: np.ndarray, mask: np.ndarray) -> np.ndarray:
+        """NumPy implementation of masked softmax."""
+        weights = weights.copy()
+        weights[mask == 0] = -1e9
+        exp_w = np.exp(weights - weights.max())
+        return exp_w / exp_w.sum()
 
     # ------------------------------------------------------------------ #
     # Training plan hook

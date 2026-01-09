@@ -498,27 +498,31 @@ class MultimodalLDAPyroModel(PyroModule):
             cursor = 0
             for m, (F_m, L_m) in enumerate(zip(self.n_inputs_modalities, self.likelihoods, strict=False)):
                 x_m = x[:, cursor : cursor + F_m]
-                lib_m = libraries[:, m]
+                lib_m = torch.clamp(libraries[:, m], min=0.0)
                 phi_m = topic_feature_dists[m]  # (K, F_m)
                 rate_m = theta @ phi_m  # (B, F_m)
 
                 if L_m == "multinomial":
-                    N_max = int(lib_m.max().item())
+                    x_m_obs = torch.clamp(x_m, min=0.0).round()
+                    N_max = int(x_m_obs.sum(dim=1).max().item()) if x_m_obs.numel() > 0 else 0
                     pyro.sample(
                         f"feature_counts_{m}",
                         CategoricalBoW(N_max, rate_m),
-                        obs=x_m,
+                        obs=x_m_obs,
                     )
                 elif L_m in {"gamma_poisson", "nb"}:
+                    # Observations must be non-negative integers; guard against preprocessed inputs
+                    x_m_obs = torch.clamp(x_m, min=0.0).round()
                     # mean scaled by lib; dispersion shared globally per feature set
-                    mu = rate_m * lib_m.unsqueeze(-1)
+                    mu = torch.clamp(rate_m * lib_m.unsqueeze(-1), min=1e-8)
                     r = torch.tensor(self.dispersion_rna, device=mu.device)
                     pyro.sample(
                         f"feature_counts_{m}",
                         dist.NegativeBinomial(total_count=r, probs=mu / (mu + r)).to_event(1),
-                        obs=x_m,
+                        obs=x_m_obs,
                     )
                 elif L_m == "bernoulli":
+                    x_m_obs = torch.clamp(x_m, min=0.0, max=1.0).round()
                     # Library size scaling (depth normalization)
                     lib_ratio = lib_m / lib_m.mean()  # (B,) - relative depth
                     p_m = rate_m * lib_ratio.unsqueeze(-1)  # (B, F_m) - scale by depth
@@ -527,7 +531,7 @@ class MultimodalLDAPyroModel(PyroModule):
                     pyro.sample(
                         f"feature_counts_{m}",
                         dist.Bernoulli(probs=p_m).to_event(1),
-                        obs=x_m,
+                        obs=x_m_obs,
                     )
                 else:
                     raise ValueError(f"Unknown likelihood {L_m}")
@@ -552,6 +556,9 @@ class MultimodalLDAPyroGuide(PyroModule):
         topic_feature_prior_type: str = "logistic_normal",
         use_feature_background: bool = True,
         likelihoods: list[str] | None = None,
+        normalize_encoder_inputs: bool = False,
+        encoder_scale_factor: float = 1e4,
+        entropy_weight: float = 0.0,
     ) -> None:
         super().__init__("multimodal_lda_guide")
         self.n_modalities = len(n_inputs_modalities)
@@ -562,6 +569,10 @@ class MultimodalLDAPyroGuide(PyroModule):
         self.topic_feature_prior_type = topic_feature_prior_type
         self.use_feature_background = use_feature_background
         self.likelihoods = likelihoods if likelihoods is not None else ["gamma_poisson"] * self.n_modalities
+        self.normalize_encoder_inputs = normalize_encoder_inputs
+        self.encoder_scale_factor = encoder_scale_factor
+        self.entropy_weight = entropy_weight
+        self._last_entropy = None  # For logging
 
         # Regular encoders (always present)
         self.encoders = torch.nn.ModuleList(
@@ -737,21 +748,25 @@ class MultimodalLDAPyroGuide(PyroModule):
     # NEW METHOD: Initialize full graph data for semi-supervised learning
     # ═══════════════════════════════════════════════════════════════════════
     def set_full_graph_data(
-        self, 
+        self,
         x_full_modalities: list[torch.Tensor] | torch.Tensor,
     ):
         """
         Initialize GCN encoders with full graph data for transductive learning.
-        
+
+        CRITICAL: When normalize_encoder_inputs=True, this applies log-normalization
+        to the FULL graph BEFORE storing it in the GCN encoder. This ensures that
+        spatial graph convolution operates on normalized features.
+
         Must be called after model initialization and before training when spatial=True.
-        
+
         Parameters
         ----------
         x_full_modalities : list[torch.Tensor] or torch.Tensor
             Either:
             - List of full feature matrices, one per modality [n_obs, n_features_m]
             - Single concatenated matrix [n_obs, sum(n_features)] (will be split)
-        
+
         Notes
         -----
         Edge indices are already stored as buffers in __init__.
@@ -760,19 +775,38 @@ class MultimodalLDAPyroGuide(PyroModule):
         if not self.use_gcn:
             logger.warning("set_full_graph_data() called but spatial=False. No effect.")
             return
-        
+
         # Split concatenated features if needed
         if isinstance(x_full_modalities, torch.Tensor):
             x_full_list = torch.split(x_full_modalities, self.n_inputs_modalities, dim=1)
         else:
             x_full_list = x_full_modalities
-        
-        # Initialize each GCN encoder with its modality's full data
+
+        # IMPORTANT: Apply normalization BEFORE storing in GCN encoder
+        # This ensures graph convolution operates on normalized features
+        if self.normalize_encoder_inputs:
+            libs = [x_full_m.sum(dim=1, keepdim=True) for x_full_m in x_full_list]
+            x_full_normalized = []
+            for x_full_m, lib_m in zip(x_full_list, libs):
+                lib_m = torch.clamp(lib_m, min=1.0)
+                # Use median depth of this modality as scale factor
+                median_depth = torch.median(lib_m)
+                x_full_m_norm = torch.log1p(x_full_m / lib_m * median_depth)
+                x_full_normalized.append(x_full_m_norm)
+            x_full_list = x_full_normalized
+            logger.info("Applied log-normalization to full graph BEFORE spatial convolution")
+
+        # Initialize each GCN encoder with (potentially normalized) full graph
         for idx, (gcn_enc, x_full_m) in enumerate(zip(self.gcn_encoders, x_full_list)):
             edge_index = self._get_edge_index(idx)
+            # This stores x_full_m in gcn_enc.x_full
+            # During forward pass, GCN will do: conv(x_full, edge_index)
             gcn_enc.set_full_graph_data(x_full_m, edge_index)
-        
-        logger.info("All GCN encoders initialized with full graph data for transductive learning")
+
+        logger.info(
+            f"GCN encoders initialized with full graph "
+            f"(normalize_encoder_inputs={self.normalize_encoder_inputs})"
+        )
 
     # ---------- forward ----------
     @auto_move_data
@@ -873,6 +907,21 @@ class MultimodalLDAPyroGuide(PyroModule):
 
         # θₙ variational
         xs = torch.split(x, self.n_inputs_modalities, dim=1)  # (B,Fₘ)
+
+        # Apply normalization + log transform if requested
+        if self.normalize_encoder_inputs:
+            # Compute library sizes per modality
+            libs = [x_m.sum(dim=1, keepdim=True) for x_m in xs]  # List of (B, 1)
+            # Normalize to median depth per modality
+            xs_normalized = []
+            for x_m, lib_m in zip(xs, libs):
+                lib_m = torch.clamp(lib_m, min=1.0)  # Avoid division by zero
+                # Use median depth of this modality as scale factor
+                median_depth = torch.median(lib_m)
+                x_m_norm = torch.log1p(x_m / lib_m * median_depth)
+                xs_normalized.append(x_m_norm)
+            xs = xs_normalized
+
         mus, vars_, masks = [], [], []
         for idx, (enc, x_m) in enumerate(zip(self.encoders, xs, strict=False)):
             if self.use_gcn:
@@ -882,15 +931,30 @@ class MultimodalLDAPyroGuide(PyroModule):
                 q_m, _ = enc(x_m)  # q(z|x)
             mus.append(q_m.loc)
             vars_.append(q_m.scale**2)
-            masks.append((x_m.sum(1) > 0).float())
+            # Compute mask from ORIGINAL x (before normalization)
+            original_xs = torch.split(x, self.n_inputs_modalities, dim=1)
+            masks.append((original_xs[idx].sum(1) > 0).float())
         mus = torch.stack(mus)  # (M,B,K)
         vars_ = torch.stack(vars_)  # (M,B,K)
         masks = torch.stack(masks)  # (M,B)
 
         muθ, varθ = self._mix_gaussians(mus, vars_, masks, cell_idx)
 
-        with pyro.plate("cells", size=n_obs or self.n_obs, subsample_size=B), poutine.scale(None, kl_weight):
-            pyro.sample("log_cell_topic_dist", dist.Normal(muθ, torch.sqrt(varθ)).to_event(1))
+        with pyro.plate("cells", size=n_obs or self.n_obs, subsample_size=B):
+            # Sample cell-topic distribution (with KL weight scaling)
+            with poutine.scale(None, kl_weight):
+                log_theta = pyro.sample("log_cell_topic_dist", dist.Normal(muθ, torch.sqrt(varθ)).to_event(1))
+
+            # Compute per-cell entropy and add bonus (extensive formulation, no KL scaling)
+            if self.entropy_weight > 0:
+                theta = F.softmax(log_theta, dim=-1)  # (B, K)
+                # Per-cell entropy: -Σ_k θ_k * log(θ_k)
+                entropy_per_cell = -(theta * torch.log(theta + 1e-10)).sum(dim=-1)  # (B,)
+                # Store mean for logging
+                self._last_entropy = entropy_per_cell.mean().detach()
+                # Add entropy bonus to ELBO (Pyro will sum over batch and scale by n_obs/B)
+                # has_rsample=True because entropy is computed from reparametrized sample (log_theta)
+                pyro.factor("entropy_bonus", self.entropy_weight * entropy_per_cell, has_rsample=True)
 
 
 # --------------------------------------------------------------------------------------------------
@@ -914,6 +978,9 @@ class MultimodalAmortizedLDAPyroModule(PyroBaseModuleClass):
         max_n_obs: int | None = None,
         spatial: bool = False,
         adjacency: torch.Tensor | Sequence[torch.Tensor] | None = None,
+        normalize_encoder_inputs: bool = False,
+        encoder_scale_factor: float = 1e4,
+        entropy_weight: float = 0.0,
     ):
         super().__init__()
         assert len(n_inputs_modalities) == len(likelihoods)
@@ -926,6 +993,9 @@ class MultimodalAmortizedLDAPyroModule(PyroBaseModuleClass):
         self.spatial = spatial
         self.topic_feature_prior_type = topic_feature_prior_type
         self.use_feature_background = use_feature_background
+        self.normalize_encoder_inputs = normalize_encoder_inputs
+        self.encoder_scale_factor = encoder_scale_factor
+        self.entropy_weight = entropy_weight
 
         if cell_topic_prior is None:
             cell_topic_prior_tensor = torch.full((n_topics,), 1 / n_topics)
@@ -964,6 +1034,9 @@ class MultimodalAmortizedLDAPyroModule(PyroBaseModuleClass):
             topic_feature_prior_type=topic_feature_prior_type,
             use_feature_background=use_feature_background,
             likelihoods=likelihoods,
+            normalize_encoder_inputs=normalize_encoder_inputs,
+            encoder_scale_factor=encoder_scale_factor,
+            entropy_weight=entropy_weight,
         )
 
         # We need this method so scvi training plan can create data-loader args
@@ -1055,9 +1128,21 @@ class MultimodalAmortizedLDAPyroModule(PyroBaseModuleClass):
 
         B = x.shape[0]
         xs = torch.split(x, self.model.n_inputs_modalities, dim=1)
-        
+
+        # Apply normalization + log transform if requested (must match training)
+        if self.guide.normalize_encoder_inputs:
+            libs = [x_m.sum(dim=1, keepdim=True) for x_m in xs]
+            xs_normalized = []
+            for x_m, lib_m in zip(xs, libs):
+                lib_m = torch.clamp(lib_m, min=1.0)
+                # Use median depth of this modality as scale factor
+                median_depth = torch.median(lib_m)
+                x_m_norm = torch.log1p(x_m / lib_m * median_depth)
+                xs_normalized.append(x_m_norm)
+            xs = xs_normalized
+
         batch_indices = torch.arange(B, device=x.device)
-        
+
         # run encoders
         mus, vars_, masks = [], [], []
         for idx, (enc, x_m) in enumerate(zip(self.guide.encoders, xs, strict=False)):
@@ -1068,7 +1153,9 @@ class MultimodalAmortizedLDAPyroModule(PyroBaseModuleClass):
                 q_m, _ = enc(x_m)
             mus.append(q_m.loc)
             vars_.append(q_m.scale**2)
-            masks.append((x_m.sum(1) > 0).float())
+            # Compute mask from original x
+            original_xs = torch.split(x, self.model.n_inputs_modalities, dim=1)
+            masks.append((original_xs[idx].sum(1) > 0).float())
         mus = torch.stack(mus)
         vars_ = torch.stack(vars_)
         masks = torch.stack(masks)
@@ -1082,3 +1169,85 @@ class MultimodalAmortizedLDAPyroModule(PyroBaseModuleClass):
         device = next(self._guide.parameters()).device  # cuda:0 or cpu
         x = x.to(device, non_blocking=True)
         return Trace_ELBO().loss(self.model, self.guide, x, libs, n_obs=n_obs)
+
+    @auto_move_data
+    @torch.inference_mode()
+    def get_cell_entropy(self, x: torch.Tensor, libs: torch.Tensor, n_samples: int = 100) -> torch.Tensor:
+        """
+        Compute per-cell entropy of the cell-topic distribution.
+
+        Parameters
+        ----------
+        x : torch.Tensor
+            Input features (batch_size, total_features)
+        libs : torch.Tensor
+            Per-modality library sizes (batch_size, n_modalities)
+        n_samples : int
+            Number of samples to draw for Monte Carlo estimation (default: 100)
+
+        Returns
+        -------
+        torch.Tensor
+            Per-cell entropy values, shape (batch_size,)
+            H(θ_n) = -Σ_k θ_n,k * log(θ_n,k) for each cell n
+        """
+        device = next(self._guide.parameters()).device
+        x = x.to(device, non_blocking=True)
+        libs = libs.to(device, non_blocking=True)
+
+        # Get cell-topic distribution (averaged over samples)
+        theta = self.get_topic_distribution(x, libs, n_samples=n_samples)  # (B, K)
+
+        # Compute entropy per cell
+        entropy = -(theta * torch.log(theta + 1e-10)).sum(dim=-1)  # (B,)
+        return entropy
+
+    def get_last_entropy(self) -> float | None:
+        """
+        Get the last computed entropy value from the guide.
+
+        Returns
+        -------
+        float | None
+            Mean entropy from the last forward pass, or None if not available
+        """
+        if hasattr(self.guide, '_last_entropy') and self.guide._last_entropy is not None:
+            return float(self.guide._last_entropy)
+        return None
+
+    @auto_move_data
+    @torch.inference_mode()
+    def get_per_modality_log_prob(self, x: torch.Tensor, libs: torch.Tensor, n_obs: int):
+        """
+        Compute log-probability for each modality separately using poutine.trace.
+
+        Parameters
+        ----------
+        x : torch.Tensor
+            Input features (batch_size, total_features)
+        libs : torch.Tensor
+            Per-modality library sizes (batch_size, n_modalities)
+        n_obs : int
+            Total number of observations in the dataset
+
+        Returns
+        -------
+        dict[int, float]
+            Dictionary mapping modality index to log-probability
+        """
+        device = next(self._guide.parameters()).device
+        x = x.to(device, non_blocking=True)
+
+        # Trace model and guide
+        guide_trace = poutine.trace(self.guide).get_trace(x, libs, n_obs=n_obs)
+        model_trace = poutine.trace(poutine.replay(self.model, trace=guide_trace)).get_trace(x, libs, n_obs=n_obs)
+        model_trace.compute_log_prob()
+
+        # Extract per-modality log-probs
+        per_mod_logprob = {}
+        for m in range(len(self.n_inputs_modalities)):
+            site_name = f"feature_counts_{m}"
+            if site_name in model_trace.nodes:
+                per_mod_logprob[m] = model_trace.nodes[site_name]["log_prob"].sum().item()
+
+        return per_mod_logprob

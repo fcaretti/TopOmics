@@ -73,22 +73,47 @@ class MultimodalLDAPyroTrainingPlan(PyroTrainingPlan):
 
     def validation_step(self, batch: dict[str, torch.Tensor], batch_idx: int, dataloader_idx: int = 0):
         """
-        Validation step logs ``elbo_val`` (positive ELBO) to the progress bar/logger.
+        Validation step logs ``elbo_val`` (positive ELBO) and entropy to the progress bar/logger.
 
         Lightning will only run this if a validation dataloader exists; with
         ``validation_size=0`` or ``train_size=1.0`` the loop is skipped.
         """
         elbo = self._log_validation_elbo(batch)
+        output = {}
         if elbo is not None:
-            self.validation_step_outputs.append({"elbo_val": elbo})
+            output["elbo_val"] = elbo
+
+        # Log entropy term if available
+        if hasattr(self.module, 'guide') and hasattr(self.module.guide, '_last_entropy'):
+            entropy = self.module.guide._last_entropy
+            if entropy is not None and self.module.entropy_weight > 0:
+                self.log(
+                    "entropy_mean_val",
+                    entropy,
+                    on_epoch=True,
+                    prog_bar=False,
+                    logger=True,
+                    batch_size=batch[REGISTRY_KEYS.X_KEY].shape[0],
+                )
+                output["entropy_mean_val"] = float(entropy)
+
+        if output:
+            self.validation_step_outputs.append(output)
         return None
 
     def on_validation_epoch_end(self):
-        """Aggregate validation ELBO across batches."""
+        """Aggregate validation ELBO and entropy across batches."""
         if not self.validation_step_outputs:
             return
         elbos = [x["elbo_val"] for x in self.validation_step_outputs if "elbo_val" in x]
         if elbos:
             mean_elbo = sum(elbos) / len(elbos)
             self.log("elbo_val", mean_elbo, on_epoch=True, prog_bar=True, logger=True, batch_size=1)
+
+        # Aggregate entropy if present
+        entropies = [x["entropy_mean_val"] for x in self.validation_step_outputs if "entropy_mean_val" in x]
+        if entropies:
+            mean_entropy = sum(entropies) / len(entropies)
+            self.log("entropy_mean_val", mean_entropy, on_epoch=True, prog_bar=False, logger=True, batch_size=1)
+
         self.validation_step_outputs.clear()
