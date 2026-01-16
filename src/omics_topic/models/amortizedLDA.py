@@ -14,7 +14,7 @@ from anndata import AnnData
 from mudata import MuData
 from scvi._constants import REGISTRY_KEYS
 from scvi.data import AnnDataManager
-from scvi.data.fields import LayerField
+from scvi.data.fields import LayerField, NumericalObsField
 from scvi.model.base import BaseModelClass, PyroSviTrainMixin
 from scvi.utils import setup_anndata_dsp
 
@@ -151,11 +151,16 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
         topic_feature_prior: float | Sequence[float] | None = None,
         topic_feature_prior_type: str = "logistic_normal",
         use_feature_background: bool = True,
+        dispersion_rna: float = 1.0,
+        learnable_dispersion: bool = False,
+        global_dispersion: bool = True,
         modality_names: list[str] | None = None,
         weight_mode: str = "cell",
         normalize_encoder_inputs: bool = True,
         encoder_scale_factor: float = 1e6,
-        entropy_weight: float = 0.0,
+        entropy_weight: float = 0.01,
+        topic_variance_weight: float = 1.0,
+        kl_weight: float = 1.0,
     ):
         """
         Initialize MultimodalAmortizedLDA with Mixture-of-Experts (MoE) architecture.
@@ -196,6 +201,21 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
             Following scTM, this separates baseline feature expression from topic-specific
             variation by adding a learned background term bg_m to log-probabilities.
             Ignored for ``likelihood="multinomial"`` modalities.
+        dispersion_rna
+            Fixed dispersion value for Negative Binomial likelihood when
+            ``learnable_dispersion=False``. Default: 1.0.
+        learnable_dispersion
+            Whether to learn dispersion parameters (True) or use fixed dispersion (False).
+            When True, dispersion is sampled with a HalfCauchy prior in the model and
+            LogNormal variational posterior in the guide (STAMP-like behavior).
+            Default: False (backward compatible).
+        global_dispersion
+            When ``learnable_dispersion=True``:
+
+            - If True: learn one global dispersion per modality (single scalar)
+            - If False: learn per-gene dispersion (one parameter per feature, STAMP-like)
+
+            Ignored when ``learnable_dispersion=False``. Default: True.
         modality_names
             Optional list of modality names (e.g., ["rna", "protein"]). If None, uses indices.
         weight_mode
@@ -220,6 +240,19 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
             where H(θ_n) = -Σ_k θ_n,k * log(θ_n,k) is the entropy of cell-topic distribution.
             Typical values: 0.001-0.1. Higher values → more uniform topic distributions.
             Trade-off: too high can hurt reconstruction quality.
+        topic_variance_weight
+            Weight for topic variance regularization (default: 0.0).
+            When > 0, encourages different cells to use different topics, preventing
+            cell collapse where all cells have identical topic distributions.
+            ``Objective = ELBO + topic_variance_weight * Σ_k Var(θ_:,k)``
+            where Var(θ_:,k) is the variance of topic k usage across cells in the batch.
+            Typical values: 1.0-10.0 (higher than entropy_weight because variance is smaller).
+            This regularization is complementary to entropy_weight: entropy encourages
+            each cell to use many topics uniformly, while topic variance encourages
+            different cells to specialize in different topics.
+        kl_weight
+            Weight applied to KL terms in the ELBO (default: 1.0).
+            This scales KL contributions in both the model and guide.
 
         Notes
         -----
@@ -303,6 +336,17 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
         self.normalize_encoder_inputs = normalize_encoder_inputs
         self.encoder_scale_factor = encoder_scale_factor
         self.entropy_weight = entropy_weight
+        self.dispersion_rna = dispersion_rna
+        self.learnable_dispersion = learnable_dispersion
+        self.global_dispersion = global_dispersion
+
+        # Log dispersion settings
+        if learnable_dispersion:
+            disp_type = "global" if global_dispersion else "per-gene"
+            logger.info(
+                f"Using learnable {disp_type} dispersion for Negative Binomial modalities. "
+                f"Prior: HalfCauchy(1), Posterior: LogNormal."
+            )
 
         # Log horseshoe usage
         if topic_feature_prior_type == "horseshoe":
@@ -379,9 +423,14 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
             max_n_obs=max_n_obs,
             spatial=self.spatial,
             adjacency=adjacency,
+            dispersion_rna=dispersion_rna,
+            learnable_dispersion=learnable_dispersion,
+            global_dispersion=global_dispersion,
             normalize_encoder_inputs=normalize_encoder_inputs,
             encoder_scale_factor=encoder_scale_factor,
             entropy_weight=entropy_weight,
+            topic_variance_weight=topic_variance_weight,
+            kl_weight=kl_weight,
         )
 
         # For spatial models, initialise GCN encoders with full-graph data
@@ -469,8 +518,16 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
                 )
 
         setup_args = cls._get_setup_method_args(**locals())
+
+        # Register global cell indices for spatial/transductive models
+        # This enables minibatch training with GCN encoders
+        adata.obs["_indices"] = np.arange(adata.n_obs)
+
         adata_manager = AnnDataManager(
-            fields=[LayerField(REGISTRY_KEYS.X_KEY, layer, is_count_data=True)],
+            fields=[
+                LayerField(REGISTRY_KEYS.X_KEY, layer, is_count_data=True),
+                NumericalObsField(REGISTRY_KEYS.INDICES_KEY, "_indices"),
+            ],
             setup_method_args=setup_args,
         )
         adata_manager.register_fields(adata, **kwargs)
@@ -1567,6 +1624,124 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
             all_entropies.append(entropy_batch.detach().cpu().numpy())
 
         return np.concatenate(all_entropies)
+
+    def get_topic_variance_weight(self) -> float:
+        """
+        Get the topic variance regularization weight.
+
+        Returns
+        -------
+        float
+            Topic variance weight used during training
+        """
+        return self.module.topic_variance_weight
+
+    def get_last_topic_variance(self) -> float | None:
+        """
+        Get the last computed mean topic variance from training.
+
+        Returns
+        -------
+        float | None
+            Mean topic variance from the last forward pass, or None if not available
+        """
+        return self.module.get_last_topic_variance()
+
+    def get_topic_variance(
+        self,
+        adata: AnnData | None = None,
+        indices: _Seq[int] | None = None,
+        batch_size: int | None = None,
+        n_samples: int = 100,
+    ) -> np.ndarray:
+        """
+        Compute per-topic variance of topic usage across cells.
+
+        Parameters
+        ----------
+        adata
+            AnnData object with data. If None, uses the training data.
+        indices
+            Indices of cells to compute variance for. If None, uses all cells.
+        batch_size
+            Batch size for computation. If None, processes all cells at once.
+        n_samples
+            Number of posterior samples for Monte Carlo estimation (default: 100)
+
+        Returns
+        -------
+        np.ndarray
+            Per-topic variance values, shape (n_topics,)
+            Var(θ_:,k) = variance of topic k usage across all cells
+        """
+        adata = self._validate_anndata(adata)
+
+        # Collect all cell-topic distributions first
+        all_theta = []
+        dl = self._make_data_loader(adata=adata, indices=indices, batch_size=batch_size)
+
+        for tensors in dl:
+            x = tensors[REGISTRY_KEYS.X_KEY]
+            libs = self._batch_library_tensor(x)
+            theta_batch = self.module.get_topic_distribution(x, libs, n_samples=n_samples)
+            all_theta.append(theta_batch.detach().cpu())
+
+        # Concatenate all batches and compute variance across cells
+        all_theta = torch.cat(all_theta, dim=0)  # (n_cells, n_topics)
+        topic_variance = all_theta.var(dim=0)  # (n_topics,)
+
+        return topic_variance.numpy()
+
+    def get_learned_dispersion(
+        self,
+        modality: str | int | None = None,
+        n_samples: int = 1000,
+    ) -> dict[str, np.ndarray] | np.ndarray:
+        """
+        Get the learned or fixed dispersion parameters.
+
+        Parameters
+        ----------
+        modality : str | int | None, optional
+            Modality name or index. If None, returns dispersion for all
+            NB modalities as a dict.
+        n_samples : int, optional
+            Number of Monte Carlo samples for learned dispersion. Default: 1000.
+
+        Returns
+        -------
+        dict[str, np.ndarray] | np.ndarray
+            If modality is None: dict mapping modality names to dispersion arrays
+            If modality specified: dispersion array for that modality
+
+        Notes
+        -----
+        - If learnable_dispersion=False, returns the fixed dispersion value
+        - If learnable_dispersion=True and global_dispersion=True: returns (1,) array
+        - If learnable_dispersion=True and global_dispersion=False: returns (n_features,) array
+        """
+        self._check_if_trained(warn=False)
+
+        if modality is not None:
+            # Single modality
+            if isinstance(modality, str):
+                if modality not in self.modality_names:
+                    raise ValueError(f"Unknown modality '{modality}'")
+                mod_idx = self.modality_names.index(modality)
+            else:
+                mod_idx = int(modality)
+
+            disp = self.module.get_learned_dispersion(mod_idx, n_samples)
+            return disp.cpu().numpy()
+
+        # All modalities
+        result = {}
+        for m, (mod_name, likelihood) in enumerate(zip(self.modality_names, self.likelihoods)):
+            if likelihood in {"gamma_poisson", "nb"}:
+                disp = self.module.get_learned_dispersion(m, n_samples)
+                result[mod_name] = disp.cpu().numpy()
+
+        return result
 
     @staticmethod
     def _masked_softmax_np(weights: np.ndarray, mask: np.ndarray) -> np.ndarray:
