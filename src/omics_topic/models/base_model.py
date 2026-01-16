@@ -48,6 +48,9 @@ class BaseTopicModel:
 
         self.n_cells = self.data_dict[self.modalities[0]].shape[0]
 
+        # Initialize metric cache
+        self._cached_metrics = {}
+
         print("Initializing model with the following modalities:", self.modalities)
 
     def fit(self, data):
@@ -204,15 +207,30 @@ class BaseTopicModel:
         # 1.  Pull matrices from the model
         # ------------------------------------------------------------------
         Θ = np.asarray(self.get_cell_topic_dist())  # (C × K)
-        Φa = self.get_feature_topic_dist(mod_a)  # (K × G_a)  — may be DataFrame
-        Φb = self.get_feature_topic_dist(mod_b)  # (K × G_b)
+        Φa_raw = self.get_feature_topic_dist(mod_a)  # may be DataFrame, orientation varies
+        Φb_raw = self.get_feature_topic_dist(mod_b)
 
-        # keep feature names if they exist
-        names_a = getattr(Φa, "columns", None)
-        names_b = getattr(Φb, "columns", None)
+        # normalise orientation to (K × G)
+        def _normalize_phi(phi, n_topics):
+            names = None
+            if isinstance(phi, pd.DataFrame):
+                if phi.shape[1] == n_topics and phi.shape[0] != n_topics:
+                    # (features × topics) -> transpose to (topics × features)
+                    names = phi.index.tolist()
+                    phi = phi.values.T
+                elif phi.shape[0] == n_topics:
+                    names = phi.columns.tolist()
+                    phi = phi.values
+                else:
+                    raise ValueError(
+                        f"Unexpected feature-topic shape {phi.shape}; expected topics on one axis."
+                    )
+            else:
+                phi = np.asarray(phi, dtype=float)
+            return phi, names
 
-        Φa = np.asarray(Φa, dtype=float)
-        Φb = np.asarray(Φb, dtype=float)
+        Φa, names_a = _normalize_phi(Φa_raw, Θ.shape[1])
+        Φb, names_b = _normalize_phi(Φb_raw, Θ.shape[1])
 
         # ------------------------------------------------------------------
         # 2.  Normalise across *topics* for every feature   (λ*, φ*)
@@ -243,3 +261,237 @@ class BaseTopicModel:
             P = pd.DataFrame(P, index=names_a, columns=names_b)
 
         return P
+
+    def clear_metric_cache(self):
+        """
+        Clear the cached metrics.
+
+        Call this method after retraining the model to ensure metrics are recomputed
+        with the updated parameters.
+        """
+        self._cached_metrics = {}
+
+    # ------------------------------------------------------------------
+    # Model-specific metrics (abstract - must be implemented by subclasses)
+    # ------------------------------------------------------------------
+    def get_perplexity(self, **kwargs) -> float:
+        """
+        Compute perplexity (reconstruction quality).
+
+        Lower is better. Perplexity = exp(-log_likelihood / N_tokens)
+
+        Returns
+        -------
+        float
+            Perplexity score
+        """
+        raise NotImplementedError("This method should be overridden by subclasses.")
+
+    def get_likelihood_per_modality(self, **kwargs) -> dict[str, float]:
+        """
+        Compute log-likelihood for each modality separately.
+
+        Higher is better.
+
+        Returns
+        -------
+        dict[str, float]
+            Dictionary mapping modality names to log-likelihood values
+        """
+        raise NotImplementedError("This method should be overridden by subclasses.")
+
+    def get_perplexity_per_modality(self, **kwargs) -> dict[str, float]:
+        """
+        Compute perplexity for each modality separately.
+
+        Lower is better. Perplexity = exp(-log_likelihood / N_tokens)
+
+        Returns
+        -------
+        dict[str, float]
+            Dictionary mapping modality names to perplexity values
+        """
+        raise NotImplementedError("This method should be overridden by subclasses.")
+
+    def get_modality_weights(self, **kwargs) -> "pd.DataFrame | dict[str, np.ndarray]":
+        """
+        Get normalized mixing weights showing how much each modality contributes to topic assignments.
+
+        Only applicable for multimodal models with mixture-of-experts or similar architectures.
+        Returns weights in range [0, 1] that sum to 1 per cell.
+        Higher weight = model relies more on that modality for inferring topics.
+
+        Returns
+        -------
+        pd.DataFrame or dict[str, np.ndarray]
+            Normalized mixing weights for each cell and modality.
+            DataFrame: cells × modalities
+            Dict: modality name → weights array
+        """
+        raise NotImplementedError("This method should be overridden by subclasses.")
+
+    # ------------------------------------------------------------------
+    # Concrete metrics (implemented using abstract get_cell_topic_dist and get_feature_topic_dist)
+    # ------------------------------------------------------------------
+    def get_entropy(self, normalised: bool = True) -> float:
+        """
+        Compute mean entropy of cell-topic distributions.
+
+        Higher entropy means topics are more evenly distributed across cells.
+        This measures the uncertainty in topic assignments per cell.
+
+        Parameters
+        ----------
+        normalised : bool
+            Whether to normalize cell-topic distributions before computing entropy.
+            If True, ensures distributions sum to 1 (default: True).
+
+        Returns
+        -------
+        float
+            Mean entropy across all cells
+        """
+        cache_key = f"entropy_normalised={normalised}"
+        if cache_key in self._cached_metrics:
+            return self._cached_metrics[cache_key]
+
+        # Get cell-topic matrix Θ (C × K)
+        theta = self.get_cell_topic_dist()
+
+        if normalised:
+            # Normalize to ensure rows sum to 1
+            theta = theta / (theta.sum(axis=1, keepdims=True) + 1e-12)
+
+        # Compute entropy per cell: -Σ_k θ_ck * log(θ_ck)
+        # Use np.log with clipping to avoid log(0)
+        entropy_per_cell = -(theta * np.log(np.clip(theta, 1e-8, None))).sum(axis=1)
+
+        # Return mean entropy across cells
+        result = float(entropy_per_cell.mean())
+
+        # Cache result
+        self._cached_metrics[cache_key] = result
+        return result
+
+    def get_topic_diversity(self, modality: str | None = None) -> float:
+        """
+        Compute topic diversity as average pairwise cosine distance.
+
+        Higher values indicate more distinct topics. This metric measures how
+        different the topic-feature distributions are from each other.
+
+        Parameters
+        ----------
+        modality : str, optional
+            If provided, compute diversity for this specific modality's
+            feature-topic distribution. If None, compute diversity averaged
+            across all modalities (default: None).
+
+        Returns
+        -------
+        float
+            Average pairwise cosine distance between topic distributions (0-1).
+            Higher = more diverse/distinct topics.
+        """
+        if modality is not None:
+            cache_key = f"topic_diversity_modality={modality}"
+            if cache_key in self._cached_metrics:
+                return self._cached_metrics[cache_key]
+
+            # Get feature-topic dist for specific modality (K × F)
+            phi = self.get_feature_topic_dist(modality)
+            phi = np.asarray(phi, dtype=float)
+
+            # Normalize topics to unit vectors for cosine similarity
+            phi_norm = phi / (np.linalg.norm(phi, axis=1, keepdims=True) + 1e-12)
+
+            # Compute pairwise cosine similarity
+            cosine_sim = phi_norm @ phi_norm.T  # (K × K)
+
+            # Extract upper triangle (excluding diagonal)
+            K = phi.shape[0]
+            upper_tri_indices = np.triu_indices(K, k=1)
+            similarities = cosine_sim[upper_tri_indices]
+
+            # Diversity = 1 - average similarity
+            result = float(1 - similarities.mean())
+
+            # Cache result
+            self._cached_metrics[cache_key] = result
+            return result
+        else:
+            # Average across all modalities
+            cache_key = "topic_diversity_all_modalities"
+            if cache_key in self._cached_metrics:
+                return self._cached_metrics[cache_key]
+
+            diversities = []
+            for mod in self.modalities:
+                diversities.append(self.get_topic_diversity(modality=mod))
+
+            result = float(np.mean(diversities))
+
+            # Cache result
+            self._cached_metrics[cache_key] = result
+            return result
+
+    def get_top_features_per_topic(
+        self,
+        modality: str,
+        n_features: int = 10,
+        return_scores: bool = False,
+    ) -> dict[str, list[str]] | dict[str, list[tuple[str, float]]]:
+        """
+        Get top N features for each topic in a specific modality.
+
+        Parameters
+        ----------
+        modality : str
+            Modality name (e.g., 'rna', 'protein', 'chromatin')
+        n_features : int
+            Number of top features to return per topic (default: 10)
+        return_scores : bool
+            If True, return (feature_name, score) tuples.
+            If False, return feature names only (default: False).
+
+        Returns
+        -------
+        dict[str, list[str]] or dict[str, list[tuple[str, float]]]
+            Dictionary mapping topic names (e.g., 'topic_0') to lists of
+            top feature names or (feature_name, score) tuples.
+        """
+        cache_key = f"top_features_{modality}_n={n_features}_scores={return_scores}"
+        if cache_key in self._cached_metrics:
+            return self._cached_metrics[cache_key]
+
+        # Get feature-topic distribution Φ (K × F)
+        phi = self.get_feature_topic_dist(modality)
+
+        # Convert to array if DataFrame
+        if isinstance(phi, pd.DataFrame):
+            # DataFrame returned as (features × topics); transpose to (topics × features)
+            feature_names = phi.index.tolist()
+            phi_array = phi.values.T  # (K × F)
+        else:
+            phi_array = np.asarray(phi)
+            feature_names = [f"feature_{i}" for i in range(phi_array.shape[1])]
+
+        K = phi_array.shape[0]
+        result = {}
+
+        for k in range(K):
+            # Get top n_features indices for topic k
+            top_indices = np.argsort(phi_array[k, :])[-n_features:][::-1]
+
+            if return_scores:
+                # Return list of (feature_name, score) tuples
+                result[f"topic_{k}"] = [
+                    (feature_names[i], float(phi_array[k, i])) for i in top_indices
+                ]
+            else:
+                # Return list of feature names only
+                result[f"topic_{k}"] = [feature_names[i] for i in top_indices]
+
+        # Cache result
+        self._cached_metrics[cache_key] = result
+        return result
