@@ -20,6 +20,7 @@ import numpy as np
 import pandas as pd
 import scanpy as sc
 import seaborn as sns
+import anndata as ad
 
 from omics_topic import MultimodalAmortizedLDA
 
@@ -44,6 +45,20 @@ def parse_args():
         help="Aggregation strategy for modalities (default: cell)"
     )
     parser.add_argument(
+        "--likelihood_weight_mode",
+        type=str,
+        default="none",
+        choices=["none", "inverse_features", "sqrt_inverse_features"],
+        help="Rescale per-modality likelihoods (default: none)"
+    )
+    parser.add_argument(
+        "--likelihood_weight_ref",
+        type=str,
+        default="mean",
+        choices=["mean", "median", "max"],
+        help="Reference feature count for likelihood rescaling (default: mean)"
+    )
+    parser.add_argument(
         "--learnable_dispersion",
         action="store_true",
         help="Learn dispersion parameters (default: False)"
@@ -62,7 +77,7 @@ def parse_args():
     parser.add_argument(
         "--max_epochs",
         type=int,
-        default=300,
+        default=500,
         help="Maximum training epochs (default: 1000)"
     )
     parser.add_argument(
@@ -80,9 +95,30 @@ def parse_args():
     return parser.parse_args()
 
 
+DATA_PATH = "/data/GSE158013/GSM5123951_celltypist.h5mu"
+
+
+def _ensure_counts_layer(adata):
+    if "counts" not in adata.layers:
+        adata.layers["counts"] = adata.X.copy()
+
+
+def _find_true_umap(mdata):
+    if "X_umap" in mdata.obsm:
+        return mdata.obsm["X_umap"], "mdata"
+    for mod_name in ("rna", "atac", "prot"):
+        if mod_name in mdata.mod and "X_umap" in mdata.mod[mod_name].obsm:
+            return mdata.mod[mod_name].obsm["X_umap"], mod_name
+    return None, None
+
+
 def load_data():
-    """Load and preprocess TEA-seq data."""
-    mdata = mu.read_h5mu("/data/GSE158013/GSM5123951.h5mu")
+    """Load and preprocess TEA-seq data (CellTypist annotated)."""
+    mdata = mu.read_h5mu(DATA_PATH)
+
+    _ensure_counts_layer(mdata.mod["rna"])
+    _ensure_counts_layer(mdata.mod["atac"])
+    _ensure_counts_layer(mdata.mod["prot"])
 
     # Binarize ATAC data
     mdata.mod['atac'].layers['counts'] = (mdata.mod['atac'].layers['counts'] > 0).astype(int)
@@ -93,6 +129,8 @@ def load_data():
 
     sc.pp.highly_variable_genes(mdata.mod['atac'], n_top_genes=10000, flavor='seurat_v3', layer='counts')
     mdata.mod['atac'] = mdata.mod['atac'][:, mdata.mod['atac'].var['highly_variable']].copy()
+
+    mdata.update()
 
     return mdata
 
@@ -108,6 +146,8 @@ def create_model(mdata, args):
         n_hidden=64,
         cell_topic_prior=1/args.n_topics,
         weight_mode=args.weight_mode,
+        likelihood_weight_mode=args.likelihood_weight_mode,
+        likelihood_weight_ref=args.likelihood_weight_ref,
         normalize_encoder_inputs=True,
         topic_feature_prior_type=args.feature_prior_type,
         learnable_dispersion=args.learnable_dispersion,
@@ -134,18 +174,22 @@ def save_results(model, mdata, output_dir):
 
     # Save model
     model_path = os.path.join(output_dir, "model")
-    model.save(model_path)
+    model.save(model_path, overwrite=True)
     print(f"Model saved to: {model_path}")
 
     # Get latent representation
     adata_concat = mdata.uns["_flattened_ann_data"]
     theta = model.get_latent_representation(adata_concat, batch_size=mdata.n_obs)
 
-    # Add to mdata and run Leiden clustering on topic space
-    mdata.obsm["X_topic"] = theta.values - 1/theta.values.shape[1]
-    sc.pp.neighbors(mdata, use_rep="X_topic", n_neighbors=15, metric="cosine", key_added="topic_neighbors")
-    sc.tl.leiden(mdata, neighbors_key="topic_neighbors", key_added="topic_leiden")
-    sc.tl.umap(mdata, neighbors_key="topic_neighbors", min_dist=0.3)
+    # Run Leiden clustering and UMAP on topic space
+    topic_X = theta.values - 1 / theta.values.shape[1]
+    topic_adata = ad.AnnData(np.asarray(topic_X))
+    topic_adata.obs = mdata.obs.copy()
+    sc.pp.neighbors(topic_adata, n_neighbors=15, metric="cosine")
+    sc.tl.leiden(topic_adata, key_added="topic_leiden")
+    sc.tl.umap(topic_adata, min_dist=0.3)
+    mdata.obsm["X_topic"] = topic_X
+    mdata.obs["topic_leiden"] = topic_adata.obs["topic_leiden"].values
 
     # Training curve
     fig, ax = plt.subplots(figsize=(10, 6))
@@ -158,21 +202,55 @@ def save_results(model, mdata, output_dir):
     plt.savefig(os.path.join(output_dir, "training_curve.png"), dpi=150, bbox_inches='tight')
     plt.close()
 
-    # UMAP colored by Leiden clusters
+    # UMAP colored by topic clusters (prefer true UMAP if available)
+    true_umap, true_umap_source = _find_true_umap(mdata)
+    if true_umap is not None and np.asarray(true_umap).shape[0] == topic_adata.n_obs:
+        umap_adata = ad.AnnData(np.zeros((topic_adata.n_obs, 1)))
+        umap_adata.obs["topic_leiden"] = topic_adata.obs["topic_leiden"].values
+        umap_adata.obsm["X_umap"] = np.asarray(true_umap)
+        title = f"UMAP (true, {true_umap_source}) colored by topic clusters"
+    else:
+        umap_adata = topic_adata
+        title = "UMAP (topic space) colored by topic clusters"
+
     fig, ax = plt.subplots(figsize=(10, 8))
-    mu.pl.embedding(
-        mdata,
-        basis="X_umap",
+    sc.pl.umap(
+        umap_adata,
         color="topic_leiden",
         frameon=False,
         s=20,
-        title="UMAP colored by Leiden Clusters (on topic space)",
+        title=title,
         show=False,
         ax=ax,
-        legend_loc="right margin"
+        legend_loc="right margin",
     )
-    plt.savefig(os.path.join(output_dir, "umap_leiden.png"), dpi=150, bbox_inches='tight')
+    plt.savefig(os.path.join(output_dir, "umap_topic_leiden.png"), dpi=150, bbox_inches="tight")
     plt.close()
+
+    # UMAP in topic space colored by cell type
+    cell_type_key = None
+    if "celltypist_label" in topic_adata.obs.columns:
+        cell_type_key = "celltypist_label"
+    elif "celltypist_label" in mdata.mod["rna"].obs.columns:
+        topic_adata.obs["celltypist_label"] = mdata.mod["rna"].obs["celltypist_label"].values
+        cell_type_key = "celltypist_label"
+
+    if cell_type_key is not None:
+        fig, ax = plt.subplots(figsize=(10, 8))
+        sc.pl.umap(
+            topic_adata,
+            color=cell_type_key,
+            frameon=False,
+            s=20,
+            title="UMAP (topic space) colored by cell type",
+            show=False,
+            ax=ax,
+            legend_loc="right margin",
+        )
+        plt.savefig(os.path.join(output_dir, "umap_topic_cell_type.png"), dpi=150, bbox_inches="tight")
+        plt.close()
+    else:
+        print("CellTypist labels not found; skipping topic-space UMAP colored by cell type.")
 
     # Topic distribution
     fig, ax = plt.subplots(figsize=(10, 6))
@@ -226,6 +304,10 @@ def main():
 
     # Create output directory with hyperparameter info
     hyperparam_str = f"prior_{args.feature_prior_type}_weight_{args.weight_mode}"
+    if args.likelihood_weight_mode != "none" or args.likelihood_weight_ref != "mean":
+        hyperparam_str += f"_likewt_{args.likelihood_weight_mode}"
+        if args.likelihood_weight_ref != "mean":
+            hyperparam_str += f"_{args.likelihood_weight_ref}"
     if args.learnable_dispersion:
         hyperparam_str += f"_learnable_disp"
         if args.global_dispersion:
@@ -240,6 +322,8 @@ def main():
     print("=" * 70)
     print(f"Feature prior type: {args.feature_prior_type}")
     print(f"Weight mode: {args.weight_mode}")
+    print(f"Likelihood weight mode: {args.likelihood_weight_mode}")
+    print(f"Likelihood weight ref: {args.likelihood_weight_ref}")
     print(f"Learnable dispersion: {args.learnable_dispersion}")
     print(f"Global dispersion: {args.global_dispersion}")
     print(f"N topics: {args.n_topics}")

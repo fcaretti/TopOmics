@@ -546,6 +546,8 @@ class MultimodalLDAPyroModel(PyroModule):
         global_dispersion: bool = True,  # if learnable: one global vs per-gene dispersion
         topic_feature_prior_type: str = "logistic_normal",
         use_feature_background: bool = True,
+        likelihood_weight_mode: str = "none",
+        likelihood_weight_ref: str = "mean",
         init_bg_mean: list[torch.Tensor | None] | None = None,
     ) -> None:
         super().__init__("multimodal_lda")
@@ -560,6 +562,38 @@ class MultimodalLDAPyroModel(PyroModule):
         self.global_dispersion = global_dispersion
         self.topic_feature_prior_type = topic_feature_prior_type
         self.use_feature_background = use_feature_background
+        self.likelihood_weight_mode = likelihood_weight_mode
+        self.likelihood_weight_ref = likelihood_weight_ref
+
+        valid_weight_modes = {"none", "inverse_features", "sqrt_inverse_features"}
+        if likelihood_weight_mode not in valid_weight_modes:
+            raise ValueError(
+                f"likelihood_weight_mode must be one of {valid_weight_modes}, "
+                f"got '{likelihood_weight_mode}'"
+            )
+
+        valid_weight_refs = {"mean", "median", "max"}
+        if likelihood_weight_ref not in valid_weight_refs:
+            raise ValueError(
+                f"likelihood_weight_ref must be one of {valid_weight_refs}, "
+                f"got '{likelihood_weight_ref}'"
+            )
+
+        feature_counts = torch.as_tensor(n_inputs_modalities, dtype=torch.float32)
+        if likelihood_weight_mode == "none":
+            weights = torch.ones_like(feature_counts)
+        else:
+            if likelihood_weight_ref == "mean":
+                ref_value = feature_counts.mean()
+            elif likelihood_weight_ref == "median":
+                ref_value = feature_counts.median()
+            else:
+                ref_value = feature_counts.max()
+
+            weights = ref_value / feature_counts
+            if likelihood_weight_mode == "sqrt_inverse_features":
+                weights = torch.sqrt(weights)
+        self.register_buffer("likelihood_weights", weights)
 
         # Normalise/expand cell_topic_prior to length-K tensor
         cell_topic_prior = torch.as_tensor(cell_topic_prior)
@@ -791,56 +825,57 @@ class MultimodalLDAPyroModel(PyroModule):
                 lib_m = torch.clamp(libraries[:, m], min=0.0)
                 phi_m = topic_feature_dists[m]  # (K, F_m)
                 rate_m = theta @ phi_m  # (B, F_m)
-
-                if L_m == "multinomial":
-                    x_m_obs = torch.clamp(x_m, min=0.0).round()
-                    N_max = int(x_m_obs.sum(dim=1).max().item()) if x_m_obs.numel() > 0 else 0
-                    pyro.sample(
-                        f"feature_counts_{m}",
-                        CategoricalBoW(N_max, rate_m),
-                        obs=x_m_obs,
-                    )
-                elif L_m in {"gamma_poisson", "nb"}:
-                    # Observations must be non-negative integers; guard against preprocessed inputs
-                    x_m_obs = torch.clamp(x_m, min=0.0).round()
-                    # mean scaled by lib
-                    mu = torch.clamp(rate_m * lib_m.unsqueeze(-1), min=1e-8)
-
-                    if self.learnable_dispersion and m in dispersion_samples:
-                        # Use sampled dispersion (STAMP-like parameterization)
-                        disp = dispersion_samples[m]
-                        inv_disp = 1.0 / (disp ** 2 + 1e-8)
-                        # GammaPoisson(concentration, rate) where mean = concentration/rate
+                likelihood_scale = self.likelihood_weights[m]
+                with poutine.scale(scale=likelihood_scale):
+                    if L_m == "multinomial":
+                        x_m_obs = torch.clamp(x_m, min=0.0).round()
+                        N_max = int(x_m_obs.sum(dim=1).max().item()) if x_m_obs.numel() > 0 else 0
                         pyro.sample(
                             f"feature_counts_{m}",
-                            dist.GammaPoisson(
-                                concentration=inv_disp,
-                                rate=inv_disp / mu
-                            ).to_event(1),
+                            CategoricalBoW(N_max, rate_m),
+                            obs=x_m_obs,
+                        )
+                    elif L_m in {"gamma_poisson", "nb"}:
+                        # Observations must be non-negative integers; guard against preprocessed inputs
+                        x_m_obs = torch.clamp(x_m, min=0.0).round()
+                        # mean scaled by lib
+                        mu = torch.clamp(rate_m * lib_m.unsqueeze(-1), min=1e-8)
+
+                        if self.learnable_dispersion and m in dispersion_samples:
+                            # Use sampled dispersion (STAMP-like parameterization)
+                            disp = dispersion_samples[m]
+                            inv_disp = 1.0 / (disp ** 2 + 1e-8)
+                            # GammaPoisson(concentration, rate) where mean = concentration/rate
+                            pyro.sample(
+                                f"feature_counts_{m}",
+                                dist.GammaPoisson(
+                                    concentration=inv_disp,
+                                    rate=inv_disp / mu
+                                ).to_event(1),
+                                obs=x_m_obs,
+                            )
+                        else:
+                            # Fixed dispersion (original behavior)
+                            r = torch.tensor(self.dispersion_rna, device=mu.device)
+                            pyro.sample(
+                                f"feature_counts_{m}",
+                                dist.NegativeBinomial(total_count=r, probs=mu / (mu + r)).to_event(1),
+                                obs=x_m_obs,
+                            )
+                    elif L_m == "bernoulli":
+                        x_m_obs = torch.clamp(x_m, min=0.0, max=1.0).round()
+                        # Library size scaling (depth normalization)
+                        lib_ratio = lib_m / lib_m.mean()  # (B,) - relative depth
+                        p_m = rate_m * lib_ratio.unsqueeze(-1)  # (B, F_m) - scale by depth
+                        p_m = torch.clamp(p_m, max=1.0)  # Ensure valid probability
+                        # Sample Bernoulli observations
+                        pyro.sample(
+                            f"feature_counts_{m}",
+                            dist.Bernoulli(probs=p_m).to_event(1),
                             obs=x_m_obs,
                         )
                     else:
-                        # Fixed dispersion (original behavior)
-                        r = torch.tensor(self.dispersion_rna, device=mu.device)
-                        pyro.sample(
-                            f"feature_counts_{m}",
-                            dist.NegativeBinomial(total_count=r, probs=mu / (mu + r)).to_event(1),
-                            obs=x_m_obs,
-                        )
-                elif L_m == "bernoulli":
-                    x_m_obs = torch.clamp(x_m, min=0.0, max=1.0).round()
-                    # Library size scaling (depth normalization)
-                    lib_ratio = lib_m / lib_m.mean()  # (B,) - relative depth
-                    p_m = rate_m * lib_ratio.unsqueeze(-1)  # (B, F_m) - scale by depth
-                    p_m = torch.clamp(p_m, max=1.0)  # Ensure valid probability
-                    # Sample Bernoulli observations
-                    pyro.sample(
-                        f"feature_counts_{m}",
-                        dist.Bernoulli(probs=p_m).to_event(1),
-                        obs=x_m_obs,
-                    )
-                else:
-                    raise ValueError(f"Unknown likelihood {L_m}")
+                        raise ValueError(f"Unknown likelihood {L_m}")
                 cursor += F_m
 
 
@@ -1371,6 +1406,8 @@ class MultimodalAmortizedLDAPyroModule(PyroBaseModuleClass):
         dispersion_rna: float = 1.0,
         learnable_dispersion: bool = False,
         global_dispersion: bool = True,
+        likelihood_weight_mode: str = "none",
+        likelihood_weight_ref: str = "mean",
         normalize_encoder_inputs: bool = True,
         encoder_scale_factor: float = 1e4,
         entropy_weight: float = 0.01,
@@ -1424,6 +1461,8 @@ class MultimodalAmortizedLDAPyroModule(PyroBaseModuleClass):
             global_dispersion=global_dispersion,
             topic_feature_prior_type=topic_feature_prior_type,
             use_feature_background=use_feature_background,
+            likelihood_weight_mode=likelihood_weight_mode,
+            likelihood_weight_ref=likelihood_weight_ref,
             init_bg_mean=init_bg_mean,
         )
         self._guide = MultimodalLDAPyroGuide(

@@ -156,6 +156,8 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
         global_dispersion: bool = True,
         modality_names: list[str] | None = None,
         weight_mode: str = "cell",
+        likelihood_weight_mode: str = "none",
+        likelihood_weight_ref: str = "mean",
         normalize_encoder_inputs: bool = True,
         encoder_scale_factor: float = 1e6,
         entropy_weight: float = 0.01,
@@ -224,6 +226,15 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
             - "equal": All modalities weighted equally (default, simplest)
             - "universal": Learn a single weight per modality across all cells
             - "cell": Learn per-cell, per-modality weights (most flexible)
+        likelihood_weight_mode
+            How to rescale per-modality likelihood terms (default: "none"):
+
+            - "none": no rescaling (current behavior)
+            - "inverse_features": scale by (F_ref / F_m)
+            - "sqrt_inverse_features": scale by sqrt(F_ref / F_m)
+        likelihood_weight_ref
+            Reference feature count for rescaling (default: "mean"):
+            one of {"mean", "median", "max"}.
         normalize_encoder_inputs
             If ``True``, normalize counts by library size and apply log1p before encoding.
             Each modality is normalized to its own median sequencing depth:
@@ -294,6 +305,20 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
         if weight_mode not in valid_modes:
             raise ValueError(f"weight_mode must be one of {valid_modes}, got '{weight_mode}'")
 
+        valid_likelihood_modes = {"none", "inverse_features", "sqrt_inverse_features"}
+        if likelihood_weight_mode not in valid_likelihood_modes:
+            raise ValueError(
+                f"likelihood_weight_mode must be one of {valid_likelihood_modes}, "
+                f"got '{likelihood_weight_mode}'"
+            )
+
+        valid_likelihood_refs = {"mean", "median", "max"}
+        if likelihood_weight_ref not in valid_likelihood_refs:
+            raise ValueError(
+                f"likelihood_weight_ref must be one of {valid_likelihood_refs}, "
+                f"got '{likelihood_weight_ref}'"
+            )
+
         # Validate topic_feature_prior_type
         valid_prior_types = {"logistic_normal", "horseshoe"}
         if topic_feature_prior_type not in valid_prior_types:
@@ -330,6 +355,8 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
         self.modality_names = modality_names if modality_names else [str(i) for i in range(self.n_modalities)]
         self.modalities = self.modality_names  # alias for BaseTopicModel utilities
         self.weight_mode = weight_mode
+        self.likelihood_weight_mode = likelihood_weight_mode
+        self.likelihood_weight_ref = likelihood_weight_ref
         self.n_topics = n_topics
         self.topic_feature_prior_type = topic_feature_prior_type
         self.use_feature_background = use_feature_background
@@ -353,6 +380,13 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
             logger.info(
                 "Using regularized horseshoe prior for topic-feature distributions. "
                 "This induces sparsity for more interpretable topics."
+            )
+
+        if likelihood_weight_mode != "none":
+            logger.info(
+                "Using likelihood rescaling mode '%s' with reference '%s'.",
+                likelihood_weight_mode,
+                likelihood_weight_ref,
             )
 
         # Compute feature background initialization (scTM-style)
@@ -426,6 +460,8 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
             dispersion_rna=dispersion_rna,
             learnable_dispersion=learnable_dispersion,
             global_dispersion=global_dispersion,
+            likelihood_weight_mode=likelihood_weight_mode,
+            likelihood_weight_ref=likelihood_weight_ref,
             normalize_encoder_inputs=normalize_encoder_inputs,
             encoder_scale_factor=encoder_scale_factor,
             entropy_weight=entropy_weight,
@@ -896,6 +932,8 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
             - n_topics: Number of topics (default: 20)
             - n_hidden: Hidden units in encoders (default: 128)
             - weight_mode: "equal", "universal", or "cell" (default: "equal")
+            - likelihood_weight_mode: "none", "inverse_features", "sqrt_inverse_features" (default: "none")
+            - likelihood_weight_ref: "mean", "median", or "max" (default: "mean")
             - likelihoods: List of likelihoods per modality ("multinomial", "gamma_poisson"/"nb", "bernoulli"; auto-inferred if not provided)
         """
         if modality_order is None:
@@ -970,6 +1008,8 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
             - n_topics: Number of topics (required)
             - n_hidden: Hidden units (default: 128)
             - weight_mode: "equal", "universal", or "cell" (default: "equal")
+            - likelihood_weight_mode: "none", "inverse_features", "sqrt_inverse_features" (default: "none")
+            - likelihood_weight_ref: "mean", "median", or "max" (default: "mean")
             - likelihoods: List of likelihoods per modality ("multinomial", "gamma_poisson"/"nb", "bernoulli"; auto-inferred if not provided)
 
         Returns
@@ -1563,6 +1603,28 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
                 self._cached_metrics[cache_key] = pd.DataFrame(result)
 
         return result
+
+    def get_likelihood_weights(self, return_format: str = "dataframe") -> pd.DataFrame | dict[str, float]:
+        """
+        Return per-modality likelihood scaling weights used in the generative model.
+
+        Parameters
+        ----------
+        return_format : str
+            "dataframe" returns a single-row DataFrame (modalities as columns),
+            "dict" returns a mapping of modality name -> weight.
+
+        Returns
+        -------
+        pd.DataFrame or dict[str, float]
+            Likelihood weights for each modality.
+        """
+        weights = self.module.model.likelihood_weights.detach().cpu().numpy()
+        if return_format == "dict":
+            return {name: float(weights[i]) for i, name in enumerate(self.modality_names)}
+        if return_format != "dataframe":
+            raise ValueError("return_format must be 'dataframe' or 'dict'.")
+        return pd.DataFrame([weights], columns=self.modality_names)
 
     def get_entropy_weight(self) -> float:
         """
