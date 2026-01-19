@@ -288,7 +288,7 @@ class GCNEncoder(nn.Module):
         n_hidden: int,
         dropout: float = 0.1,
         add_self_loops: bool = True,
-        conv_type: str = "GCNConv",  # or 'GATv2Conv'
+        conv_type: str = "GATv2Conv",  # or 'GATv2Conv'
         heads: int = 4,              # used only by GAT
         normalize: bool = True,      # used only by GCN
         concat: bool = True,         # multi-head strategy for GAT
