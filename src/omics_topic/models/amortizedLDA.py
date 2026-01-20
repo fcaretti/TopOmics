@@ -158,6 +158,8 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
         weight_mode: str = "cell",
         likelihood_weight_mode: str = "none",
         likelihood_weight_ref: str = "mean",
+        gcn_n_layers: int = 1,
+        gcn_hidden_dims: list[int] | None = None,
         normalize_encoder_inputs: bool = True,
         encoder_scale_factor: float = 1e6,
         entropy_weight: float = 0.01,
@@ -235,6 +237,10 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
         likelihood_weight_ref
             Reference feature count for rescaling (default: "mean"):
             one of {"mean", "median", "max"}.
+        gcn_n_layers
+            Number of graph convolution layers for spatial encoders (default: 1).
+        gcn_hidden_dims
+            Optional list of hidden sizes for each GCN layer (length = gcn_n_layers).
         normalize_encoder_inputs
             If ``True``, normalize counts by library size and apply log1p before encoding.
             Each modality is normalized to its own median sequencing depth:
@@ -357,6 +363,8 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
         self.weight_mode = weight_mode
         self.likelihood_weight_mode = likelihood_weight_mode
         self.likelihood_weight_ref = likelihood_weight_ref
+        self.gcn_n_layers = gcn_n_layers
+        self.gcn_hidden_dims = gcn_hidden_dims
         self.n_topics = n_topics
         self.topic_feature_prior_type = topic_feature_prior_type
         self.use_feature_background = use_feature_background
@@ -457,6 +465,8 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
             max_n_obs=max_n_obs,
             spatial=self.spatial,
             adjacency=adjacency,
+            gcn_n_layers=gcn_n_layers,
+            gcn_hidden_dims=gcn_hidden_dims,
             dispersion_rna=dispersion_rna,
             learnable_dispersion=learnable_dispersion,
             global_dispersion=global_dispersion,
@@ -934,6 +944,8 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
             - weight_mode: "equal", "universal", or "cell" (default: "equal")
             - likelihood_weight_mode: "none", "inverse_features", "sqrt_inverse_features" (default: "none")
             - likelihood_weight_ref: "mean", "median", or "max" (default: "mean")
+            - gcn_n_layers: Number of graph conv layers for spatial encoders (default: 1)
+            - gcn_hidden_dims: List of hidden sizes per graph conv layer
             - likelihoods: List of likelihoods per modality ("multinomial", "gamma_poisson"/"nb", "bernoulli"; auto-inferred if not provided)
         """
         if modality_order is None:
@@ -1010,6 +1022,8 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
             - weight_mode: "equal", "universal", or "cell" (default: "equal")
             - likelihood_weight_mode: "none", "inverse_features", "sqrt_inverse_features" (default: "none")
             - likelihood_weight_ref: "mean", "median", or "max" (default: "mean")
+            - gcn_n_layers: Number of graph conv layers for spatial encoders (default: 1)
+            - gcn_hidden_dims: List of hidden sizes per graph conv layer
             - likelihoods: List of likelihoods per modality ("multinomial", "gamma_poisson"/"nb", "bernoulli"; auto-inferred if not provided)
 
         Returns

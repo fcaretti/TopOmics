@@ -62,7 +62,7 @@ def parse_args():
     parser.add_argument(
         "--max_epochs",
         type=int,
-        default=300,
+        default=200,
         help="Maximum training epochs (default: 500)"
     )
     parser.add_argument(
@@ -134,6 +134,7 @@ def train_model(model, args):
         train_size=0.8,
         validation_size=0.2,
         log_every_n_steps=1,
+        plan_kwargs={"optim_kwargs": {"lr": 1e-2}},
     )
     return model
 
@@ -144,7 +145,7 @@ def save_results(model, mdata, output_dir):
 
     # Save model
     model_path = os.path.join(output_dir, "model")
-    model.save(model_path)
+    model.save(model_path, overwrite=True)
     print(f"Model saved to: {model_path}")
 
     # Get latent representation
