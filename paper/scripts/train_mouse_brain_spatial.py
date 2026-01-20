@@ -41,9 +41,9 @@ def parse_args():
     parser.add_argument(
         "--weight_mode",
         type=str,
-        default="cell",
+        default="universal",
         choices=["equal", "universal", "cell"],
-        help="Aggregation strategy for modalities (default: cell)"
+        help="Aggregation strategy for modalities (default: universal)"
     )
     parser.add_argument(
         "--learnable_dispersion",
@@ -72,6 +72,12 @@ def parse_args():
         type=int,
         default=256,
         help="Batch size (default: 256)"
+    )
+    parser.add_argument(
+        "--gcn_n_layers",
+        type=int,
+        default=1,
+        help="Number of GCN layers for spatial encoder (default: 1)"
     )
     parser.add_argument(
         "--gcn_alpha",
@@ -133,6 +139,7 @@ def create_model(mdata, args):
         weight_mode=args.weight_mode,
         cell_topic_prior=1/args.n_topics,
         spatial_keys="spatial_connectivities",
+        gcn_n_layers=args.gcn_n_layers,
         kl_weight=1,
         topic_feature_prior_type=args.feature_prior_type,
         learnable_dispersion=args.learnable_dispersion,
@@ -264,6 +271,8 @@ def main():
 
     # Create output directory with hyperparameter info
     hyperparam_str = f"prior_{args.feature_prior_type}_weight_{args.weight_mode}"
+    if args.gcn_n_layers != 1:
+        hyperparam_str += f"_gcn{args.gcn_n_layers}"
     if args.learnable_dispersion:
         hyperparam_str += f"_learnable_disp"
         if args.global_dispersion:
@@ -278,6 +287,7 @@ def main():
     print("=" * 70)
     print(f"Feature prior type: {args.feature_prior_type}")
     print(f"Weight mode: {args.weight_mode}")
+    print(f"GCN layers: {args.gcn_n_layers}")
     print(f"Learnable dispersion: {args.learnable_dispersion}")
     print(f"Global dispersion: {args.global_dispersion}")
     print(f"GCN alpha: {args.gcn_alpha}")

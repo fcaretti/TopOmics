@@ -269,8 +269,8 @@ logger = logging.getLogger(__name__)
 
 class GCNEncoder(nn.Module):
     """
-    GCN/GAT encoder for spatial data with an explicit skip-connection that
-    preserves node identity.
+    GCN/GAT encoder for spatial data with optional multi-layer graph
+    convolution and an explicit skip-connection that preserves node identity.
 
     The skip path uses the scvi Encoder structure (FCLayers -> mean/var). When
     the skip weight is exactly 1, the graph branch is ignored and the encoder
@@ -286,6 +286,8 @@ class GCNEncoder(nn.Module):
         n_in: int,
         n_topics: int,
         n_hidden: int,
+        gcn_n_layers: int = 1,
+        gcn_hidden_dims: list[int] | None = None,
         dropout: float = 0.1,
         add_self_loops: bool = True,
         conv_type: str = "GATv2Conv",  # or 'GATv2Conv'
@@ -304,32 +306,55 @@ class GCNEncoder(nn.Module):
         self.n_topics = n_topics
         self.n_hidden = n_hidden
         self.var_eps = var_eps
+        self.gcn_n_layers = gcn_n_layers
+        self.gcn_hidden_dims = gcn_hidden_dims
+        self.gcn_dropout = dropout
         # Use softplus instead of exp for variance - bounded gradients prevent explosion
         self.var_activation = F.softplus if var_activation is None else var_activation
 
+        if gcn_n_layers < 1:
+            raise ValueError("gcn_n_layers must be >= 1.")
+
         # Neighbor aggregation (graph convolution)
         self.conv_type = conv_type
-        if conv_type == "GATv2Conv":
-            self.conv = GATv2Conv(
-                in_channels=n_in,
-                out_channels=n_hidden if not concat else max(1, n_hidden // heads),
-                heads=heads,
-                add_self_loops=add_self_loops,
-                dropout=dropout,
-                concat=concat,
-            )
-            # If concat=True, output dim is heads*out_channels; make sure it matches n_hidden
-            conv_out_dim = (heads * (n_hidden if not concat else max(1, n_hidden // heads))) if concat else n_hidden
-        else:
-            # GCNConv already includes a linear transform internally
-            self.conv = GCNConv(
-                n_in,
-                n_hidden,
-                add_self_loops=add_self_loops,
-                normalize=normalize,
-                # improved=True,  # optional: strengthens self-loop contribution
-            )
-            conv_out_dim = n_hidden
+        if gcn_hidden_dims is None:
+            gcn_hidden_dims = [n_hidden] * gcn_n_layers
+        elif len(gcn_hidden_dims) != gcn_n_layers:
+            raise ValueError("gcn_hidden_dims must have length gcn_n_layers.")
+
+        def _make_conv(in_dim: int, out_dim: int):
+            if conv_type == "GATv2Conv":
+                out_channels = out_dim if not concat else max(1, out_dim // heads)
+                conv = GATv2Conv(
+                    in_channels=in_dim,
+                    out_channels=out_channels,
+                    heads=heads,
+                    add_self_loops=add_self_loops,
+                    dropout=dropout,
+                    concat=concat,
+                )
+                conv_out_dim = (heads * out_channels) if concat else out_dim
+            else:
+                conv = GCNConv(
+                    in_dim,
+                    out_dim,
+                    add_self_loops=add_self_loops,
+                    normalize=normalize,
+                )
+                conv_out_dim = out_dim
+            return conv, conv_out_dim
+
+        self.convs = nn.ModuleList()
+        self.conv_bns = nn.ModuleList()
+        self.conv_out_dims = []
+
+        prev_dim = n_in
+        for hidden_dim in gcn_hidden_dims:
+            conv, conv_out_dim = _make_conv(prev_dim, hidden_dim)
+            self.convs.append(conv)
+            self.conv_bns.append(nn.BatchNorm1d(conv_out_dim))
+            self.conv_out_dims.append(conv_out_dim)
+            prev_dim = conv_out_dim
 
         # scvi-style encoder for the self signal
         fc_n_layers = kwargs.pop("n_layers", 1)
@@ -346,12 +371,10 @@ class GCNEncoder(nn.Module):
         self.mean_encoder = nn.Linear(n_hidden, n_topics)
         self.var_encoder = nn.Linear(n_hidden, n_topics)
 
-        # BatchNorm after GCN conv to prevent over-smoothing (like STAMP)
-        self.conv_bn = nn.BatchNorm1d(conv_out_dim)
-
         # If GAT concat produced a different hidden size, align it
-        if conv_out_dim != n_hidden:
-            self.nei_proj = nn.Linear(conv_out_dim, n_hidden, bias=False)
+        final_conv_dim = self.conv_out_dims[-1]
+        if final_conv_dim != n_hidden:
+            self.nei_proj = nn.Linear(final_conv_dim, n_hidden, bias=False)
         else:
             self.nei_proj = nn.Identity()
 
@@ -467,9 +490,17 @@ class GCNEncoder(nn.Module):
         # Self path (scvi-style)
         h_self_full = clamp_symmetric(self.encoder(x_full))
 
-        # Neighbor aggregation path (with BatchNorm to prevent over-smoothing)
-        h_nei_raw = self.conv(x_full, ei_full)
-        h_nei_full = clamp_symmetric(self.conv_bn(h_nei_raw))
+        # Neighbor aggregation path (stacked graph convs with BatchNorm)
+        h_nei_full = x_full
+        for i, (conv, bn) in enumerate(zip(self.convs, self.conv_bns, strict=False)):
+            h_nei_full = conv(h_nei_full, ei_full)
+            h_nei_full = clamp_symmetric(bn(h_nei_full))
+            if i < len(self.convs) - 1:
+                h_nei_full = clamp_symmetric(F.relu(h_nei_full))
+                if self.gcn_dropout > 0:
+                    h_nei_full = F.dropout(
+                        h_nei_full, p=self.gcn_dropout, training=self.training
+                    )
 
         # Mix self + neighbors (skip connection)
         h_full = clamp_symmetric(self._mix_self_and_neighbors(h_self_full, h_nei_full))
@@ -890,6 +921,8 @@ class MultimodalLDAPyroGuide(PyroModule):
         n_inputs_modalities: list[int],
         n_topics: int,
         n_hidden: int,
+        gcn_n_layers: int = 1,
+        gcn_hidden_dims: list[int] | None = None,
         weight_mode: str = "equal",
         max_n_obs: int | None = None,
         spatial: bool = False,
@@ -937,7 +970,16 @@ class MultimodalLDAPyroGuide(PyroModule):
             
             # Create GCN encoders
             self.gcn_encoders = torch.nn.ModuleList(
-                [GCNEncoder(n_in, n_topics, n_hidden) for n_in in n_inputs_modalities]
+                [
+                    GCNEncoder(
+                        n_in,
+                        n_topics,
+                        n_hidden,
+                        gcn_n_layers=gcn_n_layers,
+                        gcn_hidden_dims=gcn_hidden_dims,
+                    )
+                    for n_in in n_inputs_modalities
+                ]
             )
             
             # Convert adjacency to edge_index ONCE and store as buffers
@@ -1403,6 +1445,8 @@ class MultimodalAmortizedLDAPyroModule(PyroBaseModuleClass):
         max_n_obs: int | None = None,
         spatial: bool = False,
         adjacency: torch.Tensor | Sequence[torch.Tensor] | None = None,
+        gcn_n_layers: int = 1,
+        gcn_hidden_dims: list[int] | None = None,
         dispersion_rna: float = 1.0,
         learnable_dispersion: bool = False,
         global_dispersion: bool = True,
@@ -1469,6 +1513,8 @@ class MultimodalAmortizedLDAPyroModule(PyroBaseModuleClass):
             n_inputs_modalities,
             n_topics,
             n_hidden,
+            gcn_n_layers=gcn_n_layers,
+            gcn_hidden_dims=gcn_hidden_dims,
             weight_mode=weight_mode,
             max_n_obs=max_n_obs,
             spatial=spatial,
@@ -1510,6 +1556,21 @@ class MultimodalAmortizedLDAPyroModule(PyroBaseModuleClass):
     @property
     def guide(self):
         return self._guide
+
+    def load_state_dict(self, state_dict, strict: bool = True):
+        incompatible = super().load_state_dict(state_dict, strict=False)
+        missing = [
+            key for key in incompatible.missing_keys
+            if key != "_model.likelihood_weights"
+        ]
+        unexpected = list(incompatible.unexpected_keys)
+        if strict and (missing or unexpected):
+            raise RuntimeError(
+                "Error(s) in loading state_dict for "
+                f"{self.__class__.__name__}: "
+                f"Missing keys: {missing}, Unexpected keys: {unexpected}"
+            )
+        return incompatible
 
 
     def set_full_graph_data(self, x_full: torch.Tensor):

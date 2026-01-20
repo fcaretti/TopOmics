@@ -38,6 +38,12 @@ def parse_args():
         help="Feature prior type (default: logistic_normal)"
     )
     parser.add_argument(
+        "--gcn_n_layers",
+        type=int,
+        default=1,
+        help="Number of GCN layers for spatial encoder (default: 1)"
+    )
+    parser.add_argument(
         "--learnable_dispersion",
         action="store_true",
         help="Learn dispersion parameters (default: False)"
@@ -56,7 +62,7 @@ def parse_args():
     parser.add_argument(
         "--max_epochs",
         type=int,
-        default=800,
+        default=200,
         help="Maximum training epochs (default: 200)"
     )
     parser.add_argument(
@@ -80,6 +86,8 @@ def load_data():
 
     # Use raw counts
     adata.X = adata.raw.X
+    if "spatial_connectivities" not in adata.obsp:
+        sq.gr.spatial_neighbors(adata, coord_type="generic")
 
     return adata
 
@@ -91,6 +99,8 @@ def create_model(adata, args):
         n_topics=args.n_topics,
         likelihoods=["gamma_poisson"],
         cell_topic_prior=1/args.n_topics,
+        spatial_keys="spatial_connectivities",
+        gcn_n_layers=args.gcn_n_layers,
         kl_weight=1,
         use_feature_background=False,
         topic_feature_prior_type=args.feature_prior_type,
@@ -108,7 +118,7 @@ def train_model(model, args):
         train_size=0.8,
         validation_size=0.2,
         log_every_n_steps=1,
-        plan_kwargs={"optim_kwargs": {"lr": 1e-3}},
+        plan_kwargs={"optim_kwargs": {"lr": 1e-2}},
     )
     return model
 
@@ -124,6 +134,10 @@ def save_results(model, adata, output_dir):
 
     # Get latent representation
     theta = model.get_latent_representation(adata, batch_size=adata.n_obs)
+
+    # Save latent representation for easy loading (avoids GCN architecture issues)
+    np.save(os.path.join(output_dir, "latent_representation.npy"), theta.values)
+    print(f"Latent representation saved to: {os.path.join(output_dir, 'latent_representation.npy')}")
 
     # Add to adata
     adata.obsm["X_topic"] = theta.values - 1
@@ -153,7 +167,7 @@ def save_results(model, adata, output_dir):
 
     # Spatial plot colored by topic clusters
     fig, ax = plt.subplots(figsize=(10, 10))
-    sq.pl.spatial_scatter(adata, color=["topic_clusters"], ax=ax, show=False)
+    sq.pl.spatial_scatter(adata, color=["topic_clusters"], ax=ax)
     plt.savefig(os.path.join(output_dir, "spatial_topic_clusters.png"), dpi=150, bbox_inches='tight')
     plt.close()
 
@@ -195,6 +209,8 @@ def main():
 
     # Create output directory with hyperparameter info
     hyperparam_str = f"prior_{args.feature_prior_type}"
+    if args.gcn_n_layers != 1:
+        hyperparam_str += f"_gcn{args.gcn_n_layers}"
     if args.learnable_dispersion:
         hyperparam_str += f"_learnable_disp"
         if args.global_dispersion:
@@ -208,6 +224,7 @@ def main():
     print("SCTM Comparison (Visium H&E) Training")
     print("=" * 70)
     print(f"Feature prior type: {args.feature_prior_type}")
+    print(f"GCN layers: {args.gcn_n_layers}")
     print(f"Learnable dispersion: {args.learnable_dispersion}")
     print(f"Global dispersion: {args.global_dispersion}")
     print(f"N topics: {args.n_topics}")
