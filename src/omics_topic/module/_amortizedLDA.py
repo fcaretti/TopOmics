@@ -356,13 +356,19 @@ class GCNEncoder(nn.Module):
             self.conv_out_dims.append(conv_out_dim)
             prev_dim = conv_out_dim
 
+        # Covariate parameters (passed via kwargs)
+        self.n_cats_per_cov = kwargs.pop("n_cats_per_cov", None)
+        self.n_continuous_cov = kwargs.pop("n_continuous_cov", 0)
+        self.use_covariates = (self.n_cats_per_cov is not None and len(self.n_cats_per_cov) > 0) or self.n_continuous_cov > 0
+
         # scvi-style encoder for the self signal
+        # Continuous covariates are added to input; categorical handled via n_cat_list
         fc_n_layers = kwargs.pop("n_layers", 1)
         fc_dropout_rate = kwargs.pop("dropout_rate", dropout)
         self.encoder = FCLayers(
-            n_in=n_in,
+            n_in=n_in + self.n_continuous_cov,
             n_out=n_hidden,
-            n_cat_list=None,
+            n_cat_list=self.n_cats_per_cov,
             n_layers=fc_n_layers,
             n_hidden=n_hidden,
             dropout_rate=fc_dropout_rate,
@@ -454,6 +460,7 @@ class GCNEncoder(nn.Module):
         x: torch.Tensor,
         edge_index: torch.Tensor,
         batch_indices: torch.Tensor | None = None,
+        cat_list: list[torch.Tensor] | None = None,
     ):
         """
         Forward pass. Uses full-graph data when initialized.
@@ -466,6 +473,8 @@ class GCNEncoder(nn.Module):
             Ignored when full-graph is initialized
         batch_indices : torch.Tensor, optional
             Indices of nodes in the current minibatch. Required if full-graph is initialized.
+        cat_list : list[torch.Tensor], optional
+            List of categorical covariate tensors for the minibatch.
 
         Returns
         -------
@@ -487,7 +496,9 @@ class GCNEncoder(nn.Module):
         x_full = clamp_symmetric(self.x_full)
         ei_full = self.edge_index_full
 
-        # Self path (scvi-style)
+        # Self path (scvi-style FCLayers)
+        # Note: For full-graph, categorical covariates need to be expanded to full size
+        # We pass None here and apply covariates only in the minibatch path
         h_self_full = clamp_symmetric(self.encoder(x_full))
 
         # Neighbor aggregation path (stacked graph convs with BatchNorm)
@@ -580,6 +591,9 @@ class MultimodalLDAPyroModel(PyroModule):
         likelihood_weight_mode: str = "none",
         likelihood_weight_ref: str = "mean",
         init_bg_mean: list[torch.Tensor | None] | None = None,
+        # Covariate parameters for decoder-side batch correction
+        n_cats_per_cov: list[int] | None = None,
+        n_continuous_cov: int = 0,
     ) -> None:
         super().__init__("multimodal_lda")
 
@@ -640,6 +654,29 @@ class MultimodalLDAPyroModel(PyroModule):
         self.register_buffer("cell_mu", cell_mu)
         self.register_buffer("cell_sigma", cell_sigma)
 
+        # Covariate handling for decoder-side batch correction (STAMP-style)
+        # Batch effects are modelled as latent offsets on topic-gene logits:
+        #   batch_tau   ~ Beta(0.5, 0.5)        per-topic gate       (K, 1)
+        #   batch_delta ~ StudentT(10, 0, 0.01)  per-batch, per-gene  (n_batches, F_m)
+        # Applied as: phi_b = softmax(log_phi + batch_tau * batch_delta[b])
+        self.n_cats_per_cov = n_cats_per_cov
+        self.n_continuous_cov = n_continuous_cov
+        self.use_covariates = (n_cats_per_cov is not None and len(n_cats_per_cov) > 0) or n_continuous_cov > 0
+
+        if self.use_covariates:
+            if n_continuous_cov > 0:
+                raise ValueError(
+                    "Continuous covariates are not supported for STAMP-style batch correction. "
+                    "Only a single categorical covariate (batch key) is supported."
+                )
+            if n_cats_per_cov is not None and len(n_cats_per_cov) != 1:
+                raise ValueError(
+                    f"Exactly one categorical covariate (batch key) is required, "
+                    f"got {len(n_cats_per_cov)}. STAMP-style batch correction supports "
+                    f"a single batch key only."
+                )
+            self.n_batches = n_cats_per_cov[0]
+
         # Topic-feature priors: Logistic-Normal or Horseshoe
         if topic_feature_prior_type == "logistic_normal":
             # Pre-compute Logistic-Normal approximations for priors
@@ -699,6 +736,8 @@ class MultimodalLDAPyroModel(PyroModule):
         n_obs: int | None = None,
         kl_weight: float = 1.0,
         batch_indices: torch.Tensor | None = None,
+        cat_covs: torch.Tensor | None = None,  # (B, n_cat_covs)
+        cont_covs: torch.Tensor | None = None,  # (B, n_continuous_cov)
     ):
         # ----- topic-feature distributions (per modality) -----
         topic_feature_dists = []  # will store φₖ,ₘ tensors
@@ -738,7 +777,7 @@ class MultimodalLDAPyroModel(PyroModule):
                     if bg_samples[m] is not None:
                         log_phi = log_phi + bg_samples[m].unsqueeze(0)  # (K, F_m) + (1, F_m) -> (K, F_m)
 
-                    topic_feature_dists.append(F.softmax(log_phi, dim=-1))  # (K, Fₘ)
+                    topic_feature_dists.append(log_phi)  # (K, Fₘ) -- log-space, softmax applied later
 
         elif self.topic_feature_prior_type == "horseshoe":
             # NEW: Horseshoe prior (following scTM)
@@ -816,8 +855,8 @@ class MultimodalLDAPyroModel(PyroModule):
                 # Register as named sample for guide to match
                 pyro.deterministic(f"log_topic_feature_dist_{m}", beta_shrunk_m)
 
-                # 8. Convert to probability simplex
-                topic_feature_dists.append(F.softmax(beta_shrunk_m, dim=-1))
+                # 8. Store in log-space (softmax applied later)
+                topic_feature_dists.append(beta_shrunk_m)  # (K, F_m) -- log-space
 
         # ----- dispersion sampling (for learnable dispersion) -----
         dispersion_samples = {}
@@ -842,11 +881,48 @@ class MultimodalLDAPyroModel(PyroModule):
                                 )
                         dispersion_samples[m] = disp  # shape: (F_m,)
 
+        # ----- STAMP-style batch effect parameters (per modality) -----
+        batch_effects = []  # list of (batch_tau_m, batch_delta_m) tuples
+        if self.use_covariates:
+            for m in range(self.n_modalities):
+                F_m = self.n_inputs_modalities[m]
+
+                # Per-topic gate: Beta(0.5, 0.5), shape (K, 1)
+                with pyro.plate(f"topics_batch_tau_{m}", self.n_topics):
+                    with poutine.scale(scale=kl_weight):
+                        batch_tau_m = pyro.sample(
+                            f"batch_tau_{m}",
+                            dist.Beta(
+                                torch.tensor(0.5, device=self._dummy.device),
+                                torch.tensor(0.5, device=self._dummy.device),
+                            ),
+                        )
+                batch_tau_m = batch_tau_m.unsqueeze(-1)  # (K, 1)
+
+                # Per-batch, per-gene offset: StudentT(10, 0, 0.01), shape (n_batches, F_m)
+                # Plate nesting: genes outer (dim=-1), batches inner (dim=-2)
+                # -> sample shape (n_batches, F_m) with n_batches at dim=-2, F_m at dim=-1
+                with pyro.plate(f"genes_batch_delta_{m}", F_m):
+                    with pyro.plate(f"batches_batch_delta_{m}", self.n_batches):
+                        with poutine.scale(scale=kl_weight):
+                            batch_delta_m = pyro.sample(
+                                f"batch_delta_{m}",
+                                dist.StudentT(
+                                    torch.tensor(10.0, device=self._dummy.device),
+                                    torch.zeros(1, device=self._dummy.device),
+                                    torch.tensor(0.01, device=self._dummy.device),
+                                ),
+                            )
+                # batch_delta_m shape: (n_batches, F_m)
+
+                batch_effects.append((batch_tau_m, batch_delta_m))
+
         # ----- cells plate -----
         with pyro.plate("cells", size=n_obs or self.n_obs, subsample_size=x.shape[0]):
             # shared θₙ
             with poutine.scale(scale=kl_weight):
                 log_theta = pyro.sample("log_cell_topic_dist", dist.Normal(self.cell_mu, self.cell_sigma).to_event(1))
+
             theta = F.softmax(log_theta, dim=-1)
 
             # likelihood per modality
@@ -854,8 +930,28 @@ class MultimodalLDAPyroModel(PyroModule):
             for m, (F_m, L_m) in enumerate(zip(self.n_inputs_modalities, self.likelihoods, strict=False)):
                 x_m = x[:, cursor : cursor + F_m]
                 lib_m = torch.clamp(libraries[:, m], min=0.0)
-                phi_m = topic_feature_dists[m]  # (K, F_m)
-                rate_m = theta @ phi_m  # (B, F_m)
+                log_phi_m = topic_feature_dists[m]  # (K, F_m) -- log-space
+
+                # Apply STAMP-style batch correction on topic-gene logits
+                if self.use_covariates and batch_effects:
+                    batch_tau_m, batch_delta_m = batch_effects[m]
+                    if cat_covs is None:
+                        raise ValueError(
+                            "Covariates were enabled but `cat_covs` is missing. "
+                            "Ensure CAT_COVS_KEY is provided to the model/guide call."
+                        )
+                    if cat_covs.dim() == 1:
+                        cat_covs = cat_covs.unsqueeze(1)
+                    batch_idx = cat_covs[:, 0].long()  # (B,)
+                    rate_m = torch.zeros_like(x_m)
+                    for b in range(self.n_batches):
+                        mask_b = (batch_idx == b)
+                        if mask_b.any():
+                            offset = batch_tau_m * batch_delta_m[b]  # (K, 1) * (F_m,) -> (K, F_m)
+                            phi_b = F.softmax(log_phi_m + offset, dim=-1)  # (K, F_m)
+                            rate_m[mask_b] = theta[mask_b] @ phi_b  # (n_b, F_m)
+                else:
+                    rate_m = theta @ F.softmax(log_phi_m, dim=-1)  # (B, F_m)
                 likelihood_scale = self.likelihood_weights[m]
                 with poutine.scale(scale=likelihood_scale):
                     if L_m == "multinomial":
@@ -923,6 +1019,7 @@ class MultimodalLDAPyroGuide(PyroModule):
         n_hidden: int,
         gcn_n_layers: int = 1,
         gcn_hidden_dims: list[int] | None = None,
+        gcn_conv_type: str='GATv2Conv',
         weight_mode: str = "equal",
         max_n_obs: int | None = None,
         spatial: bool = False,
@@ -936,6 +1033,12 @@ class MultimodalLDAPyroGuide(PyroModule):
         encoder_scale_factor: float = 1e4,
         entropy_weight: float = 0.01,
         topic_variance_weight: float = 1.0,
+        # Covariate parameters (encoder side: n_cat_list for scvi Encoder)
+        n_cats_per_cov: list[int] | None = None,
+        n_continuous_cov: int = 0,
+        # Batch effect parameters (decoder side: STAMP-style)
+        n_batches: int = 0,
+        use_batch_covariates: bool = False,
     ) -> None:
         super().__init__("multimodal_lda_guide")
         self.n_modalities = len(n_inputs_modalities)
@@ -955,10 +1058,41 @@ class MultimodalLDAPyroGuide(PyroModule):
         self.topic_variance_weight = topic_variance_weight
         self._last_topic_variance = None  # For logging
 
+        # Covariate parameters (for encoder-side batch correction via n_cat_list)
+        self.n_cats_per_cov = n_cats_per_cov
+        self.n_continuous_cov = n_continuous_cov
+        self.use_covariates = (n_cats_per_cov is not None and len(n_cats_per_cov) > 0) or n_continuous_cov > 0
+
+        # STAMP-style batch effect variational parameters (decoder side)
+        self.n_batches = n_batches
+        self.use_batch_covariates = use_batch_covariates
+        if use_batch_covariates and n_batches > 0:
+            self.batch_tau_loc = torch.nn.ParameterList()
+            self.batch_tau_scale = torch.nn.ParameterList()
+            self.batch_delta_loc = torch.nn.ParameterList()
+            self.batch_delta_scale = torch.nn.ParameterList()
+            for F_m in n_inputs_modalities:
+                # batch_tau: Logit-Normal approximation to Beta posterior
+                # loc=0 -> sigmoid(0)=0.5 initial mode
+                self.batch_tau_loc.append(torch.nn.Parameter(torch.zeros(n_topics)))
+                self.batch_tau_scale.append(torch.nn.Parameter(torch.ones(n_topics) * 0.1))
+                # batch_delta: Normal approximation to StudentT posterior
+                self.batch_delta_loc.append(torch.nn.Parameter(torch.zeros(n_batches, F_m)))
+                self.batch_delta_scale.append(torch.nn.Parameter(torch.ones(n_batches, F_m) * 0.1))
+
         # Regular encoders (always present)
+        # scvi Encoder handles categorical covariates via n_cat_list (internal embeddings)
+        # Continuous covariates are added to input dimension
         self.encoders = torch.nn.ModuleList(
             [
-                Encoder(n_in, n_topics, distribution="ln", return_dist=True, n_hidden=n_hidden)
+                Encoder(
+                    n_in + n_continuous_cov,  # Add continuous covariates to input
+                    n_topics,
+                    distribution="ln",
+                    return_dist=True,
+                    n_hidden=n_hidden,
+                    n_cat_list=n_cats_per_cov,  # scvi handles categorical embeddings
+                )
                 for n_in in n_inputs_modalities
             ]
         )
@@ -967,8 +1101,10 @@ class MultimodalLDAPyroGuide(PyroModule):
         if self.use_gcn:
             if adjacency is None:
                 raise ValueError("GCN encoder requested (spatial=True) but no adjacency was provided.")
-            
-            # Create GCN encoders
+
+            # Create GCN encoders with covariate support
+            # GCN encoders - note: categorical covariates not supported in full-graph mode
+            # Only continuous covariates (which are concatenated to input) are supported
             self.gcn_encoders = torch.nn.ModuleList(
                 [
                     GCNEncoder(
@@ -976,7 +1112,10 @@ class MultimodalLDAPyroGuide(PyroModule):
                         n_topics,
                         n_hidden,
                         gcn_n_layers=gcn_n_layers,
+                        conv_type=gcn_conv_type,
                         gcn_hidden_dims=gcn_hidden_dims,
+                        n_cats_per_cov=None,  # Categorical covariates not supported in GCN full-graph mode
+                        n_continuous_cov=n_continuous_cov,
                     )
                     for n_in in n_inputs_modalities
                 ]
@@ -1237,6 +1376,8 @@ class MultimodalLDAPyroGuide(PyroModule):
         n_obs: int | None = None,
         kl_weight: float = 1.0,
         batch_indices: torch.Tensor | None = None,
+        cat_covs: torch.Tensor | None = None,  # (B, n_cat_covs)
+        cont_covs: torch.Tensor | None = None,  # (B, n_continuous_cov)
     ):
         B = x.shape[0]
 
@@ -1327,6 +1468,38 @@ class MultimodalLDAPyroGuide(PyroModule):
                             dist.Normal(self.bg_loc[m], self._softplus(self.bg_scale[m])).to_event(1)
                         )
 
+        # STAMP-style batch effect variational posteriors
+        if self.use_batch_covariates and self.n_batches > 0:
+            for m in range(self.n_modalities):
+                F_m = self.n_inputs_modalities[m]
+
+                # batch_tau guide: Logit-Normal (Normal + SigmoidTransform -> (0,1))
+                with pyro.plate(f"topics_batch_tau_{m}", self.n_topics):
+                    with poutine.scale(scale=kl_weight):
+                        pyro.sample(
+                            f"batch_tau_{m}",
+                            dist.TransformedDistribution(
+                                dist.Normal(
+                                    self.batch_tau_loc[m],
+                                    self._softplus(self.batch_tau_scale[m]),
+                                ),
+                                dist.transforms.SigmoidTransform(),
+                            ),
+                        )
+
+                # batch_delta guide: Normal
+                # Plate nesting must match model: genes outer (dim=-1), batches inner (dim=-2)
+                with pyro.plate(f"genes_batch_delta_{m}", F_m):
+                    with pyro.plate(f"batches_batch_delta_{m}", self.n_batches):
+                        with poutine.scale(scale=kl_weight):
+                            pyro.sample(
+                                f"batch_delta_{m}",
+                                dist.Normal(
+                                    self.batch_delta_loc[m],
+                                    self._softplus(self.batch_delta_scale[m]),
+                                ),
+                            )
+
         # Dispersion variational posterior (for learnable dispersion)
         if self.learnable_dispersion and self.disp_loc is not None:
             for m in range(self.n_modalities):
@@ -1371,13 +1544,49 @@ class MultimodalLDAPyroGuide(PyroModule):
                 xs_normalized.append(x_m_norm)
             xs = xs_normalized
 
+        # Prepare covariate inputs for encoders
+        # scvi Encoder expects categorical covariates as *cat_list (one tensor per covariate)
+        # Each tensor should be 2D with shape (batch_size, 1)
+        # and continuous covariates concatenated to input x
+        cat_list = []
+        if self.n_cats_per_cov is not None and len(self.n_cats_per_cov) > 0:
+            if cat_covs is not None:
+                # Split cat_covs into individual covariate tensors, keeping 2D shape
+                # Handle both 1D and 2D cat_covs tensors
+                if cat_covs.dim() == 1:
+                    cat_list = [cat_covs.unsqueeze(1)]
+                else:
+                    cat_list = [cat_covs[:, i].unsqueeze(1) for i in range(cat_covs.shape[1])]
+            else:
+                # Encoder expects categorical covariates but none were provided
+                # Create dummy zeros as placeholders
+                device = x.device
+                cat_list = [torch.zeros((B, 1), dtype=torch.long, device=device) for _ in range(len(self.n_cats_per_cov))]
+
+        # Handle continuous covariates - if encoder expects them but they're not provided, create dummies
+        if cont_covs is None and self.n_continuous_cov > 0:
+            device = x.device
+            cont_covs = torch.zeros((B, self.n_continuous_cov), dtype=torch.float32, device=device)
+
         mus, vars_, masks = [], [], []
         for idx, (enc, x_m) in enumerate(zip(self.encoders, xs, strict=False)):
+            # Concatenate continuous covariates to modality input
+            if cont_covs is not None and self.n_continuous_cov > 0:
+                x_m_with_cov = torch.cat([x_m, cont_covs], dim=-1)
+            else:
+                x_m_with_cov = x_m
+
             if self.use_gcn:
                 edge_index = self._get_edge_index(idx)
-                q_m, _ = self.gcn_encoders[idx](x_m, edge_index, batch_indices=batch_indices)
+                # GCN encoder doesn't support categorical covariates in full-graph mode
+                # Only continuous covariates (already in x_m_with_cov) are used
+                q_m, _ = self.gcn_encoders[idx](
+                    x_m_with_cov, edge_index, batch_indices=batch_indices,
+                    cat_list=None  # Not supported in full-graph mode
+                )
             else:
-                q_m, _ = enc(x_m)  # q(z|x)
+                # scvi Encoder: forward(x, *cat_list)
+                q_m, _ = enc(x_m_with_cov, *cat_list)
             mus.append(clamp_symmetric(q_m.loc))
             vars_.append(clamp_positive(q_m.scale**2))
             # Compute mask from ORIGINAL x (before normalization)
@@ -1446,6 +1655,7 @@ class MultimodalAmortizedLDAPyroModule(PyroBaseModuleClass):
         spatial: bool = False,
         adjacency: torch.Tensor | Sequence[torch.Tensor] | None = None,
         gcn_n_layers: int = 1,
+        gcn_conv_type: str = 'GATv2COnv',
         gcn_hidden_dims: list[int] | None = None,
         dispersion_rna: float = 1.0,
         learnable_dispersion: bool = False,
@@ -1457,6 +1667,10 @@ class MultimodalAmortizedLDAPyroModule(PyroBaseModuleClass):
         entropy_weight: float = 0.01,
         topic_variance_weight: float = 1.0,
         kl_weight: float = 1.0,
+        # Covariate parameters
+        n_cats_per_cov: list[int] | None = None,
+        n_continuous_cov: int = 0,
+        encode_covariates: bool = True,
     ):
         super().__init__()
         assert len(n_inputs_modalities) == len(likelihoods)
@@ -1477,6 +1691,11 @@ class MultimodalAmortizedLDAPyroModule(PyroBaseModuleClass):
         self.entropy_weight = entropy_weight
         self.topic_variance_weight = topic_variance_weight
         self.kl_weight = kl_weight
+
+        # Covariate parameters
+        self.n_cats_per_cov = n_cats_per_cov
+        self.n_continuous_cov = n_continuous_cov
+        self.encode_covariates = encode_covariates
 
         if cell_topic_prior is None:
             cell_topic_prior_tensor = torch.full((n_topics,), 1 / n_topics)
@@ -1508,12 +1727,20 @@ class MultimodalAmortizedLDAPyroModule(PyroBaseModuleClass):
             likelihood_weight_mode=likelihood_weight_mode,
             likelihood_weight_ref=likelihood_weight_ref,
             init_bg_mean=init_bg_mean,
+            # Covariate parameters (decoder always uses them)
+            n_cats_per_cov=n_cats_per_cov,
+            n_continuous_cov=n_continuous_cov,
         )
+        # Compute batch effect parameters for guide (decoder-side, independent of encode_covariates)
+        use_batch_covariates = (n_cats_per_cov is not None and len(n_cats_per_cov) > 0)
+        _n_batches = n_cats_per_cov[0] if use_batch_covariates else 0
+
         self._guide = MultimodalLDAPyroGuide(
             n_inputs_modalities,
             n_topics,
             n_hidden,
             gcn_n_layers=gcn_n_layers,
+            gcn_conv_type=gcn_conv_type,
             gcn_hidden_dims=gcn_hidden_dims,
             weight_mode=weight_mode,
             max_n_obs=max_n_obs,
@@ -1528,6 +1755,12 @@ class MultimodalAmortizedLDAPyroModule(PyroBaseModuleClass):
             encoder_scale_factor=encoder_scale_factor,
             entropy_weight=entropy_weight,
             topic_variance_weight=topic_variance_weight,
+            # Covariate parameters (encoder uses them if encode_covariates=True)
+            n_cats_per_cov=n_cats_per_cov if encode_covariates else None,
+            n_continuous_cov=n_continuous_cov if encode_covariates else 0,
+            # Batch effect parameters (decoder side, always active when covariates present)
+            n_batches=_n_batches,
+            use_batch_covariates=use_batch_covariates,
         )
 
         # We need this method so scvi training plan can create data-loader args
@@ -1544,6 +1777,13 @@ class MultimodalAmortizedLDAPyroModule(PyroBaseModuleClass):
                 kwargs["batch_indices"] = tdict["indices"]
             elif "batch_indices" in tdict:
                 kwargs["batch_indices"] = tdict["batch_indices"]
+
+            # Extract covariates from batch dict (scVI convention)
+            if REGISTRY_KEYS.CAT_COVS_KEY in tdict:
+                kwargs["cat_covs"] = tdict[REGISTRY_KEYS.CAT_COVS_KEY]
+            if REGISTRY_KEYS.CONT_COVS_KEY in tdict:
+                kwargs["cont_covs"] = tdict[REGISTRY_KEYS.CONT_COVS_KEY]
+
             return args, kwargs
 
         self._get_fn_args_from_batch = _args_from_batch
@@ -1660,14 +1900,32 @@ class MultimodalAmortizedLDAPyroModule(PyroBaseModuleClass):
 
         batch_indices = torch.arange(B, device=x.device)
 
+        # Prepare dummy categorical covariates if encoder expects them
+        cat_list = []
+        if self.guide.n_cats_per_cov is not None and len(self.guide.n_cats_per_cov) > 0:
+            # Create dummy zeros since we don't have actual covariate values during inference
+            cat_list = [torch.zeros((B, 1), dtype=torch.long, device=device) for _ in range(len(self.guide.n_cats_per_cov))]
+
+        # Prepare dummy continuous covariates if encoder expects them
+        if self.guide.n_continuous_cov > 0:
+            cont_covs = torch.zeros((B, self.guide.n_continuous_cov), dtype=torch.float32, device=device)
+        else:
+            cont_covs = None
+
         # run encoders
         mus, vars_, masks = [], [], []
         for idx, (enc, x_m) in enumerate(zip(self.guide.encoders, xs, strict=False)):
+            # Add continuous covariates to input
+            if cont_covs is not None:
+                x_m_with_cov = torch.cat([x_m, cont_covs], dim=-1)
+            else:
+                x_m_with_cov = x_m
+
             if self.guide.use_gcn:
                 edge_index = self.guide._get_edge_index(idx)
-                q_m, _ = self.guide.gcn_encoders[idx](x_m, edge_index, batch_indices=batch_indices)
+                q_m, _ = self.guide.gcn_encoders[idx](x_m_with_cov, edge_index, batch_indices=batch_indices)
             else:
-                q_m, _ = enc(x_m)
+                q_m, _ = enc(x_m_with_cov, *cat_list)
             mus.append(q_m.loc)
             vars_.append(q_m.scale**2)
             # Compute mask from original x

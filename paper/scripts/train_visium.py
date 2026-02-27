@@ -44,6 +44,13 @@ def parse_args():
         help="Number of GCN layers for spatial encoder (default: 1)"
     )
     parser.add_argument(
+        "--gcn_layers_type",
+        type=str,
+        default="GATv2Conv",
+        choices=["GATv2Conv","GCNConv"],
+        help="Type of Graph Convolution"
+    )
+    parser.add_argument(
         "--learnable_dispersion",
         action="store_true",
         help="Learn dispersion parameters (default: False)"
@@ -62,7 +69,7 @@ def parse_args():
     parser.add_argument(
         "--max_epochs",
         type=int,
-        default=200,
+        default=500,
         help="Maximum training epochs (default: 200)"
     )
     parser.add_argument(
@@ -101,6 +108,7 @@ def create_model(adata, args):
         cell_topic_prior=1/args.n_topics,
         spatial_keys="spatial_connectivities",
         gcn_n_layers=args.gcn_n_layers,
+        gcn_conv_type = args.gcn_layers_type,
         kl_weight=1,
         use_feature_background=False,
         topic_feature_prior_type=args.feature_prior_type,

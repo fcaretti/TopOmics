@@ -64,7 +64,7 @@ def parse_args():
     parser.add_argument(
         "--max_epochs",
         type=int,
-        default=50,
+        default=100,
         help="Maximum training epochs (default: 50)"
     )
     parser.add_argument(
@@ -78,6 +78,13 @@ def parse_args():
         type=int,
         default=1,
         help="Number of GCN layers for spatial encoder (default: 1)"
+    )
+    parser.add_argument(
+        "--gcn_layers_type",
+        type=str,
+        default="GATv2Conv",
+        choices=["GATv2Conv","GCNConv"],
+        help="Type of Graph Convolution"
     )
     parser.add_argument(
         "--gcn_alpha",
@@ -140,6 +147,7 @@ def create_model(mdata, args):
         cell_topic_prior=1/args.n_topics,
         spatial_keys="spatial_connectivities",
         gcn_n_layers=args.gcn_n_layers,
+        gcn_conv_type=args.gcn_layers_type,
         kl_weight=1,
         topic_feature_prior_type=args.feature_prior_type,
         learnable_dispersion=args.learnable_dispersion,
@@ -172,7 +180,7 @@ def save_results(model, mdata, output_dir):
 
     # Save model
     model_path = os.path.join(output_dir, "model")
-    model.save(model_path)
+    model.save(model_path, overwrite=True)
     print(f"Model saved to: {model_path}")
 
     # Get latent representation
