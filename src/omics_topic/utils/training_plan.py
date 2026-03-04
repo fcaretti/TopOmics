@@ -4,6 +4,7 @@ import logging
 from typing import Any
 
 import torch
+from pyro.infer import Trace_ELBO
 from scvi._constants import REGISTRY_KEYS
 from scvi.train import PyroTrainingPlan
 
@@ -54,10 +55,6 @@ class MultimodalLDAPyroTrainingPlan(PyroTrainingPlan):
     def _log_validation_elbo(self, batch: dict[str, torch.Tensor]) -> float | None:
         """Compute and log validation ELBO (higher is better)."""
         x = batch[REGISTRY_KEYS.X_KEY]
-        libs = self._batch_library_tensor(x)
-        if libs.numel() == 0:
-            logger.debug("Skipping validation ELBO logging; could not build library tensor.")
-            return None
 
         n_obs = self.n_obs_validation
         if n_obs is None:
@@ -65,8 +62,10 @@ class MultimodalLDAPyroTrainingPlan(PyroTrainingPlan):
             val_indices = getattr(dm, "val_indices", None) if dm is not None else None
             n_obs = len(val_indices) if val_indices is not None else x.shape[0]
 
-        # module.get_elbo returns the Pyro Trace_ELBO loss (negative ELBO)
-        loss = self.module.get_elbo(x, libs, n_obs)
+        # Use the module's batch parser so categorical/continuous covariates are preserved.
+        args, kwargs = self.module._get_fn_args_from_batch(batch)
+        kwargs["n_obs"] = n_obs
+        loss = Trace_ELBO().loss(self.module.model, self.module.guide, *args, **kwargs)
         # Keep sign consistent with elbo_train (logged as the raw loss)
         elbo = float(loss)
         self.log(

@@ -76,6 +76,11 @@ def parse_args():
         action="store_true",
         help="Skip GLUE training",
     )
+    parser.add_argument(
+        "--skip_multivi_linear",
+        action="store_true",
+        help="Skip Linear MultiVI training",
+    )
     return parser.parse_args()
 
 
@@ -192,14 +197,95 @@ def train_multivi(mdata, n_latent, max_epochs, output_dir):
     history = model.history
     if isinstance(history, pd.DataFrame):
         history_df = history
+    elif isinstance(history, dict):
+        # scvi-tools history is a dict of metric_name -> pd.DataFrame
+        # Concatenate all metrics into a single DataFrame
+        dfs = []
+        for key, val in history.items():
+            if isinstance(val, pd.DataFrame):
+                df = val.copy()
+                df.columns = [f"{key}_{c}" if c != key else key for c in df.columns]
+                dfs.append(df)
+        if dfs:
+            history_df = pd.concat(dfs, axis=1)
+        else:
+            history_df = pd.DataFrame([history])
     else:
-        try:
-            history_df = pd.DataFrame(history)
-        except ValueError:
-            history_df = pd.DataFrame(
-                {k: [v] if np.isscalar(v) else v for k, v in history.items()}
-            )
+        history_df = pd.DataFrame()
     history_df.to_csv(os.path.join(output_dir, "multivi_history.csv"), index=False)
+
+    return latent, mdata_multivi
+
+
+# =============================================================================
+# Linear MultiVI (single layer encoder/decoder)
+# =============================================================================
+def train_multivi_linear(mdata, n_latent, max_epochs, output_dir):
+    """Train Linear MultiVI model on RNA + ATAC (single layer encoder/decoder)."""
+    import scvi
+
+    print("\n" + "=" * 70)
+    print("Training Linear MultiVI (RNA + ATAC)")
+    print("=" * 70)
+
+    mdata_multivi = mdata.copy()
+    mdata_multivi.mod["rna"].X = mdata_multivi.mod["rna"].layers["counts"].copy()
+    mdata_multivi.mod["atac"].X = mdata_multivi.mod["atac"].layers["counts"].copy()
+
+    scvi.model.MULTIVI.setup_mudata(
+        mdata_multivi,
+        rna_layer=None,
+        atac_layer=None,
+        batch_key=None,
+        modalities={
+            "rna_layer": "rna",
+            "atac_layer": "atac",
+        },
+    )
+
+    # Linear approximation: single layer encoder/decoder
+    model = scvi.model.MULTIVI(
+        mdata_multivi,
+        n_latent=n_latent,
+        n_hidden=128,
+        n_layers_encoder=1,
+        n_layers_decoder=1,
+    )
+
+    print("Training...")
+    model.train(
+        max_epochs=max_epochs,
+        train_size=0.8,
+        early_stopping=True,
+    )
+
+    latent = model.get_latent_representation()
+    print(f"Latent shape: {latent.shape}")
+
+    model_path = os.path.join(output_dir, "multivi_linear")
+    os.makedirs(model_path, exist_ok=True)
+    model.save(model_path, overwrite=True)
+    print(f"Model saved to: {model_path}")
+
+    np.save(os.path.join(output_dir, "latent_multivi_linear.npy"), latent)
+
+    history = model.history
+    if isinstance(history, pd.DataFrame):
+        history_df = history
+    elif isinstance(history, dict):
+        dfs = []
+        for key, val in history.items():
+            if isinstance(val, pd.DataFrame):
+                df = val.copy()
+                df.columns = [f"{key}_{c}" if c != key else key for c in df.columns]
+                dfs.append(df)
+        if dfs:
+            history_df = pd.concat(dfs, axis=1)
+        else:
+            history_df = pd.DataFrame([history])
+    else:
+        history_df = pd.DataFrame()
+    history_df.to_csv(os.path.join(output_dir, "multivi_linear_history.csv"), index=False)
 
     return latent, mdata_multivi
 
@@ -377,6 +463,18 @@ def main():
             results["multivi"] = latent
         except Exception as exc:
             print(f"MultiVI training failed: {exc}")
+            import traceback
+
+            traceback.print_exc()
+
+    if not args.skip_multivi_linear:
+        try:
+            latent, _ = train_multivi_linear(
+                mdata, args.n_latent, args.max_epochs, args.output_dir
+            )
+            results["multivi_linear"] = latent
+        except Exception as exc:
+            print(f"Linear MultiVI training failed: {exc}")
             import traceback
 
             traceback.print_exc()
