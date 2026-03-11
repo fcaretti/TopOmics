@@ -20,6 +20,7 @@ from scvi.data.fields import (
     LayerField,
     NumericalJointObsField,
     NumericalObsField,
+    ObsmField,
 )
 from scvi.model.base import BaseModelClass, PyroSviTrainMixin
 from scvi.utils import setup_anndata_dsp
@@ -167,12 +168,16 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
         gcn_n_layers: int = 1,
         gcn_conv_type: str = 'GATv2Conv',
         gcn_hidden_dims: list[int] | None = None,
+        gcn_alpha_init: float = 0.7,
+        gcn_use_learned_alpha: bool = True,
         normalize_encoder_inputs: bool = True,
         encoder_scale_factor: float = 1e6,
         entropy_weight: float = 0.01,
         topic_variance_weight: float = 1.0,
         kl_weight: float = 1.0,
         encode_covariates: bool = True,
+        bg_offset: float = 1.0,
+        learnable_bg: bool = True,
     ):
         """
         Initialize MultimodalAmortizedLDA with Mixture-of-Experts (MoE) architecture.
@@ -282,6 +287,12 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
             Whether to concatenate covariates to encoder input (default: True).
             If True, covariates are used in both encoder and decoder (batch-corrected latent space).
             If False, covariates are only used in decoder (scVI-style decoder-only correction).
+        bg_offset
+            Offset added to mean expression before log-transform for feature background:
+            ``init_bg_mean = log(mean_expr + bg_offset)``
+            Default: 1.0. STAMP uses 1e-15 which preserves the full dynamic range of
+            log-expression. Higher values compress the range, requiring the model to
+            learn larger deviations from the background.
 
         Notes
         -----
@@ -391,8 +402,16 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
                 if "columns" in state_registry and state_registry["columns"] is not None:
                     n_continuous_cov = len(state_registry["columns"])
 
+        # Detect extra encoder features from obsm registration
+        n_extra_encoder_features = 0
+        if "encoder_extra" in adata_manager.data_registry:
+            extra_shape = adata.obsm[adata_manager.data_registry["encoder_extra"].attr_key].shape
+            n_extra_encoder_features = extra_shape[1]
+            logger.info(f"Extra encoder features: {n_extra_encoder_features} from obsm")
+
         self.n_cats_per_cov = n_cats_per_cov
         self.n_continuous_cov = n_continuous_cov
+        self.n_extra_encoder_features = n_extra_encoder_features
         self.encode_covariates = encode_covariates
 
         # Log covariate info if present
@@ -415,6 +434,8 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
         self.gcn_n_layers = gcn_n_layers
         self.gcn_conv_type = gcn_conv_type,
         self.gcn_hidden_dims = gcn_hidden_dims
+        self.gcn_alpha_init = gcn_alpha_init
+        self.gcn_use_learned_alpha = gcn_use_learned_alpha
         self.n_topics = n_topics
         self.topic_feature_prior_type = topic_feature_prior_type
         self.use_feature_background = use_feature_background
@@ -467,9 +488,8 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
                     X_m = X_full[:, start_idx:end_idx]
 
                     # Compute mean expression per feature (scTM approach)
-                    # Use log(mean + 1) to get baseline expression in log-space
                     mean_expr = X_m.mean(axis=0)  # (F_m,)
-                    init_bg_mean_m = np.log(mean_expr + 1.0)  # (F_m,)
+                    init_bg_mean_m = np.log(mean_expr + bg_offset)  # (F_m,)
 
                     # Convert to tensor
                     init_bg_mean_list.append(torch.as_tensor(init_bg_mean_m, dtype=torch.float32))
@@ -518,6 +538,8 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
             gcn_n_layers=gcn_n_layers,
             gcn_conv_type=gcn_conv_type,
             gcn_hidden_dims=gcn_hidden_dims,
+            gcn_alpha_init=gcn_alpha_init,
+            gcn_use_learned_alpha=gcn_use_learned_alpha,
             dispersion_rna=dispersion_rna,
             learnable_dispersion=learnable_dispersion,
             global_dispersion=global_dispersion,
@@ -532,6 +554,8 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
             n_cats_per_cov=n_cats_per_cov,
             n_continuous_cov=n_continuous_cov,
             encode_covariates=encode_covariates,
+            learnable_bg=learnable_bg,
+            n_extra_encoder_features=n_extra_encoder_features,
         )
 
         # For spatial models, initialise GCN encoders with full-graph data
@@ -571,6 +595,7 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
         spatial_keys: dict[str, str] | str | None = None,
         categorical_covariate_keys: list[str] | None = None,
         continuous_covariate_keys: list[str] | None = None,
+        encoder_extra_obsm_key: str | None = None,
         **kwargs,
     ):
         """%(summary)s.
@@ -593,6 +618,11 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
         continuous_covariate_keys
             Keys in ``adata.obs`` for continuous covariates (e.g., age, percent_mito).
             These will be directly concatenated to the covariate representation.
+        encoder_extra_obsm_key
+            Optional key in ``adata.obsm`` for extra encoder input features (e.g.,
+            precomputed SGC-smoothed features). These are concatenated to the encoder
+            input but NOT used by the decoder/likelihood. The reconstruction target
+            remains the raw counts in ``.X``.
         """
         # Handle new API with data extraction
         if modalities is not None or layers is not None or spatial_keys is not None:
@@ -632,13 +662,16 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
         # This enables minibatch training with GCN encoders
         adata.obs["_indices"] = np.arange(adata.n_obs)
 
+        fields = [
+            LayerField(REGISTRY_KEYS.X_KEY, layer, is_count_data=True),
+            NumericalObsField(REGISTRY_KEYS.INDICES_KEY, "_indices"),
+            CategoricalJointObsField(REGISTRY_KEYS.CAT_COVS_KEY, categorical_covariate_keys),
+            NumericalJointObsField(REGISTRY_KEYS.CONT_COVS_KEY, continuous_covariate_keys),
+        ]
+        if encoder_extra_obsm_key is not None:
+            fields.append(ObsmField("encoder_extra", encoder_extra_obsm_key))
         adata_manager = AnnDataManager(
-            fields=[
-                LayerField(REGISTRY_KEYS.X_KEY, layer, is_count_data=True),
-                NumericalObsField(REGISTRY_KEYS.INDICES_KEY, "_indices"),
-                CategoricalJointObsField(REGISTRY_KEYS.CAT_COVS_KEY, categorical_covariate_keys),
-                NumericalJointObsField(REGISTRY_KEYS.CONT_COVS_KEY, continuous_covariate_keys),
-            ],
+            fields=fields,
             setup_method_args=setup_args,
         )
         adata_manager.register_fields(adata, **kwargs)
@@ -1168,6 +1201,9 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
         """
         from omics_topic.data import detect_data_type
 
+        # Extract setup-only kwargs before passing to model constructor
+        encoder_extra_obsm_key = model_kwargs.pop("encoder_extra_obsm_key", None)
+
         # Call setup_data to handle all preprocessing and registration
         result = cls.setup_data(
             data,
@@ -1177,6 +1213,7 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
             table_key=table_key,
             categorical_covariate_keys=categorical_covariate_keys,
             continuous_covariate_keys=continuous_covariate_keys,
+            encoder_extra_obsm_key=encoder_extra_obsm_key,
         )
 
         # Detect data type to know how to extract metadata
@@ -1334,7 +1371,8 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
         thetas = []
         for tensors in dl:
             x = tensors[REGISTRY_KEYS.X_KEY]
-            thetas.append(self.module.get_topic_distribution(x, n_samples))
+            enc_extra = tensors.get("encoder_extra", None)
+            thetas.append(self.module.get_topic_distribution(x, n_samples, encoder_extra=enc_extra))
         theta = torch.cat(thetas).cpu().numpy()
 
         return pd.DataFrame(theta, index=adata.obs_names, columns=[f"topic_{k}" for k in range(theta.shape[1])])
@@ -1373,7 +1411,8 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
         thetas = []
         for tensors in dl:
             x = tensors[REGISTRY_KEYS.X_KEY]
-            thetas.append(self.module.get_topic_distribution(x, n_samples))
+            enc_extra = tensors.get("encoder_extra", None)
+            thetas.append(self.module.get_topic_distribution(x, n_samples, encoder_extra=enc_extra))
         return torch.cat(thetas).cpu().numpy()
 
     # ------------------------------------------------------------------ #
@@ -1937,6 +1976,9 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
     def _create_training_plan(self, **kwargs):
         """
         Use custom training plan that logs validation ELBO when a val split exists.
+
+        Accepts ``kl_warmup_fraction`` (default 0.25) to control KL annealing.
+        Set to 0 to disable KL warmup (recommended for horseshoe prior).
         """
         return MultimodalLDAPyroTrainingPlan(self.module, **kwargs)
 

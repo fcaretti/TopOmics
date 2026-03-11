@@ -151,7 +151,7 @@ def save_results(model, mdata, adata, output_dir):
 
     # Save model
     model_path = os.path.join(output_dir, "model")
-    model.save(model_path)
+    model.save(model_path, overwrite=True)
     print(f"Model saved to: {model_path}")
 
     # Get latent representation
