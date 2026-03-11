@@ -414,6 +414,12 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
         self.n_extra_encoder_features = n_extra_encoder_features
         self.encode_covariates = encode_covariates
 
+        if n_continuous_cov > 0:
+            raise ValueError(
+                "Continuous covariates are not supported. "
+                "Please use categorical covariates only."
+            )
+
         # Log covariate info if present
         if n_cats_per_cov or n_continuous_cov:
             logger.info(
