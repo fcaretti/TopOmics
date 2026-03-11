@@ -90,7 +90,18 @@ def parse_args():
         "--gcn_alpha",
         type=float,
         default=0.2,
-        help="GCN alpha parameter for spatial smoothing (default: 0.2)"
+        help="GCN alpha parameter for skip connection (default: 0.2). "
+             "0 = neighbors only, 1 = self only."
+    )
+    parser.add_argument(
+        "--fixed_alpha",
+        action="store_true",
+        help="Fix alpha (don't learn it during training)"
+    )
+    parser.add_argument(
+        "--meanfield",
+        action="store_true",
+        help="Use TraceMeanField_ELBO instead of Trace_ELBO (analytic KL, lower variance gradients)"
     )
     parser.add_argument(
         "--output_dir",
@@ -138,40 +149,86 @@ def load_data():
 
 def create_model(mdata, args):
     """Create the topic model with specified hyperparameters."""
-    model = MultimodalAmortizedLDA.from_data(
+    model = MultimodalAmortizedLDA.from_mudata(
         mdata,
-        layers={"rna": None, "atac": 'binary'},
+        layer_dict={"rna": None, "atac": 'binary'},
+        spatial_key="spatial_connectivities",
         n_topics=args.n_topics,
         likelihoods=["gamma_poisson", "bernoulli"],
         weight_mode=args.weight_mode,
         cell_topic_prior=1/args.n_topics,
-        spatial_keys="spatial_connectivities",
         gcn_n_layers=args.gcn_n_layers,
         gcn_conv_type=args.gcn_layers_type,
+        gcn_alpha_init=args.gcn_alpha,
+        gcn_use_learned_alpha=not args.fixed_alpha,
         kl_weight=1,
         topic_feature_prior_type=args.feature_prior_type,
         learnable_dispersion=args.learnable_dispersion,
         global_dispersion=args.global_dispersion,
     )
 
-    # Set GCN alpha for spatial smoothing
-    for enc in model.module.guide.gcn_encoders:
-        #enc._alpha_logit.requires_grad_(False)
-        enc.alpha = args.gcn_alpha
-
     return model
 
 
 def train_model(model, args):
     """Train the model."""
+    plan_kwargs = {"optim_kwargs": {"lr": 1e-2}}
+    if args.meanfield:
+        from pyro.infer import TraceMeanField_ELBO
+        plan_kwargs["loss_fn"] = TraceMeanField_ELBO()
+    else:
+        from pyro.infer import Trace_ELBO
+        plan_kwargs["loss_fn"] = Trace_ELBO()
     model.train(
         max_epochs=args.max_epochs,
         batch_size=args.batch_size,
         train_size=0.8,
         validation_size=0.2,
-        plan_kwargs={"optim_kwargs": {"lr": 1e-2}},
+        plan_kwargs=plan_kwargs,
     )
     return model
+
+
+def print_diagnostics(model):
+    """Print learned model diagnostics: skip connection, modality weights, background."""
+    import torch
+
+    print("\n" + "=" * 70)
+    print("MODEL DIAGNOSTICS")
+    print("=" * 70)
+
+    # Skip connection alpha
+    gcn_encoders = getattr(model.module.guide, 'gcn_encoders', None)
+    if gcn_encoders is not None:
+        for i, enc in enumerate(gcn_encoders):
+            print(f"  GCN encoder {i} skip connection alpha: {enc.alpha:.4f}")
+
+    # Modality weights
+    weight_mode = model.module.model.weight_mode if hasattr(model.module.model, 'weight_mode') else "unknown"
+    print(f"  Weight mode: {weight_mode}")
+    weights = model.get_modality_weights()
+    if weight_mode == "universal":
+        for mod_name in weights.columns:
+            print(f"    {mod_name} weight: {weights[mod_name].iloc[0]:.4f}")
+    elif weight_mode == "cell":
+        for mod_name in weights.columns:
+            w = weights[mod_name].values
+            print(f"    {mod_name} weight: mean={w.mean():.4f}, std={w.std():.4f}, "
+                  f"min={w.min():.4f}, max={w.max():.4f}")
+    else:
+        for mod_name in weights.columns:
+            print(f"    {mod_name} weight: {weights[mod_name].iloc[0]:.4f}")
+
+    # Feature background
+    use_bg = getattr(model.module.model, 'use_feature_background', False)
+    learnable_bg = getattr(model.module.model, 'learnable_bg', False)
+    print(f"  Feature background: enabled={use_bg}, learnable={learnable_bg}")
+
+    # Learnable dispersion
+    learnable_disp = getattr(model.module.guide, 'learnable_dispersion', False)
+    print(f"  Learnable dispersion: {learnable_disp}")
+
+    print("=" * 70)
 
 
 def save_results(model, mdata, output_dir):
@@ -278,7 +335,8 @@ def main():
     args = parse_args()
 
     # Create output directory with hyperparameter info
-    hyperparam_str = f"prior_{args.feature_prior_type}_weight_{args.weight_mode}"
+    alpha_str = f"alpha{args.gcn_alpha}" + ("_fixed" if args.fixed_alpha else "_learned")
+    hyperparam_str = f"prior_{args.feature_prior_type}_weight_{args.weight_mode}_{alpha_str}"
     if args.gcn_n_layers != 1:
         hyperparam_str += f"_gcn{args.gcn_n_layers}"
     if args.learnable_dispersion:
@@ -287,6 +345,8 @@ def main():
             hyperparam_str += "_global"
         else:
             hyperparam_str += "_pergene"
+    if args.meanfield:
+        hyperparam_str += "_meanfield"
 
     output_dir = os.path.join(args.output_dir, hyperparam_str)
 
@@ -298,7 +358,8 @@ def main():
     print(f"GCN layers: {args.gcn_n_layers}")
     print(f"Learnable dispersion: {args.learnable_dispersion}")
     print(f"Global dispersion: {args.global_dispersion}")
-    print(f"GCN alpha: {args.gcn_alpha}")
+    print(f"GCN alpha: {args.gcn_alpha} ({'fixed' if args.fixed_alpha else 'learned'})")
+    print(f"Loss: {'TraceMeanField_ELBO' if args.meanfield else 'Trace_ELBO'}")
     print(f"N topics: {args.n_topics}")
     print(f"Max epochs: {args.max_epochs}")
     print(f"Output directory: {output_dir}")
@@ -315,6 +376,8 @@ def main():
 
     print("\nTraining model...")
     train_model(model, args)
+
+    print_diagnostics(model)
 
     print("\nSaving results...")
     save_results(model, mdata, output_dir)

@@ -1,12 +1,21 @@
 from __future__ import annotations
 
 import logging
+import warnings
 from typing import Any
 
 import torch
-from pyro.infer import Trace_ELBO
+from pyro.infer import Trace_ELBO, TraceMeanField_ELBO
 from scvi._constants import REGISTRY_KEYS
 from scvi.train import PyroTrainingPlan
+
+# Suppress Pyro's mean-field site ordering warning — our model/guide site order
+# differs but the mean-field factorization is correct.
+warnings.filterwarnings(
+    "ignore",
+    message="Failed to verify mean field restriction on the guide",
+    module="pyro.infer.trace_mean_field_elbo",
+)
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +39,9 @@ class MultimodalLDAPyroTrainingPlan(PyroTrainingPlan):
         kl_warmup_min: float = 0.01,
         **kwargs: Any,
     ) -> None:
+        # Default to TraceMeanField_ELBO (analytic KL, lower variance gradients)
+        if "loss_fn" not in kwargs:
+            kwargs["loss_fn"] = TraceMeanField_ELBO()
         super().__init__(*args, **kwargs)
         # Needed so Trace_ELBO scaling matches training behaviour
         self.n_obs_validation = n_obs_validation
