@@ -42,6 +42,13 @@ class MultimodalLDAPyroTrainingPlan(PyroTrainingPlan):
         # Default to TraceMeanField_ELBO (analytic KL, lower variance gradients)
         if "loss_fn" not in kwargs:
             kwargs["loss_fn"] = TraceMeanField_ELBO()
+        # Default to AdamW optimizer (better weight decay handling than Adam)
+        if "optim" not in kwargs:
+            import pyro.optim
+            optim_kwargs = kwargs.pop("optim_kwargs", None) or {}
+            if "lr" not in optim_kwargs:
+                optim_kwargs["lr"] = 1e-3
+            kwargs["optim"] = pyro.optim.AdamW(optim_args=optim_kwargs)
         super().__init__(*args, **kwargs)
         # Needed so Trace_ELBO scaling matches training behaviour
         self.n_obs_validation = n_obs_validation

@@ -116,6 +116,71 @@ def masked_softmax(weights: torch.Tensor, mask: torch.Tensor, dim: int = 0):
     return torch.softmax(weights, dim=dim)
 
 
+class AttentionAggregator(nn.Module):
+    """
+    SpatialGlue-style single-head attention for mixing M modality encoder outputs.
+
+    Computes per-cell, input-dependent mixing weights alpha (B, M) from the
+    encoder means, then applies them as weights in the Gaussian mixture. This
+    is more expressive than MoE because the weight of each modality depends on
+    what each encoder actually produced for that cell.
+
+    Parameters
+    ----------
+    n_topics
+        Dimensionality of each modality embedding (= n_topics in latent space).
+    att_dim
+        Projection dimension for the attention key/value (default: 32).
+
+    Notes
+    -----
+    Missing modalities are handled by masking attention logits to -inf before
+    softmax, the same strategy used by masked_softmax in the MoE path. However,
+    if all modalities are missing for a cell the result is undefined (shouldn't
+    happen in practice). Unlike MoE, this method requires all attending modalities
+    to share the same latent dimensionality (n_topics), which is already the case.
+
+    References
+    ----------
+    Tang et al. (2023), "SpatialGlue: Deciphering multi-modal spatial omics
+    integration" – between-modality attention mechanism.
+    """
+
+    def __init__(self, n_topics: int, att_dim: int = 32) -> None:
+        super().__init__()
+        self.w_omega = nn.Parameter(torch.empty(n_topics, att_dim))
+        self.u_omega = nn.Parameter(torch.empty(att_dim, 1))
+        nn.init.xavier_uniform_(self.w_omega.unsqueeze(0))
+        nn.init.xavier_uniform_(self.u_omega.unsqueeze(0))
+
+    def forward(self, mus: torch.Tensor, masks: torch.Tensor) -> torch.Tensor:
+        """
+        Compute attention mixing weights.
+
+        Parameters
+        ----------
+        mus : (M, B, K)
+            Per-modality encoder means.
+        masks : (M, B)
+            1 if modality present for that cell, 0 if absent.
+
+        Returns
+        -------
+        w : (M, B, 1)
+            Per-cell mixing weights summing to 1 over M (absent modalities = 0).
+        """
+        emb = mus.permute(1, 0, 2)              # (B, M, K)
+        v = torch.tanh(emb @ self.w_omega)       # (B, M, att_dim)
+        vu = (v @ self.u_omega).squeeze(-1)      # (B, M)
+
+        # Mask absent modalities before softmax
+        masks_BM = masks.T                       # (B, M)
+        vu = vu.masked_fill(~masks_BM.bool(), -CLAMP_MAX)
+        alpha = torch.softmax(vu, dim=1)         # (B, M)
+
+        return alpha.T.unsqueeze(-1)             # (M, B, 1)
+
+
 def adjacency_to_edge_index(adj: torch.Tensor) -> torch.Tensor:
     """
     Convert adjacency matrix to PyG edge_index format.
@@ -288,6 +353,7 @@ class GCNEncoder(nn.Module):
         n_hidden: int,
         gcn_n_layers: int = 1,
         gcn_hidden_dims: list[int] | None = None,
+        gcn_n_pre_layers: int = 0,     # FC layers before graph convolution (0 = disabled)
         dropout: float = 0.1,
         add_self_loops: bool = True,
         conv_type: str = "GATv2Conv",  # or 'GATv2Conv'
@@ -314,6 +380,28 @@ class GCNEncoder(nn.Module):
 
         if gcn_n_layers < 1:
             raise ValueError("gcn_n_layers must be >= 1.")
+
+        # Optional FC projection applied to x_full BEFORE graph convolution.
+        # When gcn_n_pre_layers > 0 the GCN operates in learned feature space
+        # rather than raw count space — beneficial for high-dimensional inputs.
+        # Note: these share the same n_hidden width as the self-path encoder.
+        fc_n_layers_kwarg = kwargs.pop("n_layers", 1)
+        fc_dropout_rate = kwargs.pop("dropout_rate", dropout)
+        n_cats_per_cov_kwarg = kwargs.pop("n_cats_per_cov", None)
+        n_continuous_cov_kwarg = kwargs.pop("n_continuous_cov", 0)
+
+        if gcn_n_pre_layers > 0:
+            self.pre_gcn_fc = FCLayers(
+                n_in=n_in,
+                n_out=n_hidden,
+                n_layers=gcn_n_pre_layers,
+                n_hidden=n_hidden,
+                dropout_rate=fc_dropout_rate,
+            )
+            gcn_input_dim = n_hidden  # GCN receives projected features
+        else:
+            self.pre_gcn_fc = None
+            gcn_input_dim = n_in     # GCN receives raw (normalized) counts
 
         # Neighbor aggregation (graph convolution)
         self.conv_type = conv_type
@@ -348,7 +436,7 @@ class GCNEncoder(nn.Module):
         self.conv_bns = nn.ModuleList()
         self.conv_out_dims = []
 
-        prev_dim = n_in
+        prev_dim = gcn_input_dim  # may be n_in or n_hidden depending on pre_gcn_fc
         for hidden_dim in gcn_hidden_dims:
             conv, conv_out_dim = _make_conv(prev_dim, hidden_dim)
             self.convs.append(conv)
@@ -356,20 +444,17 @@ class GCNEncoder(nn.Module):
             self.conv_out_dims.append(conv_out_dim)
             prev_dim = conv_out_dim
 
-        # Covariate parameters (passed via kwargs)
-        self.n_cats_per_cov = kwargs.pop("n_cats_per_cov", None)
-        self.n_continuous_cov = kwargs.pop("n_continuous_cov", 0)
+        # Covariate parameters (already popped from kwargs above)
+        self.n_cats_per_cov = n_cats_per_cov_kwarg
+        self.n_continuous_cov = n_continuous_cov_kwarg
         self.use_covariates = (self.n_cats_per_cov is not None and len(self.n_cats_per_cov) > 0) or self.n_continuous_cov > 0
 
-        # scvi-style encoder for the self signal
-        # Continuous covariates are added to input; categorical handled via n_cat_list
-        fc_n_layers = kwargs.pop("n_layers", 1)
-        fc_dropout_rate = kwargs.pop("dropout_rate", dropout)
+        # scvi-style encoder for the self signal (n_layers / dropout_rate already popped)
         self.encoder = FCLayers(
             n_in=n_in + self.n_continuous_cov,
             n_out=n_hidden,
             n_cat_list=self.n_cats_per_cov,
-            n_layers=fc_n_layers,
+            n_layers=fc_n_layers_kwarg,
             n_hidden=n_hidden,
             dropout_rate=fc_dropout_rate,
             **kwargs,
@@ -511,7 +596,11 @@ class GCNEncoder(nn.Module):
         h_self_full = clamp_symmetric(self.encoder(x_full))
 
         # Neighbor aggregation path (stacked graph convs with BatchNorm)
-        h_nei_full = x_full
+        # Optionally apply FC projection before graph convolution
+        if self.pre_gcn_fc is not None:
+            h_nei_full = clamp_symmetric(self.pre_gcn_fc(x_full))
+        else:
+            h_nei_full = x_full
         for i, (conv, bn) in enumerate(zip(self.convs, self.conv_bns, strict=False)):
             h_nei_full = conv(h_nei_full, ei_full)
             h_nei_full = clamp_symmetric(bn(h_nei_full))
@@ -934,6 +1023,16 @@ class MultimodalLDAPyroModel(PyroModule):
 
                 batch_effects.append((batch_tau_m, batch_delta_m))
 
+        # ----- Gaussian sigma (per-feature variance, shared across cells) -----
+        gaussian_sigma_samples = {}
+        for m, (F_m, L_m) in enumerate(zip(self.n_inputs_modalities, self.likelihoods, strict=False)):
+            if L_m == "gaussian":
+                with poutine.scale(scale=kl_weight):
+                    gaussian_sigma_samples[m] = pyro.sample(
+                        f"gaussian_sigma_{m}",
+                        dist.HalfCauchy(torch.ones(F_m, device=self._dummy.device)).to_event(1)
+                    )
+
         # ----- cells plate -----
         with pyro.plate("cells", size=n_obs or self.n_obs, subsample_size=x.shape[0]):
             # shared θₙ
@@ -949,77 +1048,112 @@ class MultimodalLDAPyroModel(PyroModule):
                 lib_m = torch.clamp(libraries[:, m], min=0.0)
                 log_phi_m = topic_feature_dists[m]  # (K, F_m) -- log-space
 
-                # Apply STAMP-style batch correction on topic-gene logits
-                if self.use_covariates and batch_effects:
-                    batch_tau_m, batch_delta_m = batch_effects[m]
-                    if cat_covs is None:
-                        raise ValueError(
-                            "Covariates were enabled but `cat_covs` is missing. "
-                            "Ensure CAT_COVS_KEY is provided to the model/guide call."
-                        )
-                    if cat_covs.dim() == 1:
-                        cat_covs = cat_covs.unsqueeze(1)
-                    batch_idx = cat_covs[:, 0].long()  # (B,)
-                    rate_m = torch.zeros_like(x_m)
-                    for b in range(self.n_batches):
-                        mask_b = (batch_idx == b)
-                        if mask_b.any():
-                            offset = batch_tau_m * batch_delta_m[b]  # (K, 1) * (F_m,) -> (K, F_m)
-                            phi_b = F.softmax(log_phi_m + offset, dim=-1)  # (K, F_m)
-                            rate_m[mask_b] = theta[mask_b] @ phi_b  # (n_b, F_m)
-                else:
-                    rate_m = theta @ F.softmax(log_phi_m, dim=-1)  # (B, F_m)
-                likelihood_scale = self.likelihood_weights[m]
-                with poutine.scale(scale=likelihood_scale):
-                    if L_m == "multinomial":
-                        x_m_obs = torch.clamp(x_m, min=0.0).round()
-                        N_max = int(x_m_obs.sum(dim=1).max().item()) if x_m_obs.numel() > 0 else 0
+                if L_m == "gaussian":
+                    # Gaussian likelihood: topic means are unconstrained (NO softmax)
+                    # NO library size scaling
+                    if self.use_covariates and batch_effects:
+                        batch_tau_m, batch_delta_m = batch_effects[m]
+                        if cat_covs is None:
+                            raise ValueError(
+                                "Covariates were enabled but `cat_covs` is missing. "
+                                "Ensure CAT_COVS_KEY is provided to the model/guide call."
+                            )
+                        if cat_covs.dim() == 1:
+                            cat_covs = cat_covs.unsqueeze(1)
+                        batch_idx = cat_covs[:, 0].long()
+                        mean_m = torch.zeros_like(x_m)
+                        for b in range(self.n_batches):
+                            mask_b = (batch_idx == b)
+                            if mask_b.any():
+                                offset = batch_tau_m * batch_delta_m[b]
+                                mu_b = log_phi_m + offset  # additive offset, no softmax
+                                mean_m[mask_b] = theta[mask_b] @ mu_b
+                    else:
+                        mean_m = theta @ log_phi_m  # (B, F_m)
+
+                    # Per-feature variance (sampled outside cells plate)
+                    sigma_m = gaussian_sigma_samples[m]
+
+                    likelihood_scale = self.likelihood_weights[m]
+                    with poutine.scale(scale=likelihood_scale):
                         pyro.sample(
                             f"feature_counts_{m}",
-                            CategoricalBoW(N_max, rate_m),
-                            obs=x_m_obs,
+                            dist.Normal(mean_m, sigma_m).to_event(1),
+                            obs=x_m,
                         )
-                    elif L_m in {"gamma_poisson", "nb"}:
-                        # Observations must be non-negative integers; guard against preprocessed inputs
-                        x_m_obs = torch.clamp(x_m, min=0.0).round()
-                        # mean scaled by lib
-                        mu = torch.clamp(rate_m * lib_m.unsqueeze(-1), min=1e-8)
-
-                        if self.learnable_dispersion and m in dispersion_samples:
-                            # Use sampled dispersion (STAMP-like parameterization)
-                            disp = dispersion_samples[m]
-                            inv_disp = 1.0 / (disp ** 2 + 1e-8)
-                            # GammaPoisson(concentration, rate) where mean = concentration/rate
+                else:
+                    # Count-based likelihoods: softmax on phi, library size scaling
+                    # Apply STAMP-style batch correction on topic-gene logits
+                    if self.use_covariates and batch_effects:
+                        batch_tau_m, batch_delta_m = batch_effects[m]
+                        if cat_covs is None:
+                            raise ValueError(
+                                "Covariates were enabled but `cat_covs` is missing. "
+                                "Ensure CAT_COVS_KEY is provided to the model/guide call."
+                            )
+                        if cat_covs.dim() == 1:
+                            cat_covs = cat_covs.unsqueeze(1)
+                        batch_idx = cat_covs[:, 0].long()  # (B,)
+                        rate_m = torch.zeros_like(x_m)
+                        for b in range(self.n_batches):
+                            mask_b = (batch_idx == b)
+                            if mask_b.any():
+                                offset = batch_tau_m * batch_delta_m[b]  # (K, 1) * (F_m,) -> (K, F_m)
+                                phi_b = F.softmax(log_phi_m + offset, dim=-1)  # (K, F_m)
+                                rate_m[mask_b] = theta[mask_b] @ phi_b  # (n_b, F_m)
+                    else:
+                        rate_m = theta @ F.softmax(log_phi_m, dim=-1)  # (B, F_m)
+                    likelihood_scale = self.likelihood_weights[m]
+                    with poutine.scale(scale=likelihood_scale):
+                        if L_m == "multinomial":
+                            x_m_obs = torch.clamp(x_m, min=0.0).round()
+                            N_max = int(x_m_obs.sum(dim=1).max().item()) if x_m_obs.numel() > 0 else 0
                             pyro.sample(
                                 f"feature_counts_{m}",
-                                dist.GammaPoisson(
-                                    concentration=inv_disp,
-                                    rate=inv_disp / mu
-                                ).to_event(1),
+                                CategoricalBoW(N_max, rate_m),
+                                obs=x_m_obs,
+                            )
+                        elif L_m in {"gamma_poisson", "nb"}:
+                            # Observations must be non-negative integers; guard against preprocessed inputs
+                            x_m_obs = torch.clamp(x_m, min=0.0).round()
+                            # mean scaled by lib
+                            mu = torch.clamp(rate_m * lib_m.unsqueeze(-1), min=1e-8)
+
+                            if self.learnable_dispersion and m in dispersion_samples:
+                                # Use sampled dispersion (STAMP-like parameterization)
+                                disp = dispersion_samples[m]
+                                inv_disp = 1.0 / (disp ** 2 + 1e-8)
+                                # GammaPoisson(concentration, rate) where mean = concentration/rate
+                                pyro.sample(
+                                    f"feature_counts_{m}",
+                                    dist.GammaPoisson(
+                                        concentration=inv_disp,
+                                        rate=inv_disp / mu
+                                    ).to_event(1),
+                                    obs=x_m_obs,
+                                )
+                            else:
+                                # Fixed dispersion (original behavior)
+                                r = torch.tensor(self.dispersion_rna, device=mu.device)
+                                pyro.sample(
+                                    f"feature_counts_{m}",
+                                    dist.NegativeBinomial(total_count=r, probs=mu / (mu + r)).to_event(1),
+                                    obs=x_m_obs,
+                                )
+                        elif L_m == "bernoulli":
+                            x_m_obs = torch.clamp(x_m, min=0.0, max=1.0).round()
+                            # Library size scaling (depth normalization)
+                            lib_ratio = lib_m / lib_m.mean()  # (B,) - relative depth
+                            p_m = rate_m * lib_ratio.unsqueeze(-1)  # (B, F_m) - scale by depth
+                            p_m = torch.clamp(p_m, max=1.0)  # Ensure valid probability
+                            # Sample Bernoulli observations
+                            pyro.sample(
+                                f"feature_counts_{m}",
+                                dist.Bernoulli(probs=p_m).to_event(1),
                                 obs=x_m_obs,
                             )
                         else:
-                            # Fixed dispersion (original behavior)
-                            r = torch.tensor(self.dispersion_rna, device=mu.device)
-                            pyro.sample(
-                                f"feature_counts_{m}",
-                                dist.NegativeBinomial(total_count=r, probs=mu / (mu + r)).to_event(1),
-                                obs=x_m_obs,
-                            )
-                    elif L_m == "bernoulli":
-                        x_m_obs = torch.clamp(x_m, min=0.0, max=1.0).round()
-                        # Library size scaling (depth normalization)
-                        lib_ratio = lib_m / lib_m.mean()  # (B,) - relative depth
-                        p_m = rate_m * lib_ratio.unsqueeze(-1)  # (B, F_m) - scale by depth
-                        p_m = torch.clamp(p_m, max=1.0)  # Ensure valid probability
-                        # Sample Bernoulli observations
-                        pyro.sample(
-                            f"feature_counts_{m}",
-                            dist.Bernoulli(probs=p_m).to_event(1),
-                            obs=x_m_obs,
-                        )
-                    else:
-                        raise ValueError(f"Unknown likelihood {L_m}")
+                            raise ValueError(f"Unknown likelihood {L_m}")
                 cursor += F_m
 
 
@@ -1036,6 +1170,7 @@ class MultimodalLDAPyroGuide(PyroModule):
         n_hidden: int,
         gcn_n_layers: int = 1,
         gcn_hidden_dims: list[int] | None = None,
+        gcn_n_pre_layers: int = 0,
         gcn_conv_type: str='GATv2Conv',
         gcn_alpha_init: float = 0.7,
         gcn_use_learned_alpha: bool = True,
@@ -1060,6 +1195,9 @@ class MultimodalLDAPyroGuide(PyroModule):
         n_batches: int = 0,
         use_batch_covariates: bool = False,
         n_extra_encoder_features: int = 0,
+        # Aggregation mode
+        aggregation_type: str = "moe",  # "moe" or "attention"
+        att_dim: int = 32,              # attention projection dim (used when aggregation_type="attention")
     ) -> None:
         super().__init__("multimodal_lda_guide")
         self.n_modalities = len(n_inputs_modalities)
@@ -1135,6 +1273,7 @@ class MultimodalLDAPyroGuide(PyroModule):
                         n_topics,
                         n_hidden,
                         gcn_n_layers=gcn_n_layers,
+                        gcn_n_pre_layers=gcn_n_pre_layers,
                         conv_type=gcn_conv_type,
                         gcn_hidden_dims=gcn_hidden_dims,
                         alpha_init=gcn_alpha_init,
@@ -1235,6 +1374,23 @@ class MultimodalLDAPyroGuide(PyroModule):
             self.bg_loc = None
             self.bg_scale = None
 
+        # Gaussian sigma variational parameters (for Gaussian likelihood modalities)
+        # LogNormal posterior: sigma ~ LogNormal(sigma_loc, softplus(sigma_scale))
+        has_gaussian = any(l == "gaussian" for l in self.likelihoods)
+        if has_gaussian:
+            self.gaussian_sigma_loc = torch.nn.ParameterList()
+            self.gaussian_sigma_scale = torch.nn.ParameterList()
+            for m, (F_m, likelihood) in enumerate(zip(n_inputs_modalities, self.likelihoods)):
+                if likelihood == "gaussian":
+                    self.gaussian_sigma_loc.append(torch.nn.Parameter(torch.zeros(F_m)))
+                    self.gaussian_sigma_scale.append(torch.nn.Parameter(torch.zeros(F_m)))
+                else:
+                    self.gaussian_sigma_loc.append(None)
+                    self.gaussian_sigma_scale.append(None)
+        else:
+            self.gaussian_sigma_loc = None
+            self.gaussian_sigma_scale = None
+
         # Dispersion variational parameters (for learnable dispersion, STAMP-like)
         # LogNormal posterior: disp ~ LogNormal(disp_loc, softplus(disp_scale))
         if learnable_dispersion:
@@ -1272,12 +1428,26 @@ class MultimodalLDAPyroGuide(PyroModule):
         self.weight_mode = weight_mode
         self.n_obs = None
 
+        # Aggregation type: "moe" (default) or "attention" (SpatialGlue-style)
+        if aggregation_type not in ("moe", "attention"):
+            raise ValueError("aggregation_type must be 'moe' or 'attention'.")
+        self.aggregation_type = aggregation_type
+        if aggregation_type == "attention":
+            self.attention_aggregator = AttentionAggregator(n_topics, att_dim=att_dim)
+        else:
+            self.attention_aggregator = None
+
     @staticmethod
     def _softplus(t: torch.Tensor) -> torch.Tensor:
         return F.softplus(t)
 
     def _mix_gaussians(
-        self, mus: torch.Tensor, vars_: torch.Tensor, masks: torch.Tensor, cell_idx: torch.Tensor
+        self,
+        mus: torch.Tensor,
+        vars_: torch.Tensor,
+        masks: torch.Tensor,
+        cell_idx: torch.Tensor,
+        precomputed_w: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Mix (*M,B,K*) Gaussians using weights w_{m,c}.
@@ -1286,16 +1456,22 @@ class MultimodalLDAPyroGuide(PyroModule):
         ----------
         mus/vars_ : (M , B , K)
         masks     : (M , B)  (0 = modality absent)
+        precomputed_w : (M , B , 1), optional
+            Pre-normalised weights (e.g. from AttentionAggregator).  When
+            supplied, mod_w / weight_mode are ignored.
         """
-        if self.mod_w is None:  # equal
+        if precomputed_w is not None:
+            w = precomputed_w  # (M, B, 1) — already masked and normalised
+        elif self.mod_w is None:  # equal
             w = torch.ones_like(masks)
+            w = masked_softmax(w, masks, dim=0).unsqueeze(-1)  # (M,B,1)
         elif self.mod_w.dim() == 1:  # universal
             w = self.mod_w.view(-1, 1).expand_as(masks)
+            w = masked_softmax(w, masks, dim=0).unsqueeze(-1)
         else:  # cell
             w = self.mod_w[cell_idx, :]  # (B , M) -> transpose
             w = w.T  # (M , B)
-
-        w = masked_softmax(w, masks, dim=0).unsqueeze(-1)  # (M,B,1)
+            w = masked_softmax(w, masks, dim=0).unsqueeze(-1)
         mu = (w * mus).sum(0)
         mu = clamp_symmetric(mu)
         # Law of total variance: Var[X] = E[Var[X|M]] + Var[E[X|M]]
@@ -1371,12 +1547,16 @@ class MultimodalLDAPyroGuide(PyroModule):
         if self.normalize_encoder_inputs:
             libs = [x_full_m.sum(dim=1, keepdim=True) for x_full_m in x_full_list]
             x_full_normalized = []
-            for x_full_m, lib_m in zip(x_full_list, libs):
-                lib_m = torch.clamp(lib_m, min=1.0)
-                # Use median depth of this modality as scale factor
-                median_depth = torch.median(lib_m)
-                x_full_m_norm = torch.log1p(x_full_m / lib_m * median_depth)
-                x_full_normalized.append(x_full_m_norm)
+            for m, (x_full_m, lib_m) in enumerate(zip(x_full_list, libs)):
+                if self.likelihoods[m] == "gaussian":
+                    # Gaussian modalities: pass through (data is already continuous)
+                    x_full_normalized.append(x_full_m)
+                else:
+                    lib_m = torch.clamp(lib_m, min=1.0)
+                    # Use median depth of this modality as scale factor
+                    median_depth = torch.median(lib_m)
+                    x_full_m_norm = torch.log1p(x_full_m / lib_m * median_depth)
+                    x_full_normalized.append(x_full_m_norm)
             x_full_list = x_full_normalized
             logger.info("Applied library-size and log-normalization to full graph BEFORE spatial convolution")
 
@@ -1553,6 +1733,20 @@ class MultimodalLDAPyroGuide(PyroModule):
                                     )
                                 )
 
+        # Gaussian sigma variational posterior (for Gaussian likelihood modalities)
+        if self.gaussian_sigma_loc is not None:
+            for m in range(self.n_modalities):
+                if self.gaussian_sigma_loc[m] is not None:
+                    F_m = self.n_inputs_modalities[m]
+                    with poutine.scale(scale=kl_weight):
+                        pyro.sample(
+                            f"gaussian_sigma_{m}",
+                            dist.LogNormal(
+                                self.gaussian_sigma_loc[m],
+                                self._softplus(self.gaussian_sigma_scale[m])
+                            ).to_event(1)
+                        )
+
         # θₙ variational
         xs = torch.split(x, self.n_inputs_modalities, dim=1)  # (B,Fₘ)
 
@@ -1562,12 +1756,16 @@ class MultimodalLDAPyroGuide(PyroModule):
             libs = [x_m.sum(dim=1, keepdim=True) for x_m in xs]  # List of (B, 1)
             # Normalize to median depth per modality
             xs_normalized = []
-            for x_m, lib_m in zip(xs, libs):
-                lib_m = torch.clamp(lib_m, min=1.0)  # Avoid division by zero
-                # Use median depth of this modality as scale factor
-                median_depth = torch.median(lib_m)
-                x_m_norm = torch.log1p(x_m / lib_m * median_depth)
-                xs_normalized.append(x_m_norm)
+            for m, (x_m, lib_m) in enumerate(zip(xs, libs)):
+                if self.likelihoods[m] == "gaussian":
+                    # Gaussian modalities: pass through (data is already continuous)
+                    xs_normalized.append(x_m)
+                else:
+                    lib_m = torch.clamp(lib_m, min=1.0)  # Avoid division by zero
+                    # Use median depth of this modality as scale factor
+                    median_depth = torch.median(lib_m)
+                    x_m_norm = torch.log1p(x_m / lib_m * median_depth)
+                    xs_normalized.append(x_m_norm)
             xs = xs_normalized
 
         # Prepare covariate inputs for encoders
@@ -1624,7 +1822,11 @@ class MultimodalLDAPyroGuide(PyroModule):
         vars_ = torch.stack(vars_)  # (M,B,K)
         masks = torch.stack(masks)  # (M,B)
 
-        muθ, varθ = self._mix_gaussians(mus, vars_, masks, cell_idx)
+        if self.aggregation_type == "attention":
+            attn_w = self.attention_aggregator(mus, masks)  # (M, B, 1)
+            muθ, varθ = self._mix_gaussians(mus, vars_, masks, cell_idx, precomputed_w=attn_w)
+        else:
+            muθ, varθ = self._mix_gaussians(mus, vars_, masks, cell_idx)
 
         with pyro.plate("cells", size=n_obs or self.n_obs, subsample_size=B):
             # Sample cell-topic distribution (with KL weight scaling)
@@ -1684,7 +1886,8 @@ class MultimodalAmortizedLDAPyroModule(PyroBaseModuleClass):
         spatial: bool = False,
         adjacency: torch.Tensor | Sequence[torch.Tensor] | None = None,
         gcn_n_layers: int = 1,
-        gcn_conv_type: str = 'GATv2COnv',
+        gcn_n_pre_layers: int = 0,
+        gcn_conv_type: str = 'GATv2Conv',
         gcn_hidden_dims: list[int] | None = None,
         gcn_alpha_init: float = 0.7,
         gcn_use_learned_alpha: bool = True,
@@ -1703,6 +1906,8 @@ class MultimodalAmortizedLDAPyroModule(PyroBaseModuleClass):
         n_continuous_cov: int = 0,
         encode_covariates: bool = True,
         n_extra_encoder_features: int = 0,
+        aggregation_type: str = "moe",
+        att_dim: int = 32,
     ):
         super().__init__()
         assert len(n_inputs_modalities) == len(likelihoods)
@@ -1774,6 +1979,7 @@ class MultimodalAmortizedLDAPyroModule(PyroBaseModuleClass):
             n_topics,
             n_hidden,
             gcn_n_layers=gcn_n_layers,
+            gcn_n_pre_layers=gcn_n_pre_layers,
             gcn_conv_type=gcn_conv_type,
             gcn_hidden_dims=gcn_hidden_dims,
             gcn_alpha_init=gcn_alpha_init,
@@ -1799,6 +2005,8 @@ class MultimodalAmortizedLDAPyroModule(PyroBaseModuleClass):
             n_batches=_n_batches,
             use_batch_covariates=use_batch_covariates,
             n_extra_encoder_features=n_extra_encoder_features,
+            aggregation_type=aggregation_type,
+            att_dim=att_dim,
         )
 
         # We need this method so scvi training plan can create data-loader args
@@ -1895,13 +2103,12 @@ class MultimodalAmortizedLDAPyroModule(PyroBaseModuleClass):
                     self.guide.topic_feature_posterior_sigma,
                     strict=False)
             ):
-                tbf = torch.mean(
-                    F.softmax(
-                        dist.Normal(mu.detach().cpu(), sig.detach().cpu()).sample((n_samples,)),
-                        dim=2
-                    ),
-                    dim=0,
-                )
+                samples = dist.Normal(mu.detach().cpu(), sig.detach().cpu()).sample((n_samples,))
+                if self.guide.likelihoods[m] == "gaussian":
+                    # No softmax — topic means are unconstrained for Gaussian
+                    tbf = torch.mean(samples, dim=0)
+                else:
+                    tbf = torch.mean(F.softmax(samples, dim=2), dim=0)
                 out[m] = tbf  # (K, F_m)
 
         elif self.guide.topic_feature_prior_type == "horseshoe":
@@ -1943,7 +2150,10 @@ class MultimodalAmortizedLDAPyroModule(PyroBaseModuleClass):
                         bg = init_bg.cpu()  # (F_m,)
                     shrunk_samples = shrunk_samples + bg.unsqueeze(0).unsqueeze(0)  # (n_samples, K, F_m)
 
-                tbf = torch.mean(F.softmax(shrunk_samples, dim=2), dim=0)  # (K, F_m)
+                if self.guide.likelihoods[m] == "gaussian":
+                    tbf = torch.mean(shrunk_samples, dim=0)  # (K, F_m)
+                else:
+                    tbf = torch.mean(F.softmax(shrunk_samples, dim=2), dim=0)  # (K, F_m)
                 out[m] = tbf
 
         return out
@@ -1964,12 +2174,14 @@ class MultimodalAmortizedLDAPyroModule(PyroBaseModuleClass):
         if self.guide.normalize_encoder_inputs:
             libs = [x_m.sum(dim=1, keepdim=True) for x_m in xs]
             xs_normalized = []
-            for x_m, lib_m in zip(xs, libs):
-                lib_m = torch.clamp(lib_m, min=1.0)
-                # Use median depth of this modality as scale factor
-                median_depth = torch.median(lib_m)
-                x_m_norm = torch.log1p(x_m / lib_m * median_depth)
-                xs_normalized.append(x_m_norm)
+            for m, (x_m, lib_m) in enumerate(zip(xs, libs)):
+                if self.guide.likelihoods[m] == "gaussian":
+                    xs_normalized.append(x_m)
+                else:
+                    lib_m = torch.clamp(lib_m, min=1.0)
+                    median_depth = torch.median(lib_m)
+                    x_m_norm = torch.log1p(x_m / lib_m * median_depth)
+                    xs_normalized.append(x_m_norm)
             xs = xs_normalized
 
         batch_indices = torch.arange(B, device=x.device)

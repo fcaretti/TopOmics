@@ -166,6 +166,7 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
         likelihood_weight_mode: str = "none",
         likelihood_weight_ref: str = "mean",
         gcn_n_layers: int = 1,
+        gcn_n_pre_layers: int = 0,
         gcn_conv_type: str = 'GATv2Conv',
         gcn_hidden_dims: list[int] | None = None,
         gcn_alpha_init: float = 0.7,
@@ -178,6 +179,8 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
         encode_covariates: bool = True,
         bg_offset: float = 1.0,
         learnable_bg: bool = True,
+        aggregation_type: str = "moe",
+        att_dim: int = 32,
     ):
         """
         Initialize MultimodalAmortizedLDA with Mixture-of-Experts (MoE) architecture.
@@ -195,6 +198,7 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
                 - "multinomial": For discrete count data (RNA-seq)
                 - "gamma_poisson" or "nb": For overdispersed count data (scRNA-seq, protein)
                 - "bernoulli": For binary presence/absence data (ATAC-seq peaks, methylation)
+                - "gaussian": For continuous real-valued data (Harmony/scVI embeddings, CLR-normalized protein)
         n_topics
             Number of topics.
         n_hidden
@@ -542,6 +546,7 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
             spatial=self.spatial,
             adjacency=adjacency,
             gcn_n_layers=gcn_n_layers,
+            gcn_n_pre_layers=gcn_n_pre_layers,
             gcn_conv_type=gcn_conv_type,
             gcn_hidden_dims=gcn_hidden_dims,
             gcn_alpha_init=gcn_alpha_init,
@@ -562,6 +567,8 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
             encode_covariates=encode_covariates,
             learnable_bg=learnable_bg,
             n_extra_encoder_features=n_extra_encoder_features,
+            aggregation_type=aggregation_type,
+            att_dim=att_dim,
         )
 
         # For spatial models, initialise GCN encoders with full-graph data
@@ -1443,19 +1450,24 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
         indices: _Seq[int] | None = None,
         batch_size: int | None = None,
     ) -> float:
-        """Average ELBO across cells (higher is better)."""
+        """Average ELBO across batches (higher is better).
+
+        Note: Pyro's Trace_ELBO.loss() returns -ELBO; this method negates it
+        so the returned value is the actual ELBO (higher = better fit).
+        """
         self._check_if_trained(warn=False)
         adata = self._validate_anndata(adata)
         self.module.eval()
         dl = self._make_data_loader(adata=adata, indices=indices, batch_size=batch_size)
         n_obs = len(dl.indices)
 
-        elbos = []
+        losses = []
         for tensors in dl:
             args, kwargs = self.module._get_fn_args_from_batch(tensors)
             kwargs["n_obs"] = n_obs
-            elbos.append(Trace_ELBO().loss(self.module.model, self.module.guide, *args, **kwargs))
-        return float(np.mean(elbos))
+            losses.append(Trace_ELBO().loss(self.module.model, self.module.guide, *args, **kwargs))
+        # Trace_ELBO.loss() returns -ELBO, so negate to get ELBO
+        return float(-np.mean(losses))
 
     # ------------------------------------------------------------------ #
     def get_perplexity(
@@ -1464,13 +1476,30 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
         indices: _Seq[int] | None = None,
         batch_size: int | None = None,
     ) -> float:
-        """exp( – ELBO / total counts ) – lower is better."""
+        """exp( -log_likelihood / total_counts ) — lower is better.
+
+        Uses the observation log-likelihood (via poutine.trace) rather than
+        the full ELBO, so KL terms and regularization bonuses do not inflate
+        the result.
+        """
         self._check_if_trained(warn=False)
         adata = self._validate_anndata(adata)
+        self.module.eval()
         dl = self._make_data_loader(adata=adata, indices=indices, batch_size=batch_size)
-        total_counts = sum(tensors[REGISTRY_KEYS.X_KEY].sum().item() for tensors in dl)
+        n_obs = len(dl.indices)
 
-        return float(np.exp(-self.get_elbo(adata, indices, batch_size) / total_counts))
+        total_log_lik = 0.0
+        total_counts = 0.0
+        for tensors in dl:
+            x = tensors[REGISTRY_KEYS.X_KEY]
+            libs = self._batch_library_tensor(x)
+            batch_logprobs = self.module.get_per_modality_log_prob(x, libs, n_obs)
+            total_log_lik += sum(batch_logprobs.values())
+            total_counts += x.sum().item()
+
+        if total_counts == 0:
+            return float("inf")
+        return float(np.exp(-total_log_lik / total_counts))
 
     # ------------------------------------------------------------------ #
     def get_entropy(
