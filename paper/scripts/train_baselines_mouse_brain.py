@@ -27,6 +27,7 @@ import numpy as np
 if not hasattr(np, "Inf"):
     np.Inf = np.inf
 
+import anndata as ad
 import mudata as md
 import muon as mu
 import pandas as pd
@@ -87,6 +88,11 @@ def parse_args():
         "--skip_mofa",
         action="store_true",
         help="Skip MOFA+ training",
+    )
+    parser.add_argument(
+        "--skip_cosmos",
+        action="store_true",
+        help="Skip COSMOS training",
     )
     parser.add_argument(
         "--device",
@@ -428,6 +434,97 @@ def train_mofa(mdata, n_latent, output_dir):
 
 
 # =============================================================================
+# COSMOS
+# =============================================================================
+def train_cosmos(mdata, n_latent, output_dir, device):
+    """Train COSMOS model on RNA + ATAC.
+
+    The COSMOS tutorial (tutorial_ATAC_RNA_Seq_MouseBrain.ipynb) expects
+    pre-processed inputs: HVG-selected + normalized + scaled RNA (3000 genes),
+    and LSI-reduced ATAC (50 components). We replicate that here from raw counts,
+    then pass to COSMOS with preprocessing_data defaults (no further transform).
+    """
+    from COSMOS import cosmos
+
+    print("\n" + "=" * 70)
+    print("Training COSMOS (RNA + ATAC)")
+    print("=" * 70)
+
+    # --- RNA: HVG selection + normalize + log1p + scale (matching tutorial's 3000 features) ---
+    adata_rna = mdata.mod["rna"].copy()
+    if "counts" in adata_rna.layers:
+        adata_rna.X = adata_rna.layers["counts"].copy()
+    sc.pp.highly_variable_genes(adata_rna, n_top_genes=3000, flavor="seurat_v3")
+    adata_rna = adata_rna[:, adata_rna.var["highly_variable"]].copy()
+    sc.pp.normalize_total(adata_rna, target_sum=1e4)
+    sc.pp.log1p(adata_rna)
+    sc.pp.scale(adata_rna)
+    # Convert to dense float64
+    if sp.issparse(adata_rna.X):
+        adata_rna.X = np.asarray(adata_rna.X.toarray(), dtype=np.float64)
+    else:
+        adata_rna.X = np.asarray(adata_rna.X, dtype=np.float64)
+    print(f"  RNA preprocessed: {adata_rna.shape}")
+
+    # --- ATAC: LSI reduction to 50 components (matching tutorial) ---
+    from SpatialGlue.preprocess import lsi
+
+    adata_atac = mdata.mod["atac"].copy()
+    if "counts" in adata_atac.layers:
+        adata_atac.X = adata_atac.layers["counts"].copy()
+    lsi(adata_atac, n_components=50)
+    lsi_X = adata_atac.obsm["X_lsi"].astype(np.float64)
+    # Create new AnnData with LSI components as features
+    adata_atac_lsi = ad.AnnData(lsi_X)
+    adata_atac_lsi.obsm["spatial"] = adata_atac.obsm["spatial"].copy()
+    print(f"  ATAC preprocessed (LSI): {adata_atac_lsi.shape}")
+
+    # Build model — no further preprocessing (data already transformed)
+    model = cosmos.Cosmos(adata1=adata_rna, adata2=adata_atac_lsi)
+    model.preprocessing_data(n_neighbors=10)
+
+    # Parse GPU index from device string
+    gpu = int(device.split(":")[-1]) if "cuda" in device else -1
+
+    # Train — parameters from tutorial_ATAC_RNA_Seq_MouseBrain.ipynb
+    embedding_path = os.path.join(output_dir, "cosmos_embedding.tsv")
+    weights_path = os.path.join(output_dir, "cosmos_weights.tsv")
+
+    print("Training...")
+    model.train(
+        embedding_save_filepath=embedding_path,
+        weights_save_filepath=weights_path,
+        spatial_regularization_strength=0.01,
+        z_dim=n_latent,
+        lr=1e-3,
+        wnn_epoch=500,
+        total_epoch=1000,
+        max_patience_bef=10,
+        max_patience_aft=30,
+        min_stop=200,
+        random_seed=20,
+        gpu=gpu,
+        regularization_acceleration=True,
+        edge_subset_sz=1000000,
+    )
+
+    # Get latent representation
+    latent = model.embedding
+    print(f"Latent shape: {latent.shape}")
+
+    # Save results
+    model_dir = os.path.join(output_dir, "cosmos")
+    os.makedirs(model_dir, exist_ok=True)
+
+    np.save(os.path.join(output_dir, "latent_cosmos.npy"), latent)
+    np.save(os.path.join(model_dir, "weights.npy"), model.weights)
+
+    print(f"Results saved to: {model_dir}")
+
+    return latent
+
+
+# =============================================================================
 # Main
 # =============================================================================
 def main():
@@ -494,6 +591,19 @@ def main():
             results["mofa"] = latent
         except Exception as e:
             print(f"MOFA+ training failed: {e}")
+            import traceback
+
+            traceback.print_exc()
+
+    # Train COSMOS (RNA + ATAC)
+    if not args.skip_cosmos:
+        try:
+            latent = train_cosmos(
+                mdata, args.n_latent, args.output_dir, args.device
+            )
+            results["cosmos"] = latent
+        except Exception as e:
+            print(f"COSMOS training failed: {e}")
             import traceback
 
             traceback.print_exc()

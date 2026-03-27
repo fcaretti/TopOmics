@@ -54,6 +54,19 @@ def parse_args():
         help="Use global dispersion instead of per-gene (default: False)"
     )
     parser.add_argument(
+        "--aggregation_type",
+        type=str,
+        default="moe",
+        choices=["moe", "attention"],
+        help="Aggregation type for multimodal (default: moe)"
+    )
+    parser.add_argument(
+        "--att_dim",
+        type=int,
+        default=16,
+        help="Attention projection dimension (default: 16)"
+    )
+    parser.add_argument(
         "--n_topics",
         type=int,
         default=10,
@@ -119,6 +132,8 @@ def create_model(mdata, args):
         n_hidden=64,
         cell_topic_prior=1/args.n_topics,
         weight_mode=args.weight_mode,
+        aggregation_type=args.aggregation_type,
+        att_dim=args.att_dim,
         topic_feature_prior_type=args.feature_prior_type,
         learnable_dispersion=args.learnable_dispersion,
         global_dispersion=args.global_dispersion,
@@ -151,6 +166,8 @@ def save_results(model, mdata, output_dir):
     # Get latent representation
     adata_concat = mdata.uns["_flattened_ann_data"]
     theta = model.get_latent_representation(adata_concat, batch_size=mdata.n_obs)
+    np.save(os.path.join(output_dir, "latent_representation.npy"), theta.values)
+    print(f"Latent representation saved to: {os.path.join(output_dir, 'latent_representation.npy')}")
 
     # Add to mdata and run Leiden clustering on topic space
     mdata.obsm["X_topic"] = theta.values - 1/theta.values.shape[1]
@@ -158,12 +175,14 @@ def save_results(model, mdata, output_dir):
     sc.tl.leiden(mdata, neighbors_key="topic_neighbors", key_added="topic_leiden")
     sc.tl.umap(mdata, neighbors_key="topic_neighbors", min_dist=0.3)
 
-    # Training curve
+    # Training curve (per-cell normalized)
+    n_train = int(mdata.n_obs * 0.8)
+    n_val = mdata.n_obs - n_train
     fig, ax = plt.subplots(figsize=(10, 6))
-    ax.plot(model.history['elbo_train'], label='Train ELBO')
-    ax.plot(model.history['elbo_val'] * 4, label='Validation ELBO (rescaled)')
+    ax.plot(model.history['elbo_train'] / n_train, label='Train ELBO (per cell)')
+    ax.plot(model.history['elbo_val'] / n_val, label='Val ELBO (per cell)')
     ax.set_xlabel('Epoch')
-    ax.set_ylabel('ELBO')
+    ax.set_ylabel('ELBO / cell')
     ax.set_title('Training Curve')
     ax.legend()
     plt.savefig(os.path.join(output_dir, "training_curve.png"), dpi=150, bbox_inches='tight')

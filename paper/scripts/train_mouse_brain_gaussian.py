@@ -229,11 +229,13 @@ def save_results(model, mdata, output_dir):
 
     # --- Plots ---
 
-    # Training curve
+    # Training curve (per-cell normalized)
+    n_train = int(mdata.n_obs * 0.8)
+    n_val = mdata.n_obs - n_train
     fig, ax = plt.subplots(figsize=(10, 6))
-    ax.plot(model.history['elbo_train'], label='Train ELBO')
-    ax.plot(model.history['elbo_val'] * 4, label='Validation ELBO (rescaled)')
-    ax.set_xlabel('Epoch'); ax.set_ylabel('ELBO'); ax.set_title('Training Curve')
+    ax.plot(model.history['elbo_train'] / n_train, label='Train ELBO (per cell)')
+    ax.plot(model.history['elbo_val'] / n_val, label='Val ELBO (per cell)')
+    ax.set_xlabel('Epoch'); ax.set_ylabel('ELBO / cell'); ax.set_title('Training Curve')
     ax.legend()
     plt.savefig(os.path.join(output_dir, "training_curve.png"), dpi=150, bbox_inches='tight')
     plt.close()
