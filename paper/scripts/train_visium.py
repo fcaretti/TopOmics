@@ -51,6 +51,18 @@ def parse_args():
         help="Type of Graph Convolution"
     )
     parser.add_argument(
+        "--gcn_alpha",
+        type=float,
+        default=0.2,
+        help="GCN alpha parameter for skip connection (default: 0.2). "
+             "0 = neighbors only, 1 = self only."
+    )
+    parser.add_argument(
+        "--fixed_alpha",
+        action="store_true",
+        help="Fix alpha (don't learn it during training)"
+    )
+    parser.add_argument(
         "--learnable_dispersion",
         action="store_true",
         help="Learn dispersion parameters (default: False)"
@@ -77,6 +89,12 @@ def parse_args():
         type=int,
         default=256,
         help="Batch size (default: 256)"
+    )
+    parser.add_argument(
+        "--train_size",
+        type=float,
+        default=0.8,
+        help="Fraction of data used for training (default: 0.8). Set to 1.0 to train on all cells."
     )
     parser.add_argument(
         "--output_dir",
@@ -108,7 +126,9 @@ def create_model(adata, args):
         cell_topic_prior=1/args.n_topics,
         spatial_keys="spatial_connectivities",
         gcn_n_layers=args.gcn_n_layers,
-        gcn_conv_type = args.gcn_layers_type,
+        gcn_conv_type=args.gcn_layers_type,
+        gcn_alpha_init=args.gcn_alpha,
+        gcn_use_learned_alpha=not args.fixed_alpha,
         kl_weight=1,
         use_feature_background=False,
         topic_feature_prior_type=args.feature_prior_type,
@@ -120,11 +140,12 @@ def create_model(adata, args):
 
 def train_model(model, args):
     """Train the model."""
+    val_size = 1.0 - args.train_size if args.train_size < 1.0 else 0.0
     model.train(
         max_epochs=args.max_epochs,
         batch_size=args.batch_size,
-        train_size=0.8,
-        validation_size=0.2,
+        train_size=args.train_size,
+        validation_size=val_size,
         log_every_n_steps=1,
         plan_kwargs={"optim_kwargs": {"lr": 1e-2}},
     )
@@ -156,12 +177,14 @@ def save_results(model, adata, output_dir):
     sc.tl.leiden(adata, neighbors_key='topic_neighbors', key_added='topic_clusters')
     sc.tl.umap(adata, neighbors_key='topic_neighbors')
 
-    # Training curve
+    # Training curve (per-cell normalized)
+    n_train = int(adata.n_obs * 0.8)
+    n_val = adata.n_obs - n_train
     fig, ax = plt.subplots(figsize=(10, 6))
-    ax.plot(model.history['elbo_train'], label='Train ELBO')
-    ax.plot(model.history['elbo_val'] * 4, label='Validation ELBO (rescaled)')
+    ax.plot(model.history['elbo_train'] / n_train, label='Train ELBO (per cell)')
+    ax.plot(model.history['elbo_val'] / n_val, label='Val ELBO (per cell)')
     ax.set_xlabel('Epoch')
-    ax.set_ylabel('ELBO')
+    ax.set_ylabel('ELBO / cell')
     ax.set_title('Training Curve')
     ax.legend()
     plt.savefig(os.path.join(output_dir, "training_curve.png"), dpi=150, bbox_inches='tight')
@@ -216,7 +239,8 @@ def main():
     args = parse_args()
 
     # Create output directory with hyperparameter info
-    hyperparam_str = f"prior_{args.feature_prior_type}"
+    alpha_str = f"alpha{args.gcn_alpha}" + ("_fixed" if args.fixed_alpha else "_learned")
+    hyperparam_str = f"prior_{args.feature_prior_type}_{alpha_str}"
     if args.gcn_n_layers != 1:
         hyperparam_str += f"_gcn{args.gcn_n_layers}"
     if args.learnable_dispersion:
@@ -225,6 +249,8 @@ def main():
             hyperparam_str += "_global"
         else:
             hyperparam_str += "_pergene"
+    if args.train_size >= 1.0:
+        hyperparam_str += "_allcells"
 
     output_dir = os.path.join(args.output_dir, hyperparam_str)
 
@@ -232,7 +258,8 @@ def main():
     print("SCTM Comparison (Visium H&E) Training")
     print("=" * 70)
     print(f"Feature prior type: {args.feature_prior_type}")
-    print(f"GCN layers: {args.gcn_n_layers}")
+    print(f"GCN layers: {args.gcn_n_layers}, type: {args.gcn_layers_type}")
+    print(f"GCN alpha: {args.gcn_alpha} ({'fixed' if args.fixed_alpha else 'learned'})")
     print(f"Learnable dispersion: {args.learnable_dispersion}")
     print(f"Global dispersion: {args.global_dispersion}")
     print(f"N topics: {args.n_topics}")

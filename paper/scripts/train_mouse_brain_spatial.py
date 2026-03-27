@@ -56,6 +56,19 @@ def parse_args():
         help="Use global dispersion instead of per-gene (default: False)"
     )
     parser.add_argument(
+        "--aggregation_type",
+        type=str,
+        default="moe",
+        choices=["moe", "attention"],
+        help="Aggregation type for multimodal (default: moe)"
+    )
+    parser.add_argument(
+        "--att_dim",
+        type=int,
+        default=16,
+        help="Attention projection dimension (default: 16)"
+    )
+    parser.add_argument(
         "--n_topics",
         type=int,
         default=10,
@@ -104,6 +117,18 @@ def parse_args():
         help="Use TraceMeanField_ELBO instead of Trace_ELBO (analytic KL, lower variance gradients)"
     )
     parser.add_argument(
+        "--train_size",
+        type=float,
+        default=0.8,
+        help="Fraction of data used for training (default: 0.8). Set to 1.0 to train on all cells."
+    )
+    parser.add_argument(
+        "--n_neighbors",
+        type=int,
+        default=5,
+        help="Number of spatial neighbors for graph construction (default: 5)"
+    )
+    parser.add_argument(
         "--output_dir",
         type=str,
         default="/data/omics_topic_models/mouse_brain_spatial",
@@ -112,7 +137,7 @@ def parse_args():
     return parser.parse_args()
 
 
-def load_data():
+def load_data(n_neighbors=5):
     """Load and preprocess Mouse Brain Spatial Multiome data."""
     adata_atac = sc.read_h5ad('/data/Data_SpatialGlue/Dataset10_Mouse_Brain_H3K27me3/adata_peaks_normalized.h5ad')
     adata_rna = sc.read_h5ad('/data/Data_SpatialGlue/Dataset10_Mouse_Brain_H3K27me3/adata_RNA.h5ad')
@@ -134,7 +159,7 @@ def load_data():
     sc.pp.neighbors(
         mdata.mod["rna"],
         use_rep="spatial",
-        n_neighbors=5,
+        n_neighbors=n_neighbors,
         metric="euclidean",
         key_added="spatial",
     )
@@ -156,6 +181,8 @@ def create_model(mdata, args):
         n_topics=args.n_topics,
         likelihoods=["gamma_poisson", "bernoulli"],
         weight_mode=args.weight_mode,
+        aggregation_type=args.aggregation_type,
+        att_dim=args.att_dim,
         cell_topic_prior=1/args.n_topics,
         gcn_n_layers=args.gcn_n_layers,
         gcn_conv_type=args.gcn_layers_type,
@@ -179,11 +206,12 @@ def train_model(model, args):
     else:
         from pyro.infer import Trace_ELBO
         plan_kwargs["loss_fn"] = Trace_ELBO()
+    val_size = 1.0 - args.train_size if args.train_size < 1.0 else 0.0
     model.train(
         max_epochs=args.max_epochs,
         batch_size=args.batch_size,
-        train_size=0.8,
-        validation_size=0.2,
+        train_size=args.train_size,
+        validation_size=val_size,
         plan_kwargs=plan_kwargs,
     )
     return model
@@ -258,12 +286,16 @@ def save_results(model, mdata, output_dir):
     sc.tl.leiden(mdata['rna'], neighbors_key='topic_neighbors')
     mdata.obs['leiden'] = mdata['rna'].obs['leiden']
 
-    # Training curve
+    # Training curve (per-cell normalized)
+    # Trace_ELBO with pyro.plate scales loss by n_obs, so divide by n_cells to get per-cell
+    n_train_cells = int(mdata.n_obs * args.train_size)
+    n_val_cells = mdata.n_obs - n_train_cells
     fig, ax = plt.subplots(figsize=(10, 6))
-    ax.plot(model.history['elbo_train'], label='Train ELBO')
-    ax.plot(model.history['elbo_val'] * 4, label='Validation ELBO (rescaled)')
+    ax.plot(model.history['elbo_train'] / n_train_cells, label='Train ELBO (per cell)')
+    if 'elbo_val' in model.history:
+        ax.plot(model.history['elbo_val'] / n_val_cells, label='Val ELBO (per cell)')
     ax.set_xlabel('Epoch')
-    ax.set_ylabel('ELBO')
+    ax.set_ylabel('ELBO / cell')
     ax.set_title('Training Curve')
     ax.legend()
     plt.savefig(os.path.join(output_dir, "training_curve.png"), dpi=150, bbox_inches='tight')
@@ -339,15 +371,16 @@ def main():
     hyperparam_str = f"prior_{args.feature_prior_type}_weight_{args.weight_mode}_{alpha_str}"
     if args.gcn_n_layers != 1:
         hyperparam_str += f"_gcn{args.gcn_n_layers}"
+    if args.n_neighbors != 5:
+        hyperparam_str += f"_nn{args.n_neighbors}"
     if args.learnable_dispersion:
         hyperparam_str += f"_learnable_disp"
         if args.global_dispersion:
             hyperparam_str += "_global"
         else:
             hyperparam_str += "_pergene"
-    if args.meanfield:
-        hyperparam_str += "_meanfield"
-
+    if args.train_size >= 1.0:
+        hyperparam_str += "_allcells"
     output_dir = os.path.join(args.output_dir, hyperparam_str)
 
     print("=" * 70)
@@ -359,6 +392,7 @@ def main():
     print(f"Learnable dispersion: {args.learnable_dispersion}")
     print(f"Global dispersion: {args.global_dispersion}")
     print(f"GCN alpha: {args.gcn_alpha} ({'fixed' if args.fixed_alpha else 'learned'})")
+    print(f"N neighbors: {args.n_neighbors}")
     print(f"Loss: {'TraceMeanField_ELBO' if args.meanfield else 'Trace_ELBO'}")
     print(f"N topics: {args.n_topics}")
     print(f"Max epochs: {args.max_epochs}")
@@ -366,8 +400,8 @@ def main():
     print("=" * 70)
 
     print("\nLoading data...")
-    mdata = load_data()
-    print(f"Loaded MuData with {mdata.n_obs} spots")
+    mdata = load_data(n_neighbors=args.n_neighbors)
+    print(f"Loaded MuData with {mdata.n_obs} spots (n_neighbors={args.n_neighbors})")
 
     print("\nCreating model...")
     model = create_model(mdata, args)
