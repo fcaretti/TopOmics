@@ -177,10 +177,12 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
         topic_variance_weight: float = 1.0,
         kl_weight: float = 1.0,
         encode_covariates: bool = True,
-        bg_offset: float = 1.0,
+        bg_offset: float = 1e-15,
         learnable_bg: bool = True,
         aggregation_type: str = "moe",
         att_dim: int = 32,
+        spatial_mode: str = "gcn",
+        sgc_n_layers: int = 1,
     ):
         """
         Initialize MultimodalAmortizedLDA with Mixture-of-Experts (MoE) architecture.
@@ -497,9 +499,13 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
                     # Extract modality data
                     X_m = X_full[:, start_idx:end_idx]
 
-                    # Compute mean expression per feature (scTM approach)
-                    mean_expr = X_m.mean(axis=0)  # (F_m,)
-                    init_bg_mean_m = np.log(mean_expr + bg_offset)  # (F_m,)
+                    # Compute mean frequency per feature (STAMP approach):
+                    # normalize each cell to frequencies first, then average
+                    row_sums = X_m.sum(axis=1, keepdims=True)
+                    row_sums[row_sums == 0] = 1.0
+                    X_freq = X_m / row_sums
+                    mean_freq = X_freq.mean(axis=0)
+                    init_bg_mean_m = np.log(mean_freq + bg_offset)  # (F_m,)
 
                     # Convert to tensor
                     init_bg_mean_list.append(torch.as_tensor(init_bg_mean_m, dtype=torch.float32))
@@ -569,15 +575,28 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
             n_extra_encoder_features=n_extra_encoder_features,
             aggregation_type=aggregation_type,
             att_dim=att_dim,
+            spatial_mode=spatial_mode,
+            sgc_n_layers=sgc_n_layers,
         )
 
-        # For spatial models, initialise GCN encoders with full-graph data
+        # For spatial models, initialise encoders with full-graph data
         if self.spatial:
             X_full = self.adata.X
             if sp.issparse(X_full):
                 X_full = X_full.toarray()
             x_tensor = torch.as_tensor(np.asarray(X_full), dtype=torch.float32)
-            self.module.set_full_graph_data(x_tensor)
+
+            # For SGC mode, pass the scipy adjacency for precomputation
+            adj_scipy = None
+            if spatial_mode == "sgc":
+                raw_spatial = spatial_uns
+                if isinstance(raw_spatial, dict) and "adjacency" in raw_spatial:
+                    adj_scipy = raw_spatial["adjacency"]
+                elif isinstance(raw_spatial, dict):
+                    # Multiple modalities — use first
+                    first_key = next(iter(raw_spatial))
+                    adj_scipy = raw_spatial[first_key]["adjacency"]
+            self.module.set_full_graph_data(x_tensor, adjacency_scipy=adj_scipy)
 
         self.init_params_ = self._get_init_params(locals())
 
