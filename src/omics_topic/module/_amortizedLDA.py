@@ -17,8 +17,10 @@ import logging
 import math
 from collections.abc import Sequence
 
+import numpy as np
 import pyro
 import pyro.distributions as dist
+import scipy.sparse as sp
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -644,6 +646,216 @@ class GCNEncoder(nn.Module):
         return dist.Normal(q_m, q_v.sqrt()), None
 
 
+# --------------------------------------------------------------------------------------------------
+# SGC (Simplified Graph Convolution) preprocessing and encoder — STAMP-style spatial handling
+# --------------------------------------------------------------------------------------------------
+
+
+def precompute_sgc(
+    x: torch.Tensor,
+    adj: sp.spmatrix,
+    n_layers: int = 1,
+    mode: str = "sign",
+) -> torch.Tensor:
+    """
+    Precompute Simplified Graph Convolution features (STAMP-style).
+
+    Applies fixed, parameter-free neighborhood averaging to produce spatially
+    smoothed features that are concatenated with the original.
+
+    Parameters
+    ----------
+    x : torch.Tensor
+        Raw count matrix (n_obs, n_features).
+    adj : scipy sparse matrix
+        Spatial adjacency matrix (n_obs, n_obs).
+    n_layers : int
+        Number of SGC hops (default: 1).
+    mode : str
+        ``"sign"`` — concatenate [X, ÃX, Ã²X, ...] (default).
+        ``"sgc"``  — use only the final smoothed version Ã^L X.
+
+    Returns
+    -------
+    sgc_x : torch.Tensor
+        SGC-preprocessed features: (n_obs, n_features * (n_layers + 1)) for "sign" mode.
+    """
+    # Symmetric normalisation matching STAMP exactly:
+    # deg = original_degree + 2, adj = adj + I
+    adj_coo = adj.tocoo().astype(np.float64)
+    deg = np.asarray(adj_coo.sum(axis=1)).flatten()
+    deg = deg + 2  # STAMP adds 2 to degree (not 1)
+    adj_with_self = adj_coo + sp.eye(adj_coo.shape[0], format="coo")
+    deg_inv_sqrt = np.power(deg, -0.5)
+    deg_inv_sqrt[np.isinf(deg_inv_sqrt)] = 0.0
+    D_inv_sqrt = sp.diags(deg_inv_sqrt)
+    adj_norm = D_inv_sqrt @ adj_with_self @ D_inv_sqrt
+
+    # Convert to torch sparse
+    adj_norm_coo = adj_norm.astype(np.float32).tocoo()
+    indices = torch.tensor(np.vstack([adj_norm_coo.row, adj_norm_coo.col]), dtype=torch.long)
+    values = torch.tensor(adj_norm_coo.data, dtype=torch.float32)
+    adj_t = torch.sparse_coo_tensor(indices, values, torch.Size(adj_norm_coo.shape))
+
+    # Library-size normalisation to median depth
+    ls = x.sum(dim=1, keepdim=True)
+    ms = torch.median(x.sum(dim=1))
+    xs = x / ls * ms
+
+    # Iterative smoothing
+    sgc = [xs]
+    for _ in range(n_layers):
+        xs = torch.sparse.mm(adj_t, sgc[-1])
+        sgc.append(xs)
+
+    if mode == "sgc":
+        sgc = [sgc[-1]]
+
+    sgc_x = torch.cat(sgc, dim=1)
+    sgc_x = torch.log(sgc_x + 1)
+    return sgc_x
+
+
+class SGCEncoder(nn.Module):
+    """
+    STAMP-style encoder: MLP on precomputed SGC features with optional
+    per-batch BatchNorm.
+
+    The SGC features are precomputed once before training (fixed, parameter-free).
+    The encoder is a simple MLP that maps [X, ÃX, ...] → (μ, σ) for topic logits.
+
+    Parameters
+    ----------
+    n_genes : int
+        Number of features per modality.
+    n_sgc_layers : int
+        Number of SGC hops (determines input width: n_genes * (n_sgc_layers + 1) for "sign" mode).
+    n_hidden : int
+        Hidden layer size.
+    n_topics : int
+        Output dimension (number of topics).
+    dropout : float
+        Dropout rate.
+    n_batches : int
+        Number of batch categories for per-batch BatchNorm. If <= 1, uses standard BatchNorm.
+    var_eps : float
+        Minimum variance.
+    """
+
+    def __init__(
+        self,
+        n_genes: int,
+        n_sgc_layers: int,
+        n_hidden: int,
+        n_topics: int,
+        dropout: float = 0.0,
+        n_batches: int = 0,
+        var_eps: float = 1e-4,
+    ) -> None:
+        super().__init__()
+        self.n_genes = n_genes
+        self.n_topics = n_topics
+        self.var_eps = var_eps
+        self.n_batches = n_batches
+
+        sgc_input_dim = n_genes * (n_sgc_layers + 1)
+
+        # Base network — exact replica of STAMP's MLPEncoderMVN:
+        # Dropout → Linear → BN → ReLU → Dropout
+        self.base = nn.Sequential(
+            nn.Dropout(dropout),
+            nn.Linear(sgc_input_dim, n_hidden),
+            nn.BatchNorm1d(n_hidden),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+        )
+
+        # Output heads
+        self.mu_head = nn.Linear(n_hidden, n_topics)
+        self.var_head = nn.Linear(n_hidden, n_topics)
+
+        # STAMP-style: norm_topic BN on mu (always applied, even with 1 batch)
+        # With frozen affine weights (weight.requires_grad = False)
+        n_bn = max(n_batches, 1)
+        self.norm_topic = nn.ModuleList([
+            nn.BatchNorm1d(n_topics) for _ in range(n_bn)
+        ])
+        for norm in self.norm_topic:
+            norm.weight.requires_grad = False
+
+        # Xavier initialization (STAMP-style)
+        nn.init.xavier_normal_(self.base[1].weight)
+        nn.init.xavier_normal_(self.mu_head.weight)
+        nn.init.xavier_normal_(self.var_head.weight)
+        nn.init.zeros_(self.mu_head.bias)
+        nn.init.zeros_(self.var_head.bias)
+
+        # Buffer for precomputed SGC features (full dataset)
+        self.register_buffer("sgc_x_full", torch.empty(0, sgc_input_dim))
+        self._sgc_initialized = False
+
+    def set_sgc_data(self, sgc_x: torch.Tensor):
+        """Store precomputed SGC features for the full dataset."""
+        self.sgc_x_full = sgc_x
+        self._sgc_initialized = True
+        logger.info(f"SGCEncoder initialized: {sgc_x.shape[0]} cells, {sgc_x.shape[1]} features")
+
+    def forward(
+        self,
+        x: torch.Tensor,  # ignored — we use sgc_x_full
+        edge_index: torch.Tensor,  # ignored — spatial info is in SGC features
+        batch_indices: torch.Tensor | None = None,
+        cat_list: list[torch.Tensor] | None = None,
+    ):
+        """
+        Forward pass using precomputed SGC features.
+
+        Parameters
+        ----------
+        x : ignored (kept for API compatibility with GCNEncoder)
+        edge_index : ignored
+        batch_indices : indices into sgc_x_full for the current minibatch
+        cat_list : categorical covariates (used for per-batch BatchNorm)
+
+        Returns
+        -------
+        dist.Normal, None
+        """
+        if not self._sgc_initialized:
+            raise ValueError("SGC features not initialized. Call set_sgc_data() first.")
+        if batch_indices is None:
+            raise ValueError("batch_indices required for SGCEncoder.")
+
+        # Subset precomputed SGC features to minibatch
+        h = self.sgc_x_full[batch_indices]  # (B, sgc_input_dim)
+
+        # Base network
+        h = self.base(h)
+
+        # Output heads
+        mu = self.mu_head(h)
+        raw_var = self.var_head(h)
+
+        # STAMP-style: norm_topic BN on mu (always applied)
+        if self.n_batches > 1 and cat_list is not None and len(cat_list) > 0:
+            batch_codes = cat_list[0].squeeze(-1).long()
+            mu_out = torch.zeros_like(mu)
+            for b in range(self.n_batches):
+                mask = batch_codes == b
+                if mask.sum() > 1:
+                    mu_out[mask] = self.norm_topic[b](mu[mask])
+                elif mask.sum() == 1:
+                    mu_out[mask] = mu[mask]
+            mu = mu_out
+        else:
+            # Single batch: still apply BN (STAMP always does this)
+            if mu.shape[0] > 1:
+                mu = self.norm_topic[0](mu)
+
+        var = F.softplus(raw_var) + self.var_eps
+
+        return dist.Normal(mu, var.sqrt()), None
+
 
 class CategoricalBoW(dist.Multinomial):
     """Multinomial that tolerates −inf logits for zero counts (identical to scvi implementation)."""
@@ -1198,13 +1410,18 @@ class MultimodalLDAPyroGuide(PyroModule):
         # Aggregation mode
         aggregation_type: str = "moe",  # "moe" or "attention"
         att_dim: int = 32,              # attention projection dim (used when aggregation_type="attention")
+        # Spatial mode: "gcn" (default, trainable GCN/GAT) or "sgc" (STAMP-style precomputed)
+        spatial_mode: str = "gcn",
+        sgc_n_layers: int = 1,  # number of SGC hops (only used when spatial_mode="sgc")
     ) -> None:
         super().__init__("multimodal_lda_guide")
         self.n_modalities = len(n_inputs_modalities)
         self.n_inputs_modalities = n_inputs_modalities
         self.n_topics = n_topics
+        self.spatial_mode = spatial_mode
         self.use_gcn = spatial
         self.adjacency = adjacency  # keep reference for downstream checks/tests
+        self.sgc_n_layers = sgc_n_layers
         self.topic_feature_prior_type = topic_feature_prior_type
         self.use_feature_background = use_feature_background
         self.learnable_bg = learnable_bg
@@ -1236,10 +1453,11 @@ class MultimodalLDAPyroGuide(PyroModule):
                 # batch_tau: Logit-Normal approximation to Beta posterior
                 # loc=0 -> sigmoid(0)=0.5 initial mode
                 self.batch_tau_loc.append(torch.nn.Parameter(torch.zeros(n_topics)))
-                self.batch_tau_scale.append(torch.nn.Parameter(torch.ones(n_topics) * 0.1))
+                _sp_inv_01 = float(torch.log(torch.exp(torch.tensor(0.1)) - 1))
+                self.batch_tau_scale.append(torch.nn.Parameter(torch.full((n_topics,), _sp_inv_01)))
                 # batch_delta: Normal approximation to StudentT posterior
                 self.batch_delta_loc.append(torch.nn.Parameter(torch.zeros(n_batches, F_m)))
-                self.batch_delta_scale.append(torch.nn.Parameter(torch.ones(n_batches, F_m) * 0.1))
+                self.batch_delta_scale.append(torch.nn.Parameter(torch.full((n_batches, F_m), _sp_inv_01)))
 
         # Regular encoders (always present)
         # scvi Encoder handles categorical covariates via n_cat_list (internal embeddings)
@@ -1258,45 +1476,61 @@ class MultimodalLDAPyroGuide(PyroModule):
             ]
         )
         
-        # GCN encoders and edge indices (if spatial)
+        # Spatial encoders (if spatial)
         if self.use_gcn:
             if adjacency is None:
-                raise ValueError("GCN encoder requested (spatial=True) but no adjacency was provided.")
+                raise ValueError("Spatial encoder requested (spatial=True) but no adjacency was provided.")
 
-            # Create GCN encoders with covariate support
-            # GCN encoders - note: categorical covariates not supported in full-graph mode
-            # Only continuous covariates (which are concatenated to input) are supported
-            self.gcn_encoders = torch.nn.ModuleList(
-                [
-                    GCNEncoder(
-                        n_in + n_extra_encoder_features,
-                        n_topics,
-                        n_hidden,
-                        gcn_n_layers=gcn_n_layers,
-                        gcn_n_pre_layers=gcn_n_pre_layers,
-                        conv_type=gcn_conv_type,
-                        gcn_hidden_dims=gcn_hidden_dims,
-                        alpha_init=gcn_alpha_init,
-                        use_learned_alpha=gcn_use_learned_alpha,
-                        n_cats_per_cov=None,  # Categorical covariates not supported in GCN full-graph mode
-                        n_continuous_cov=n_continuous_cov,
-                    )
-                    for n_in in n_inputs_modalities
-                ]
-            )
-            
-            # Convert adjacency to edge_index ONCE and store as buffers
-            if isinstance(adjacency, (list, tuple)):
-                # Multiple adjacencies (one per modality)
-                for idx, adj in enumerate(adjacency):
-                    edge_index = adjacency_to_edge_index(adj)
-                    self.register_buffer(f"edge_index_{idx}", edge_index)
-                self.multiple_adjacencies = True
-            else:
-                # Single shared adjacency for all modalities
-                edge_index = adjacency_to_edge_index(adjacency)
-                self.register_buffer("edge_index", edge_index)
+            if spatial_mode == "sgc":
+                # STAMP-style: SGC encoder with precomputed features
+                _n_batches_sgc = n_cats_per_cov[0] if (n_cats_per_cov and len(n_cats_per_cov) > 0) else 0
+                self.gcn_encoders = torch.nn.ModuleList(
+                    [
+                        SGCEncoder(
+                            n_genes=n_in,
+                            n_sgc_layers=sgc_n_layers,
+                            n_hidden=n_hidden,
+                            n_topics=n_topics,
+                            dropout=0.1,
+                            n_batches=_n_batches_sgc,
+                        )
+                        for n_in in n_inputs_modalities
+                    ]
+                )
                 self.multiple_adjacencies = False
+                # No edge_index buffers needed — spatial info is in SGC features
+
+            else:
+                # Default: trainable GCN/GAT encoders
+                self.gcn_encoders = torch.nn.ModuleList(
+                    [
+                        GCNEncoder(
+                            n_in + n_extra_encoder_features,
+                            n_topics,
+                            n_hidden,
+                            gcn_n_layers=gcn_n_layers,
+                            gcn_n_pre_layers=gcn_n_pre_layers,
+                            conv_type=gcn_conv_type,
+                            gcn_hidden_dims=gcn_hidden_dims,
+                            alpha_init=gcn_alpha_init,
+                            use_learned_alpha=gcn_use_learned_alpha,
+                            n_cats_per_cov=None,
+                            n_continuous_cov=n_continuous_cov,
+                        )
+                        for n_in in n_inputs_modalities
+                    ]
+                )
+
+                # Convert adjacency to edge_index ONCE and store as buffers
+                if isinstance(adjacency, (list, tuple)):
+                    for idx, adj in enumerate(adjacency):
+                        edge_index = adjacency_to_edge_index(adj)
+                        self.register_buffer(f"edge_index_{idx}", edge_index)
+                    self.multiple_adjacencies = True
+                else:
+                    edge_index = adjacency_to_edge_index(adjacency)
+                    self.register_buffer("edge_index", edge_index)
+                    self.multiple_adjacencies = False
         else:
             self.gcn_encoders = None
             self.multiple_adjacencies = False
@@ -1335,26 +1569,30 @@ class MultimodalLDAPyroGuide(PyroModule):
             self.beta_loc = torch.nn.ParameterList()
             self.beta_scale = torch.nn.ParameterList()
 
+            # softplus_inv(0.1) — raw param value so that softplus(param) = 0.1
+            # This matches STAMP's PyroParam(init=0.1, constraint=positive)
+            _sp_inv_01 = float(torch.log(torch.exp(torch.tensor(0.1)) - 1))  # ≈ -2.252
+
             for F_m in n_inputs_modalities:
-                # Initialize caux
-                self.caux_loc.append(torch.nn.Parameter(torch.ones(1)))
-                self.caux_scale.append(torch.nn.Parameter(torch.ones(1)))
+                # Initialize caux (STAMP: loc=0.1, scale→0.1 after softplus)
+                self.caux_loc.append(torch.nn.Parameter(torch.ones(1) * 0.1))
+                self.caux_scale.append(torch.nn.Parameter(torch.full((1,), _sp_inv_01)))
 
-                # Initialize tau (per-topic)
+                # Initialize tau (per-topic, STAMP: loc=0, scale→0.1)
                 self.tau_loc.append(torch.nn.Parameter(torch.zeros(n_topics)))
-                self.tau_scale.append(torch.nn.Parameter(torch.ones(n_topics)))
+                self.tau_scale.append(torch.nn.Parameter(torch.full((n_topics,), _sp_inv_01)))
 
-                # Initialize delta (per-feature)
+                # Initialize delta (per-feature, STAMP: loc=0, scale→0.1)
                 self.delta_loc.append(torch.nn.Parameter(torch.zeros(F_m)))
-                self.delta_scale.append(torch.nn.Parameter(torch.ones(F_m)))
+                self.delta_scale.append(torch.nn.Parameter(torch.full((F_m,), _sp_inv_01)))
 
-                # Initialize lambda (per-topic-feature)
+                # Initialize lambda (per-topic-feature, STAMP: loc=0, scale→0.1)
                 self.lambda_loc.append(torch.nn.Parameter(torch.zeros(n_topics, F_m)))
-                self.lambda_scale.append(torch.nn.Parameter(torch.ones(n_topics, F_m)))
+                self.lambda_scale.append(torch.nn.Parameter(torch.full((n_topics, F_m), _sp_inv_01)))
 
-                # Initialize beta (per-topic-feature)
+                # Initialize beta (per-topic-feature, STAMP: loc=0, scale→0.1)
                 self.beta_loc.append(torch.nn.Parameter(torch.zeros(n_topics, F_m)))
-                self.beta_scale.append(torch.nn.Parameter(torch.ones(n_topics, F_m)))
+                self.beta_scale.append(torch.nn.Parameter(torch.full((n_topics, F_m), _sp_inv_01)))
 
         # Feature background variational parameters (scTM-style)
         # Only for gamma_poisson modalities when use_feature_background=True
@@ -1364,8 +1602,10 @@ class MultimodalLDAPyroGuide(PyroModule):
             for m, (F_m, likelihood) in enumerate(zip(n_inputs_modalities, self.likelihoods)):
                 if likelihood == "gamma_poisson":
                     # Create background parameters for gamma_poisson modalities
+                    # STAMP: bg_scale init = 0.1, so raw param = softplus_inv(0.1)
+                    _sp_inv_01 = float(torch.log(torch.exp(torch.tensor(0.1)) - 1))
                     self.bg_loc.append(torch.nn.Parameter(torch.zeros(F_m)))
-                    self.bg_scale.append(torch.nn.Parameter(torch.ones(F_m)))
+                    self.bg_scale.append(torch.nn.Parameter(torch.full((F_m,), _sp_inv_01)))
                 else:
                     # Placeholder for multinomial modalities (won't be used)
                     self.bg_loc.append(None)
@@ -1382,8 +1622,9 @@ class MultimodalLDAPyroGuide(PyroModule):
             self.gaussian_sigma_scale = torch.nn.ParameterList()
             for m, (F_m, likelihood) in enumerate(zip(n_inputs_modalities, self.likelihoods)):
                 if likelihood == "gaussian":
+                    _sp_inv_01 = float(torch.log(torch.exp(torch.tensor(0.1)) - 1))
                     self.gaussian_sigma_loc.append(torch.nn.Parameter(torch.zeros(F_m)))
-                    self.gaussian_sigma_scale.append(torch.nn.Parameter(torch.zeros(F_m)))
+                    self.gaussian_sigma_scale.append(torch.nn.Parameter(torch.full((F_m,), _sp_inv_01)))
                 else:
                     self.gaussian_sigma_loc.append(None)
                     self.gaussian_sigma_scale.append(None)
@@ -1398,14 +1639,15 @@ class MultimodalLDAPyroGuide(PyroModule):
             self.disp_scale = torch.nn.ParameterList()
             for m, (F_m, likelihood) in enumerate(zip(n_inputs_modalities, self.likelihoods)):
                 if likelihood in {"gamma_poisson", "nb"}:
+                    _sp_inv_01 = float(torch.log(torch.exp(torch.tensor(0.1)) - 1))
                     if global_dispersion:
                         # Single dispersion per modality
                         self.disp_loc.append(torch.nn.Parameter(torch.zeros(1)))
-                        self.disp_scale.append(torch.nn.Parameter(torch.ones(1)))
+                        self.disp_scale.append(torch.nn.Parameter(torch.full((1,), _sp_inv_01)))
                     else:
                         # Per-gene dispersion (STAMP-like)
                         self.disp_loc.append(torch.nn.Parameter(torch.zeros(F_m)))
-                        self.disp_scale.append(torch.nn.Parameter(torch.ones(F_m)))
+                        self.disp_scale.append(torch.nn.Parameter(torch.full((F_m,), _sp_inv_01)))
                 else:
                     # Placeholder for non-NB modalities
                     self.disp_loc.append(None)
@@ -1510,15 +1752,13 @@ class MultimodalLDAPyroGuide(PyroModule):
     def set_full_graph_data(
         self,
         x_full_modalities: list[torch.Tensor] | torch.Tensor,
+        adjacency_scipy: sp.spmatrix | None = None,
     ):
         """
-        Initialize GCN encoders with full graph data for full-graph training.
+        Initialize spatial encoders with full graph data.
 
-        CRITICAL: When normalize_encoder_inputs=True, this applies log-normalization
-        to the FULL graph BEFORE storing it in the GCN encoder. This ensures that
-        spatial graph convolution operates on normalized features.
-
-        Must be called after model initialization and before training when spatial=True.
+        For GCN mode: stores normalized features and edge indices.
+        For SGC mode: precomputes SGC features and stores them in the encoder.
 
         Parameters
         ----------
@@ -1526,11 +1766,9 @@ class MultimodalLDAPyroGuide(PyroModule):
             Either:
             - List of full feature matrices, one per modality [n_obs, n_features_m]
             - Single concatenated matrix [n_obs, sum(n_features)] (will be split)
-
-        Notes
-        -----
-        Edge indices are already stored as buffers in __init__.
-        This method only needs to initialize the feature data.
+        adjacency_scipy : scipy sparse matrix, optional
+            Original scipy adjacency matrix. Required for SGC mode to precompute
+            spatial smoothing.
         """
         if not self.use_gcn:
             logger.warning("set_full_graph_data() called but spatial=False. No effect.")
@@ -1542,35 +1780,43 @@ class MultimodalLDAPyroGuide(PyroModule):
         else:
             x_full_list = x_full_modalities
 
-        # IMPORTANT: Apply normalization BEFORE storing in GCN encoder
-        # This ensures graph convolution operates on normalized features
-        if self.normalize_encoder_inputs:
-            libs = [x_full_m.sum(dim=1, keepdim=True) for x_full_m in x_full_list]
-            x_full_normalized = []
-            for m, (x_full_m, lib_m) in enumerate(zip(x_full_list, libs)):
-                if self.likelihoods[m] == "gaussian":
-                    # Gaussian modalities: pass through (data is already continuous)
-                    x_full_normalized.append(x_full_m)
-                else:
-                    lib_m = torch.clamp(lib_m, min=1.0)
-                    # Use median depth of this modality as scale factor
-                    median_depth = torch.median(lib_m)
-                    x_full_m_norm = torch.log1p(x_full_m / lib_m * median_depth)
-                    x_full_normalized.append(x_full_m_norm)
-            x_full_list = x_full_normalized
-            logger.info("Applied library-size and log-normalization to full graph BEFORE spatial convolution")
+        if self.spatial_mode == "sgc":
+            # STAMP-style: precompute SGC features for each modality
+            if adjacency_scipy is None:
+                raise ValueError("adjacency_scipy is required for SGC mode.")
 
-        # Initialize each GCN encoder with (potentially normalized) full graph
-        for idx, (gcn_enc, x_full_m) in enumerate(zip(self.gcn_encoders, x_full_list)):
-            edge_index = self._get_edge_index(idx)
-            # This stores x_full_m in gcn_enc.x_full
-            # During forward pass, GCN will do: conv(x_full, edge_index)
-            gcn_enc.set_full_graph_data(x_full_m, edge_index)
+            for idx, (sgc_enc, x_full_m) in enumerate(zip(self.gcn_encoders, x_full_list)):
+                sgc_x = precompute_sgc(x_full_m, adjacency_scipy, n_layers=self.sgc_n_layers)
+                sgc_enc.set_sgc_data(sgc_x)
 
-        logger.info(
-            f"GCN encoders initialized with full graph "
-            f"(normalize_encoder_inputs={self.normalize_encoder_inputs})"
-        )
+            logger.info(
+                f"SGC encoders initialized with {self.sgc_n_layers}-hop precomputed features "
+                f"(input dim: {x_full_list[0].shape[1]} -> {x_full_list[0].shape[1] * (self.sgc_n_layers + 1)})"
+            )
+        else:
+            # GCN mode: apply normalization and store in GCN encoders
+            if self.normalize_encoder_inputs:
+                libs = [x_full_m.sum(dim=1, keepdim=True) for x_full_m in x_full_list]
+                x_full_normalized = []
+                for m, (x_full_m, lib_m) in enumerate(zip(x_full_list, libs)):
+                    if self.likelihoods[m] == "gaussian":
+                        x_full_normalized.append(x_full_m)
+                    else:
+                        lib_m = torch.clamp(lib_m, min=1.0)
+                        median_depth = torch.median(lib_m)
+                        x_full_m_norm = torch.log1p(x_full_m / lib_m * median_depth)
+                        x_full_normalized.append(x_full_m_norm)
+                x_full_list = x_full_normalized
+                logger.info("Applied library-size and log-normalization to full graph BEFORE spatial convolution")
+
+            for idx, (gcn_enc, x_full_m) in enumerate(zip(self.gcn_encoders, x_full_list)):
+                edge_index = self._get_edge_index(idx)
+                gcn_enc.set_full_graph_data(x_full_m, edge_index)
+
+            logger.info(
+                f"GCN encoders initialized with full graph "
+                f"(normalize_encoder_inputs={self.normalize_encoder_inputs})"
+            )
 
     # ---------- forward ----------
     @auto_move_data
@@ -1803,13 +2049,18 @@ class MultimodalLDAPyroGuide(PyroModule):
             x_m_with_cov = torch.cat(parts, dim=-1) if len(parts) > 1 else x_m
 
             if self.use_gcn:
-                edge_index = self._get_edge_index(idx)
-                # GCN encoder doesn't support categorical covariates in full-graph mode
-                # Only continuous covariates (already in x_m_with_cov) are used
-                q_m, _ = self.gcn_encoders[idx](
-                    x_m_with_cov, edge_index, batch_indices=batch_indices,
-                    cat_list=None  # Not supported in full-graph mode
-                )
+                if self.spatial_mode == "sgc":
+                    # SGC encoder uses precomputed features; pass cat_list for per-batch BN
+                    q_m, _ = self.gcn_encoders[idx](
+                        x_m_with_cov, None, batch_indices=batch_indices,
+                        cat_list=cat_list,
+                    )
+                else:
+                    edge_index = self._get_edge_index(idx)
+                    q_m, _ = self.gcn_encoders[idx](
+                        x_m_with_cov, edge_index, batch_indices=batch_indices,
+                        cat_list=None  # Not supported in full-graph mode
+                    )
             else:
                 # scvi Encoder: forward(x, *cat_list)
                 q_m, _ = enc(x_m_with_cov, *cat_list)
@@ -1908,6 +2159,8 @@ class MultimodalAmortizedLDAPyroModule(PyroBaseModuleClass):
         n_extra_encoder_features: int = 0,
         aggregation_type: str = "moe",
         att_dim: int = 32,
+        spatial_mode: str = "gcn",
+        sgc_n_layers: int = 1,
     ):
         super().__init__()
         assert len(n_inputs_modalities) == len(likelihoods)
@@ -1918,6 +2171,7 @@ class MultimodalAmortizedLDAPyroModule(PyroBaseModuleClass):
         self.n_modalities = len(n_inputs_modalities)
         self.weight_mode = weight_mode
         self.spatial = spatial
+        self.spatial_mode = spatial_mode
         self.topic_feature_prior_type = topic_feature_prior_type
         self.use_feature_background = use_feature_background
         self.dispersion_rna = dispersion_rna
@@ -2007,6 +2261,8 @@ class MultimodalAmortizedLDAPyroModule(PyroBaseModuleClass):
             n_extra_encoder_features=n_extra_encoder_features,
             aggregation_type=aggregation_type,
             att_dim=att_dim,
+            spatial_mode=spatial_mode,
+            sgc_n_layers=sgc_n_layers,
         )
 
         # We need this method so scvi training plan can create data-loader args
@@ -2061,23 +2317,22 @@ class MultimodalAmortizedLDAPyroModule(PyroBaseModuleClass):
         return incompatible
 
 
-    def set_full_graph_data(self, x_full: torch.Tensor):
+    def set_full_graph_data(self, x_full: torch.Tensor, adjacency_scipy=None):
         """
-        Initialize GCN encoders with full graph data for semi-supervised learning.
-        
-        Must be called after model initialization and before training when spatial=True.
-        
+        Initialize spatial encoders with full graph data.
+
         Parameters
         ----------
         x_full : torch.Tensor
             Full concatenated feature matrix for ALL cells [n_obs, sum(n_features)]
-            Will be automatically split by modality
+        adjacency_scipy : scipy sparse matrix, optional
+            Original scipy adjacency. Required for SGC mode.
         """
         if not self.spatial:
             logger.warning("set_full_graph_data() called but spatial=False. No effect.")
             return
-        
-        self._guide.set_full_graph_data(x_full)
+
+        self._guide.set_full_graph_data(x_full, adjacency_scipy=adjacency_scipy)
         logger.info("Module initialized with full graph data")
 
     # utilities
@@ -2210,8 +2465,14 @@ class MultimodalAmortizedLDAPyroModule(PyroBaseModuleClass):
             x_m_with_cov = torch.cat(parts, dim=-1) if len(parts) > 1 else x_m
 
             if self.guide.use_gcn:
-                edge_index = self.guide._get_edge_index(idx)
-                q_m, _ = self.guide.gcn_encoders[idx](x_m_with_cov, edge_index, batch_indices=batch_indices)
+                if self.guide.spatial_mode == "sgc":
+                    q_m, _ = self.guide.gcn_encoders[idx](
+                        x_m_with_cov, None, batch_indices=batch_indices,
+                        cat_list=cat_list,
+                    )
+                else:
+                    edge_index = self.guide._get_edge_index(idx)
+                    q_m, _ = self.guide.gcn_encoders[idx](x_m_with_cov, edge_index, batch_indices=batch_indices)
             else:
                 q_m, _ = enc(x_m_with_cov, *cat_list)
             mus.append(q_m.loc)
