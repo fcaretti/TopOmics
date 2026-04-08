@@ -269,7 +269,7 @@ def save_results(model, mdata, output_dir, args):
     print(f"Model saved to: {model_path}")
 
     # Get latent representation
-    theta = model.get_latent_representation(batch_size=mdata.n_obs)
+    theta = model.get_latent_representation(batch_size=256)
 
     # Save latent representation for easy loading (avoids GCN architecture issues)
     np.save(os.path.join(output_dir, "latent_representation.npy"), theta.values)
