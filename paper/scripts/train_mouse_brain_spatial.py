@@ -259,7 +259,7 @@ def print_diagnostics(model):
     print("=" * 70)
 
 
-def save_results(model, mdata, output_dir):
+def save_results(model, mdata, output_dir, args):
     """Save the model and generate plots."""
     os.makedirs(output_dir, exist_ok=True)
 
@@ -414,7 +414,7 @@ def main():
     print_diagnostics(model)
 
     print("\nSaving results...")
-    save_results(model, mdata, output_dir)
+    save_results(model, mdata, output_dir, args)
 
     print("\nDone!")
 

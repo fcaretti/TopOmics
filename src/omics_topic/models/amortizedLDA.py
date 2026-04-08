@@ -1404,7 +1404,14 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
         for tensors in dl:
             x = tensors[REGISTRY_KEYS.X_KEY]
             enc_extra = tensors.get("encoder_extra", None)
-            thetas.append(self.module.get_topic_distribution(x, n_samples, encoder_extra=enc_extra))
+            # Pass global cell indices so spatial (GCN) encoders can extract
+            # the correct k-hop subgraph for each batch.
+            cell_idx = tensors.get(REGISTRY_KEYS.INDICES_KEY, None)
+            if cell_idx is not None and cell_idx.dim() > 1:
+                cell_idx = cell_idx.view(-1)
+            thetas.append(self.module.get_topic_distribution(
+                x, n_samples, encoder_extra=enc_extra, batch_indices=cell_idx,
+            ))
         theta = torch.cat(thetas).cpu().numpy()
 
         return pd.DataFrame(theta, index=adata.obs_names, columns=[f"topic_{k}" for k in range(theta.shape[1])])
@@ -1444,7 +1451,12 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
         for tensors in dl:
             x = tensors[REGISTRY_KEYS.X_KEY]
             enc_extra = tensors.get("encoder_extra", None)
-            thetas.append(self.module.get_topic_distribution(x, n_samples, encoder_extra=enc_extra))
+            cell_idx = tensors.get(REGISTRY_KEYS.INDICES_KEY, None)
+            if cell_idx is not None and cell_idx.dim() > 1:
+                cell_idx = cell_idx.view(-1)
+            thetas.append(self.module.get_topic_distribution(
+                x, n_samples, encoder_extra=enc_extra, batch_indices=cell_idx,
+            ))
         return torch.cat(thetas).cpu().numpy()
 
     # ------------------------------------------------------------------ #

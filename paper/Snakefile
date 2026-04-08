@@ -1,0 +1,62 @@
+# =============================================================================
+# TopOmics paper — Snakemake workflow
+# =============================================================================
+# Usage:
+#   snakemake -j 4 --config data_dir=/data output_dir=results
+#   snakemake -n  # dry-run
+# =============================================================================
+
+configfile: "config.yaml"
+
+OUTPUT = config["output_dir"]
+DATA   = config["data_dir"]
+
+# --- Classify datasets ---
+MULTIMODAL_DATASETS = [
+    ds for ds, info in config["datasets"].items()
+    if info["type"] == "multimodal"
+]
+UNIMODAL_DATASETS = [
+    ds for ds, info in config["datasets"].items()
+    if info["type"] == "unimodal"
+]
+TOPOMICS_CONFIGS         = list(config["topomics_configs"].keys())
+TOPOMICS_UNIMODAL_CONFIGS = list(config["topomics_configs_unimodal"].keys())
+RETINA_CONFIGS           = list(config["retina_configs"].keys())
+
+# --- Include rule files ---
+include: "workflow/rules/topomics.smk"
+include: "workflow/rules/baselines.smk"
+include: "workflow/rules/retina.smk"
+include: "workflow/rules/scaling.smk"
+
+
+# --- Master target ---
+rule all:
+    input:
+        # TopOmics: multimodal datasets x 4 configs
+        expand(
+            f"{OUTPUT}/{{dataset}}/topomics_{{cfg}}/done.sentinel",
+            dataset=MULTIMODAL_DATASETS,
+            cfg=TOPOMICS_CONFIGS,
+        ),
+        # TopOmics: unimodal datasets x 2 configs
+        expand(
+            f"{OUTPUT}/{{dataset}}/topomics_{{cfg}}/done.sentinel",
+            dataset=UNIMODAL_DATASETS,
+            cfg=TOPOMICS_UNIMODAL_CONFIGS,
+        ),
+        # TopOmics: retina x 3 configs
+        expand(
+            f"{OUTPUT}/retina/topomics_{{cfg}}/done.sentinel",
+            cfg=RETINA_CONFIGS,
+        ),
+        # Baselines: per-dataset
+        [
+            f"{OUTPUT}/{ds}/{bl}/done.sentinel"
+            for ds, info in config["datasets"].items()
+            for bl in info["baselines"]
+        ],
+        # Scaling benchmarks
+        f"{OUTPUT}/scaling/multimodal_features/done.sentinel",
+        f"{OUTPUT}/scaling/multimodal_cells/done.sentinel",

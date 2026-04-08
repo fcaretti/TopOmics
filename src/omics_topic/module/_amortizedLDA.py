@@ -31,6 +31,7 @@ from scvi._constants import REGISTRY_KEYS
 from scvi.module.base import PyroBaseModuleClass, auto_move_data
 from scvi.nn import Encoder, FCLayers
 from torch_geometric.nn import GCNConv, GATv2Conv
+from torch_geometric.utils import k_hop_subgraph
 
 logger = logging.getLogger(__name__)
 CLAMP_EPS = 10e-6
@@ -490,9 +491,13 @@ class GCNEncoder(nn.Module):
         else:
             self.register_buffer("_alpha_logit", alpha_logit.clone().detach())
 
-        # Full-graph buffers
-        self.register_buffer("x_full", torch.empty(0, n_in))
-        self.register_buffer("edge_index_full", torch.empty(2, 0, dtype=torch.long))
+        # Full-graph data stored on CPU (NOT as buffers) to avoid GPU OOM
+        # on large graphs (e.g. VisiumHD).  Subgraph extraction via
+        # k_hop_subgraph moves only the needed neighbourhood to GPU each step.
+        self.x_full: torch.Tensor | None = None
+        self.edge_index_full: torch.Tensor | None = None
+        self.num_nodes: int = 0
+        self.num_hops: int = gcn_n_layers
         self._graph_initialized = False
 
     @property
@@ -521,7 +526,10 @@ class GCNEncoder(nn.Module):
 
     def set_full_graph_data(self, x_full: torch.Tensor, edge_index_full: torch.Tensor):
         """
-        Initialize full graph data for full-graph training.
+        Initialize full graph data for minibatch-subgraph training.
+
+        Both tensors are kept on **CPU**; only the k-hop neighbourhood of
+        each minibatch is moved to the model device during ``forward()``.
 
         Parameters
         ----------
@@ -535,11 +543,14 @@ class GCNEncoder(nn.Module):
         if edge_index_full.dim() != 2 or edge_index_full.size(0) != 2:
             raise ValueError(f"edge_index_full must have shape [2, n_edges], got {tuple(edge_index_full.shape)}")
 
-        self.x_full = x_full
-        self.edge_index_full = edge_index_full
+        # Store on CPU to avoid GPU memory pressure on large graphs
+        self.x_full = x_full.detach().cpu()
+        self.edge_index_full = edge_index_full.detach().cpu().contiguous()
+        self.num_nodes = x_full.shape[0]
         self._graph_initialized = True
         logger.info(
-            f"GCN graph initialized: {x_full.shape[0]} cells, {edge_index_full.shape[1]} edges"
+            f"GCN graph initialized (CPU): {x_full.shape[0]} cells, "
+            f"{edge_index_full.shape[1]} edges, {self.num_hops}-hop subgraph sampling"
         )
 
     def _mix_self_and_neighbors(self, h_self: torch.Tensor, h_nei: torch.Tensor) -> torch.Tensor:
@@ -559,18 +570,23 @@ class GCNEncoder(nn.Module):
         cat_list: list[torch.Tensor] | None = None,
     ):
         """
-        Forward pass. Uses full-graph data when initialized.
+        Forward pass using k-hop subgraph sampling.
+
+        Instead of computing on the full graph and subsetting, we extract the
+        k-hop neighbourhood around ``batch_indices`` (global cell ids), move
+        only that subgraph to the model device, run the GCN, and return the
+        seed-node representations.
 
         Parameters
         ----------
         x : torch.Tensor
-            Ignored when full-graph is initialized
+            Ignored (features come from stored ``x_full``).
         edge_index : torch.Tensor
-            Ignored when full-graph is initialized
-        batch_indices : torch.Tensor, optional
-            Indices of nodes in the current minibatch. Required if full-graph is initialized.
+            Ignored (edges come from stored ``edge_index_full``).
+        batch_indices : torch.Tensor
+            **Global** cell indices for the current minibatch.
         cat_list : list[torch.Tensor], optional
-            List of categorical covariate tensors for the minibatch.
+            Categorical covariate tensors (not used in current graph path).
 
         Returns
         -------
@@ -584,40 +600,51 @@ class GCNEncoder(nn.Module):
 
         if batch_indices is None:
             raise ValueError(
-                "batch_indices required when using full-graph training. "
+                "batch_indices (global cell indices) required. "
                 "This should be provided automatically by the guide."
             )
 
-        # ---- STEP 1: compute on FULL graph ----
-        x_full = clamp_symmetric(self.x_full)
-        ei_full = self.edge_index_full
+        device = self.mean_encoder.weight.device  # model's compute device
 
+        # ---- STEP 1: extract k-hop subgraph on CPU ----
+        batch_indices_cpu = batch_indices.detach().cpu().long()
+        subset, sub_edge_index, mapping, _ = k_hop_subgraph(
+            batch_indices_cpu,
+            num_hops=self.num_hops,
+            edge_index=self.edge_index_full,
+            relabel_nodes=True,
+            num_nodes=self.num_nodes,
+        )
+
+        # Move only the subgraph to the compute device
+        x_sub = clamp_symmetric(self.x_full[subset].to(device))
+        sub_edge_index = sub_edge_index.to(device)
+        mapping = mapping.to(device)
+
+        # ---- STEP 2: compute on subgraph ----
         # Self path (scvi-style FCLayers)
-        # Note: For full-graph, categorical covariates need to be expanded to full size
-        # We pass None here and apply covariates only in the minibatch path
-        h_self_full = clamp_symmetric(self.encoder(x_full))
+        h_self = clamp_symmetric(self.encoder(x_sub))
 
         # Neighbor aggregation path (stacked graph convs with BatchNorm)
-        # Optionally apply FC projection before graph convolution
         if self.pre_gcn_fc is not None:
-            h_nei_full = clamp_symmetric(self.pre_gcn_fc(x_full))
+            h_nei = clamp_symmetric(self.pre_gcn_fc(x_sub))
         else:
-            h_nei_full = x_full
+            h_nei = x_sub
         for i, (conv, bn) in enumerate(zip(self.convs, self.conv_bns, strict=False)):
-            h_nei_full = conv(h_nei_full, ei_full)
-            h_nei_full = clamp_symmetric(bn(h_nei_full))
+            h_nei = conv(h_nei, sub_edge_index)
+            h_nei = clamp_symmetric(bn(h_nei))
             if i < len(self.convs) - 1:
-                h_nei_full = clamp_symmetric(F.relu(h_nei_full))
+                h_nei = clamp_symmetric(F.relu(h_nei))
                 if self.gcn_dropout > 0:
-                    h_nei_full = F.dropout(
-                        h_nei_full, p=self.gcn_dropout, training=self.training
+                    h_nei = F.dropout(
+                        h_nei, p=self.gcn_dropout, training=self.training
                     )
 
         # Mix self + neighbors (skip connection)
-        h_full = clamp_symmetric(self._mix_self_and_neighbors(h_self_full, h_nei_full))
+        h_sub = clamp_symmetric(self._mix_self_and_neighbors(h_self, h_nei))
 
-        # ---- STEP 2: subset to minibatch ----
-        h = clamp_symmetric(h_full[batch_indices])  # [batch_size, n_hidden]
+        # ---- STEP 3: extract seed-node representations ----
+        h = clamp_symmetric(h_sub[mapping])  # [batch_size, n_hidden]
 
         # scvi-style mean/variance heads
         q_m = clamp_symmetric(self.mean_encoder(h))
@@ -627,12 +654,12 @@ class GCNEncoder(nn.Module):
         # NaN detection warning
         if torch.isnan(q_m).any() or torch.isnan(q_v).any():
             nan_info = []
-            if torch.isnan(h_self_full).any():
-                nan_info.append("h_self_full")
-            if torch.isnan(h_nei_full).any():
-                nan_info.append("h_nei_full")
-            if torch.isnan(h_full).any():
-                nan_info.append("h_full")
+            if torch.isnan(h_self).any():
+                nan_info.append("h_self")
+            if torch.isnan(h_nei).any():
+                nan_info.append("h_nei")
+            if torch.isnan(h_sub).any():
+                nan_info.append("h_sub")
             if torch.isnan(q_m).any():
                 nan_info.append("q_m (mean)")
             if torch.isnan(q_v).any():
@@ -1521,15 +1548,16 @@ class MultimodalLDAPyroGuide(PyroModule):
                     ]
                 )
 
-                # Convert adjacency to edge_index ONCE and store as buffers
+                # Convert adjacency to edge_index ONCE and store on CPU.
+                # Plain attributes (not buffers) so they are NOT moved to GPU
+                # by .to(device) — subgraph extraction in GCNEncoder happens on CPU.
                 if isinstance(adjacency, (list, tuple)):
                     for idx, adj in enumerate(adjacency):
-                        edge_index = adjacency_to_edge_index(adj)
-                        self.register_buffer(f"edge_index_{idx}", edge_index)
+                        ei = adjacency_to_edge_index(adj).cpu()
+                        setattr(self, f"edge_index_{idx}", ei)
                     self.multiple_adjacencies = True
                 else:
-                    edge_index = adjacency_to_edge_index(adjacency)
-                    self.register_buffer("edge_index", edge_index)
+                    self.edge_index = adjacency_to_edge_index(adjacency).cpu()
                     self.multiple_adjacencies = False
         else:
             self.gcn_encoders = None
@@ -2416,6 +2444,7 @@ class MultimodalAmortizedLDAPyroModule(PyroBaseModuleClass):
     def get_topic_distribution(
         self, x: torch.Tensor, n_samples: int = 5_000,
         encoder_extra: torch.Tensor | None = None,
+        batch_indices: torch.Tensor | None = None,
     ) -> torch.Tensor:
         device = next(self._guide.parameters()).device  # cuda:0 or cpu
         x = x.to(device, non_blocking=True)
@@ -2439,7 +2468,12 @@ class MultimodalAmortizedLDAPyroModule(PyroBaseModuleClass):
                     xs_normalized.append(x_m_norm)
             xs = xs_normalized
 
-        batch_indices = torch.arange(B, device=x.device)
+        # Global cell indices — required for spatial (GCN) models so that
+        # k_hop_subgraph can extract the correct neighbourhood.
+        if batch_indices is not None:
+            batch_indices = batch_indices.to(device)
+        else:
+            batch_indices = torch.arange(B, device=device)
 
         # Prepare dummy categorical covariates if encoder expects them
         cat_list = []

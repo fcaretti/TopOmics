@@ -20,3 +20,6 @@ __pycache__/
 /docs/_build/
 
 examples/*.png
+*.pdf
+paper/.snakemake/*
+paper/plots/*
