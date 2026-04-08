@@ -1,0 +1,225 @@
+# =============================================================================
+# Snakemake configuration for TopOmics paper experiments
+# =============================================================================
+# Override paths at runtime:
+#   snakemake --config data_dir=/other/storage output_dir=/scratch/results
+
+# --- Paths ---
+data_dir: "/data/"
+output_dir: "/data/topomics_models/"
+
+# --- Shared TopOmics defaults (overridden per-dataset) ---
+topomics_defaults:
+  n_topics: 10
+  n_hidden: 64
+  cell_topic_prior: "auto"  # 1/n_topics
+  learnable_dispersion: false
+  global_dispersion: false
+  gcn_conv_type: "GATv2Conv"
+  gcn_n_layers: 1
+  gcn_alpha: 0.2
+  gcn_use_learned_alpha: true
+  train_size: 0.8
+
+# --- TopOmics configuration grid (multimodal: 2 priors x 2 aggregations) ---
+topomics_configs:
+  ln_moe:
+    feature_prior_type: "logistic_normal"
+    aggregation_type: "moe"
+    weight_mode: "cell"
+  ln_att:
+    feature_prior_type: "logistic_normal"
+    aggregation_type: "attention"
+  hs_moe:
+    feature_prior_type: "horseshoe"
+    aggregation_type: "moe"
+    weight_mode: "cell"
+  hs_att:
+    feature_prior_type: "horseshoe"
+    aggregation_type: "attention"
+
+# --- Unimodal config grid (no aggregation axis) ---
+topomics_configs_unimodal:
+  ln:
+    feature_prior_type: "logistic_normal"
+  hs:
+    feature_prior_type: "horseshoe"
+
+# --- Retina configs (batch correction axis) ---
+retina_configs:
+  encode_cov:
+    encode_covariates: true
+    batch_correction: true
+  decode_only:
+    encode_covariates: false
+    batch_correction: true
+  no_batch:
+    encode_covariates: false
+    batch_correction: false
+
+# --- Datasets ---
+# data_path / data_paths are relative to data_dir.
+# Datasets fetched via Python APIs use data_source instead.
+datasets:
+  teaseq:
+    data_path: "GSE158013/GSM5123951_celltypist.h5mu"
+    type: multimodal
+    spatial: false
+    modalities: ["rna", "atac", "prot"]
+    likelihoods: ["gamma_poisson", "bernoulli", "gamma_poisson"]
+    preprocessing:
+      rna_hvgs: 2000
+      atac_hvgs: 10000
+    topomics:
+      max_epochs: 500
+      batch_size: 128
+    baselines: [multivi, amortized_lda_rna, amortized_lda_atac, amortized_lda_prot, mofa, glue]
+
+  atac_rna:
+    data_path: "nelkazwi/share-topic/lymphoma_data/mdata_lymphoma.h5mu"
+    type: multimodal
+    spatial: false
+    modalities: ["rna", "atac"]
+    likelihoods: ["gamma_poisson", "bernoulli"]
+    preprocessing:
+      rna_hvgs: 2000
+      atac_hvgs: 20000
+    topomics:
+      max_epochs: 200
+      batch_size: 256
+      lr: 0.01
+    baselines: [multivi, multivi_linear, mofa, glue]
+
+  visium:
+    data_source: "squidpy.datasets.visium_hne_adata"
+    type: unimodal
+    spatial: true
+    modalities: ["rna"]
+    likelihoods: ["gamma_poisson"]
+    topomics:
+      max_epochs: 300
+      batch_size: 256
+      lr: 0.01
+    baselines: [scvi, stamp, amortized_lda]
+
+  mouse_brain_spatial:
+    data_paths:
+      rna: "Data_SpatialGlue/Dataset10_Mouse_Brain_H3K27me3/adata_RNA.h5ad"
+      atac: "Data_SpatialGlue/Dataset10_Mouse_Brain_H3K27me3/adata_peaks_normalized.h5ad"
+    type: multimodal
+    spatial: true
+    modalities: ["rna", "atac"]
+    likelihoods: ["gamma_poisson", "bernoulli"]
+    preprocessing:
+      n_neighbors: 5
+    topomics:
+      max_epochs: 100
+      batch_size: 256
+      lr: 0.01
+      weight_mode_override: "universal"
+    baselines: [spatialglue, stamp, multivi, mofa, cosmos]
+
+  colon_citeseq:
+    data_paths:
+      rna: "omics_topic_datasets/mouse_colon_citeseq_dataset/GSM6578059_mousecolon_RNA.tsv.gz"
+      protein: "omics_topic_datasets/mouse_colon_citeseq_dataset/GSM6578068_mousecolon_protein.tsv.gz"
+    type: multimodal
+    spatial: true
+    modalities: ["rna", "prot"]
+    likelihoods: ["gamma_poisson", "gamma_poisson"]
+    topomics:
+      max_epochs: 500
+      batch_size: 128
+      lr: 0.01
+    baselines: [totalvi, amortized_lda_rna, amortized_lda_prot, mofa]
+
+  thymus:
+    data_paths:
+      rna: "Data_SpatialGlue/Dataset5_Mouse_Thymus3/adata_RNA.h5ad"
+      adt: "Data_SpatialGlue/Dataset5_Mouse_Thymus3/adata_ADT.h5ad"
+    type: multimodal
+    spatial: true
+    modalities: ["rna", "adt"]
+    likelihoods: ["gamma_poisson", "gamma_poisson"]
+    topomics:
+      max_epochs: 200
+      batch_size: 128
+      lr: 0.01
+    baselines: [spatialglue, totalvi, mofa]
+
+  dbit_seq:
+    data_path: "DBiT_Seq Mouse Embryo_RNA_Protein.h5"
+    type: multimodal
+    spatial: true
+    modalities: ["rna", "prot"]
+    likelihoods: ["gamma_poisson", "gamma_poisson"]
+    preprocessing:
+      n_neighbors: 5
+    topomics:
+      max_epochs: 500
+      batch_size: 128
+      lr: 0.01
+    baselines: [spatialglue, totalvi, mofa, cosmos]
+
+  gastrulation:
+    data_source: "scvelo.datasets.gastrulation_erythroid"
+    type: multimodal
+    spatial: false
+    modalities: ["mature", "immature"]
+    likelihoods: ["gamma_poisson", "gamma_poisson"]
+    topomics:
+      n_hidden: 128
+      max_epochs: 300
+      batch_size: 256
+      lr: 0.001
+    baselines: [multivi, mofa, amortized_lda_mature, amortized_lda_immature]
+
+  retina:
+    data_path: "retina_dataset/retina.h5ad"
+    type: unimodal_batch
+    spatial: false
+    modalities: ["rna"]
+    likelihoods: ["gamma_poisson"]
+    preprocessing:
+      rna_hvgs: 2000
+      batch_aware: true
+    topomics:
+      n_topics: 30
+      n_hidden: 128
+      max_epochs: 100
+      batch_size: 128
+    baselines: [scvi_batch, scvi_no_batch, linear_scvi_batch, linear_scvi_no_batch]
+
+# --- Scaling benchmarks (multimodal RNA+ATAC) ---
+scaling:
+  # Feature-fraction sweep on lymphoma RNA+ATAC
+  multimodal_features:
+    data_path: "nelkazwi/share-topic/lymphoma_data/mdata_lymphoma.h5mu"
+    feature_fractions: [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
+    n_hvg_full: 2000
+    n_peaks_full: 20000
+    n_topics: 20
+    max_epochs: 500
+    batch_size: 256
+    seed: 42
+    models: [multivi, omics_topic, mofa]
+
+  # Cell-count sweep on synthetic RNA+ATAC (generated from SHARE-Topic posterior)
+  multimodal_cells:
+    lymphoma_rna: "nelkazwi/share-topic/lymphoma_data/rna_B_lympho.h5ad"
+    lymphoma_atac: "nelkazwi/share-topic/lymphoma_data/atac_B_lympho.h5ad"
+    n_cells: [1000, 5000, 10000, 50000, 100000, 200000]
+    n_runs: 5
+    n_topics: 20
+    max_epochs: 500
+    batch_size: 256
+    seed: 42
+    models: [multivi, omics_topic, mofa]
+
+# --- Baseline defaults ---
+baseline_defaults:
+  n_latent: 10
+  n_hidden: 128
+  max_epochs: 300
+  early_stopping: true
+  train_size: 0.8

@@ -481,7 +481,7 @@ def train_cosmos(mdata, n_latent, output_dir, device):
 
     # Build model — no further preprocessing (data already transformed)
     model = cosmos.Cosmos(adata1=adata_rna, adata2=adata_atac_lsi)
-    model.preprocessing_data(n_neighbors=10)
+    model.preprocessing_data(n_neighbors=5)
 
     # Parse GPU index from device string
     gpu = int(device.split(":")[-1]) if "cuda" in device else -1
