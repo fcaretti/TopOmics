@@ -367,6 +367,9 @@ class GCNEncoder(nn.Module):
         use_learned_alpha: bool = True,  # if False, uses fixed alpha_init
         var_eps: float = 1e-4,
         var_activation=None,
+        sampling: str = "approx",    # "approx" (stochastic neighbor sampling) or "exact" (k_hop_subgraph)
+        fan_out: list[int] | None = None,  # per-layer fan-out for neighbor sampling
+        conv_first: bool = False,    # if True, run GCN on raw features then FC on seeds only
         **kwargs,
     ) -> None:
         super().__init__()
@@ -500,6 +503,14 @@ class GCNEncoder(nn.Module):
         self.num_hops: int = gcn_n_layers
         self._graph_initialized = False
 
+        # Neighbor sampling mode
+        self.sampling = sampling
+        self.fan_out = fan_out
+        self._neighbor_sampler = None  # built lazily in set_full_graph_data
+
+        # Conv-first mode: run GCN on raw features, then FC only on seeds
+        self.conv_first = conv_first
+
     @property
     def alpha(self) -> float:
         """Get the current alpha value (skip connection weight for self features)."""
@@ -548,10 +559,23 @@ class GCNEncoder(nn.Module):
         self.edge_index_full = edge_index_full.detach().cpu().contiguous()
         self.num_nodes = x_full.shape[0]
         self._graph_initialized = True
-        logger.info(
-            f"GCN graph initialized (CPU): {x_full.shape[0]} cells, "
-            f"{edge_index_full.shape[1]} edges, {self.num_hops}-hop subgraph sampling"
-        )
+
+        # Build neighbor sampler if requested
+        if self.sampling == "approx":
+            from omics_topic.utils.neighbor_sampler import NeighborSampler as _NS
+            fan_out = self.fan_out if self.fan_out is not None else [10] * self.num_hops
+            self._neighbor_sampler = _NS(
+                self.edge_index_full, self.num_nodes, fan_out=fan_out,
+            )
+            logger.info(
+                f"GCN graph initialized (CPU): {x_full.shape[0]} cells, "
+                f"{edge_index_full.shape[1]} edges, neighbor sampling fan_out={fan_out}"
+            )
+        else:
+            logger.info(
+                f"GCN graph initialized (CPU): {x_full.shape[0]} cells, "
+                f"{edge_index_full.shape[1]} edges, {self.num_hops}-hop exact subgraph sampling"
+            )
 
     def _mix_self_and_neighbors(self, h_self: torch.Tensor, h_nei: torch.Tensor) -> torch.Tensor:
         """
@@ -606,15 +630,20 @@ class GCNEncoder(nn.Module):
 
         device = self.mean_encoder.weight.device  # model's compute device
 
-        # ---- STEP 1: extract k-hop subgraph on CPU ----
+        # ---- STEP 1: extract subgraph on CPU ----
         batch_indices_cpu = batch_indices.detach().cpu().long()
-        subset, sub_edge_index, mapping, _ = k_hop_subgraph(
-            batch_indices_cpu,
-            num_hops=self.num_hops,
-            edge_index=self.edge_index_full,
-            relabel_nodes=True,
-            num_nodes=self.num_nodes,
-        )
+        if self._neighbor_sampler is not None:
+            subset, sub_edge_index, mapping = self._neighbor_sampler.sample(
+                batch_indices_cpu
+            )
+        else:
+            subset, sub_edge_index, mapping, _ = k_hop_subgraph(
+                batch_indices_cpu,
+                num_hops=self.num_hops,
+                edge_index=self.edge_index_full,
+                relabel_nodes=True,
+                num_nodes=self.num_nodes,
+            )
 
         # Move only the subgraph to the compute device
         x_sub = clamp_symmetric(self.x_full[subset].to(device))
@@ -622,29 +651,56 @@ class GCNEncoder(nn.Module):
         mapping = mapping.to(device)
 
         # ---- STEP 2: compute on subgraph ----
-        # Self path (scvi-style FCLayers)
-        h_self = clamp_symmetric(self.encoder(x_sub))
+        if self.conv_first:
+            # Conv-first: GCN on raw features (all subgraph nodes), then FC on seeds only.
+            # This is much faster because FC runs on batch_size nodes instead of
+            # the full subgraph (~30x savings on large graphs).
+            if self.pre_gcn_fc is not None:
+                h_nei = clamp_symmetric(self.pre_gcn_fc(x_sub))
+            else:
+                h_nei = x_sub
+            for i, (conv, bn) in enumerate(zip(self.convs, self.conv_bns, strict=False)):
+                h_nei = conv(h_nei, sub_edge_index)
+                h_nei = clamp_symmetric(bn(h_nei))
+                if i < len(self.convs) - 1:
+                    h_nei = clamp_symmetric(F.relu(h_nei))
+                    if self.gcn_dropout > 0:
+                        h_nei = F.dropout(
+                            h_nei, p=self.gcn_dropout, training=self.training
+                        )
 
-        # Neighbor aggregation path (stacked graph convs with BatchNorm)
-        if self.pre_gcn_fc is not None:
-            h_nei = clamp_symmetric(self.pre_gcn_fc(x_sub))
+            # Extract seeds BEFORE FC — FC only runs on batch_size nodes
+            h_nei_seeds = clamp_symmetric(self.nei_proj(h_nei[mapping]))
+            x_seeds = x_sub[mapping]
+            h_self_seeds = clamp_symmetric(self.encoder(x_seeds))
+
+            alpha = torch.sigmoid(self._alpha_logit)
+            h = clamp_symmetric(alpha * h_self_seeds + (1.0 - alpha) * h_nei_seeds)
         else:
-            h_nei = x_sub
-        for i, (conv, bn) in enumerate(zip(self.convs, self.conv_bns, strict=False)):
-            h_nei = conv(h_nei, sub_edge_index)
-            h_nei = clamp_symmetric(bn(h_nei))
-            if i < len(self.convs) - 1:
-                h_nei = clamp_symmetric(F.relu(h_nei))
-                if self.gcn_dropout > 0:
-                    h_nei = F.dropout(
-                        h_nei, p=self.gcn_dropout, training=self.training
-                    )
+            # Default: FC and GCN both run on full subgraph, then extract seeds.
+            # Self path (scvi-style FCLayers)
+            h_self = clamp_symmetric(self.encoder(x_sub))
 
-        # Mix self + neighbors (skip connection)
-        h_sub = clamp_symmetric(self._mix_self_and_neighbors(h_self, h_nei))
+            # Neighbor aggregation path (stacked graph convs with BatchNorm)
+            if self.pre_gcn_fc is not None:
+                h_nei = clamp_symmetric(self.pre_gcn_fc(x_sub))
+            else:
+                h_nei = x_sub
+            for i, (conv, bn) in enumerate(zip(self.convs, self.conv_bns, strict=False)):
+                h_nei = conv(h_nei, sub_edge_index)
+                h_nei = clamp_symmetric(bn(h_nei))
+                if i < len(self.convs) - 1:
+                    h_nei = clamp_symmetric(F.relu(h_nei))
+                    if self.gcn_dropout > 0:
+                        h_nei = F.dropout(
+                            h_nei, p=self.gcn_dropout, training=self.training
+                        )
 
-        # ---- STEP 3: extract seed-node representations ----
-        h = clamp_symmetric(h_sub[mapping])  # [batch_size, n_hidden]
+            # Mix self + neighbors (skip connection)
+            h_sub = clamp_symmetric(self._mix_self_and_neighbors(h_self, h_nei))
+
+            # Extract seed-node representations
+            h = clamp_symmetric(h_sub[mapping])  # [batch_size, n_hidden]
 
         # scvi-style mean/variance heads
         q_m = clamp_symmetric(self.mean_encoder(h))
@@ -1440,6 +1496,10 @@ class MultimodalLDAPyroGuide(PyroModule):
         # Spatial mode: "gcn" (default, trainable GCN/GAT) or "sgc" (STAMP-style precomputed)
         spatial_mode: str = "gcn",
         sgc_n_layers: int = 1,  # number of SGC hops (only used when spatial_mode="sgc")
+        # Neighbor sampling (only used when spatial_mode="gcn")
+        gcn_sampling: str = "approx",  # "approx" or "exact"
+        gcn_fan_out: list[int] | None = None,
+        gcn_conv_first: bool = False,
     ) -> None:
         super().__init__("multimodal_lda_guide")
         self.n_modalities = len(n_inputs_modalities)
@@ -1543,6 +1603,9 @@ class MultimodalLDAPyroGuide(PyroModule):
                             use_learned_alpha=gcn_use_learned_alpha,
                             n_cats_per_cov=None,
                             n_continuous_cov=n_continuous_cov,
+                            sampling=gcn_sampling,
+                            fan_out=gcn_fan_out,
+                            conv_first=gcn_conv_first,
                         )
                         for n_in in n_inputs_modalities
                     ]
@@ -2189,6 +2252,9 @@ class MultimodalAmortizedLDAPyroModule(PyroBaseModuleClass):
         att_dim: int = 32,
         spatial_mode: str = "gcn",
         sgc_n_layers: int = 1,
+        gcn_sampling: str = "approx",
+        gcn_fan_out: list[int] | None = None,
+        gcn_conv_first: bool = False,
     ):
         super().__init__()
         assert len(n_inputs_modalities) == len(likelihoods)
@@ -2291,6 +2357,9 @@ class MultimodalAmortizedLDAPyroModule(PyroBaseModuleClass):
             att_dim=att_dim,
             spatial_mode=spatial_mode,
             sgc_n_layers=sgc_n_layers,
+            gcn_sampling=gcn_sampling,
+            gcn_fan_out=gcn_fan_out,
+            gcn_conv_first=gcn_conv_first,
         )
 
         # We need this method so scvi training plan can create data-loader args

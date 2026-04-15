@@ -183,6 +183,9 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
         att_dim: int = 32,
         spatial_mode: str = "gcn",
         sgc_n_layers: int = 1,
+        gcn_sampling: str = "approx",
+        gcn_fan_out: list[int] | None = None,
+        gcn_conv_first: bool = False,
     ):
         """
         Initialize MultimodalAmortizedLDA with Mixture-of-Experts (MoE) architecture.
@@ -318,6 +321,10 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
 
         pyro.clear_param_store()
         super().__init__(adata)
+
+        # Resolve spatial_mode alias
+        if spatial_mode == "simplified":
+            spatial_mode = "sgc"
 
         # Resolve spatial metadata early so module/guide can consume it
         spatial_uns = self.adata.uns.get("_spatial_graph") or self.adata.uns.get("_spatial_graphs")
@@ -577,6 +584,9 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
             att_dim=att_dim,
             spatial_mode=spatial_mode,
             sgc_n_layers=sgc_n_layers,
+            gcn_sampling=gcn_sampling,
+            gcn_fan_out=gcn_fan_out,
+            gcn_conv_first=gcn_conv_first,
         )
 
         # For spatial models, initialise encoders with full-graph data
