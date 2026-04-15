@@ -37,6 +37,7 @@ optional-dependencies.spatial = [
   "squidpy>=1.6.6",
   "spatialdata-plot>=0.2.13",
   "torch-geometric",
+  "pyg-lib",
 ]
 
 optional-dependencies.dev = [
@@ -163,3 +164,6 @@ skip = [
   "docs/references.md",
   "docs/notebooks/example.ipynb",
 ]
+
+[tool.uv]
+find-links = ["https://data.pyg.org/whl/torch-2.7.0+cu126.html"]
