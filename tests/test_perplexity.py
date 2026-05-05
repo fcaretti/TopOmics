@@ -16,7 +16,7 @@ import anndata as ad
 import numpy as np
 import pytest
 
-from omics_topic.models import MultimodalAmortizedLDA
+from topomics.models import MultimodalAmortizedLDA
 
 
 # ---------------------------------------------------------------------------

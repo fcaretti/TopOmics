@@ -18,7 +18,7 @@ import pytest
 import torch
 import scipy.sparse as sp
 
-from omics_topic.models import MultimodalAmortizedLDA
+from topomics.models import MultimodalAmortizedLDA
 
 
 # ============================================================================

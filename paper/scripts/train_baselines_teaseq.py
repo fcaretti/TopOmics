@@ -3,7 +3,7 @@
 Training script for baseline models (MultiVI, MOFA+, GLUE) on TEA-seq dataset.
 
 This script trains multimodal integration methods for comparison:
-- MultiVI: Deep generative model for RNA + ATAC
+- MultiVI: Deep generative model for RNA + ATAC + Protein
 - MultiVI (linear decoder): MultiVI with linear decoders for all modalities
 - scvi-tools AmortizedLDA: RNA-only, ATAC-only, and protein-only topic models
 - MOFA+: Multi-Omics Factor Analysis (all modalities)
@@ -50,7 +50,7 @@ def parse_args():
     parser.add_argument(
         "--output_dir",
         type=str,
-        default="/data/omics_topic_models/teaseq/baselines",
+        default="/data/topomics_models/teaseq/baselines",
         help="Output directory for models"
     )
     parser.add_argument(
@@ -294,14 +294,14 @@ def _linearize_multivi_decoders(model, n_latent, output_dims=None):
 
 
 # =============================================================================
-# MultiVI (RNA + ATAC)
+# MultiVI (RNA + ATAC + Protein)
 # =============================================================================
 def train_multivi(mdata, n_latent, max_epochs, output_dir):
-    """Train MultiVI model on RNA + ATAC."""
+    """Train MultiVI model on RNA + ATAC + Protein."""
     import scvi
 
     print("\n" + "=" * 70)
-    print("Training MultiVI (RNA + ATAC)")
+    print("Training MultiVI (RNA + ATAC + Protein)")
     print("=" * 70)
 
     # Create a copy for MultiVI
@@ -310,16 +310,19 @@ def train_multivi(mdata, n_latent, max_epochs, output_dir):
     # MultiVI needs counts in .X
     mdata_multivi.mod['rna'].X = mdata_multivi.mod['rna'].layers['counts'].copy()
     mdata_multivi.mod['atac'].X = mdata_multivi.mod['atac'].layers['counts'].copy()
+    mdata_multivi.mod['prot'].X = mdata_multivi.mod['prot'].layers['counts'].copy()
 
-    # Setup MultiVI for RNA + ATAC
+    # Setup MultiVI for RNA + ATAC + Protein
     scvi.model.MULTIVI.setup_mudata(
         mdata_multivi,
         rna_layer=None,
         atac_layer=None,
+        protein_layer=None,
         batch_key=None,
         modalities={
             "rna_layer": "rna",
             "atac_layer": "atac",
+            "protein_layer": "prot",
         }
     )
 
@@ -343,43 +346,46 @@ def train_multivi(mdata, n_latent, max_epochs, output_dir):
     print(f"Latent shape: {latent.shape}")
 
     # Save model
-    model_path = os.path.join(output_dir, "multivi")
+    model_path = os.path.join(output_dir, "multivi_3mod")
     os.makedirs(model_path, exist_ok=True)
     model.save(model_path, overwrite=True)
     print(f"Model saved to: {model_path}")
 
     # Save latent representation
-    np.save(os.path.join(output_dir, "latent_multivi.npy"), latent)
+    np.save(os.path.join(output_dir, "latent_multivi_3mod.npy"), latent)
 
     # Save training history
-    _save_history(model.history, os.path.join(output_dir, "multivi_history.csv"))
+    _save_history(model.history, os.path.join(output_dir, "multivi_3mod_history.csv"))
 
     return latent, mdata_multivi
 
 
 # =============================================================================
-# MultiVI (linear decoder)
+# MultiVI (linear decoder, RNA + ATAC + Protein)
 # =============================================================================
 def train_multivi_linear(mdata, n_latent, max_epochs, output_dir):
     """Train MultiVI model with linear decoders for all modalities."""
     import scvi
 
     print("\n" + "=" * 70)
-    print("Training MultiVI Linear (RNA + ATAC)")
+    print("Training MultiVI Linear (RNA + ATAC + Protein)")
     print("=" * 70)
 
     mdata_multivi = mdata.copy()
     mdata_multivi.mod["rna"].X = mdata_multivi.mod["rna"].layers["counts"].copy()
     mdata_multivi.mod["atac"].X = mdata_multivi.mod["atac"].layers["counts"].copy()
+    mdata_multivi.mod["prot"].X = mdata_multivi.mod["prot"].layers["counts"].copy()
 
     scvi.model.MULTIVI.setup_mudata(
         mdata_multivi,
         rna_layer=None,
         atac_layer=None,
+        protein_layer=None,
         batch_key=None,
         modalities={
             "rna_layer": "rna",
             "atac_layer": "atac",
+            "protein_layer": "prot",
         },
     )
 
@@ -412,13 +418,13 @@ def train_multivi_linear(mdata, n_latent, max_epochs, output_dir):
     latent = model.get_latent_representation()
     print(f"Latent shape: {latent.shape}")
 
-    model_path = os.path.join(output_dir, "multivi_linear")
+    model_path = os.path.join(output_dir, "multivi_linear_3mod")
     os.makedirs(model_path, exist_ok=True)
     model.save(model_path, overwrite=True)
     print(f"Model saved to: {model_path}")
 
-    np.save(os.path.join(output_dir, "latent_multivi_linear.npy"), latent)
-    _save_history(model.history, os.path.join(output_dir, "multivi_linear_history.csv"))
+    np.save(os.path.join(output_dir, "latent_multivi_linear_3mod.npy"), latent)
+    _save_history(model.history, os.path.join(output_dir, "multivi_linear_3mod_history.csv"))
 
     return latent, mdata_multivi
 
@@ -670,7 +676,7 @@ def main():
 
     results = {}
 
-    # Train MultiVI (RNA + ATAC)
+    # Train MultiVI (RNA + ATAC + Protein)
     if not args.skip_multivi:
         try:
             latent, _ = train_multivi(
@@ -682,7 +688,7 @@ def main():
             import traceback
             traceback.print_exc()
 
-    # Train MultiVI Linear (RNA + ATAC)
+    # Train MultiVI Linear (RNA + ATAC + Protein)
     if not args.skip_multivi_linear:
         try:
             latent, _ = train_multivi_linear(

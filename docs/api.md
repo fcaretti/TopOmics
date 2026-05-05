@@ -3,8 +3,8 @@
 ## Preprocessing
 
 ```{eval-rst}
-.. module:: omics_topic.pp
-.. currentmodule:: omics_topic
+.. module:: topomics.pp
+.. currentmodule:: topomics
 
 .. autosummary::
     :toctree: generated
@@ -16,8 +16,8 @@
 ## Tools
 
 ```{eval-rst}
-.. module:: omics_topic.tl
-.. currentmodule:: omics_topic
+.. module:: topomics.tl
+.. currentmodule:: topomics
 
 .. autosummary::
     :toctree: generated
@@ -28,8 +28,8 @@
 ## Plotting
 
 ```{eval-rst}
-.. module:: omics_topic.pl
-.. currentmodule:: omics_topic
+.. module:: topomics.pl
+.. currentmodule:: topomics
 
 .. autosummary::
     :toctree: generated

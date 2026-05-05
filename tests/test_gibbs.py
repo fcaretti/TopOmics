@@ -9,7 +9,7 @@ import torch
 # ------------------------------------------------------------------ #
 try:
     # Adjust this import to your actual package layout if necessary
-    from omics_topic.models.gibbs_model import Gibbs_LDA_Multi
+    from topomics.models.gibbs_model import Gibbs_LDA_Multi
 except ModuleNotFoundError:
     Gibbs_LDA_Multi = None  # type: ignore
 
@@ -82,7 +82,7 @@ def test_fit_runs_and_accessors(synthetic_mdata, monkeypatch):
     model = _build_model(synthetic_mdata, K=4)
 
     # silence tqdm in test logs
-    monkeypatch.setattr("omics_topic.models.gibbs_model.tqdm", lambda x, *a, **k: x)
+    monkeypatch.setattr("topomics.models.gibbs_model.tqdm", lambda x, *a, **k: x)
 
     model.fit(
         batch_size=64,

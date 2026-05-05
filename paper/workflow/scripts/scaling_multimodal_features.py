@@ -1,7 +1,7 @@
 """
 Scaling benchmark: multimodal feature-fraction sweep on lymphoma RNA+ATAC.
 
-Trains MultiVI, OmicsTopic, and MOFA+ for increasing feature fractions
+Trains MultiVI, TopOmics, and MOFA+ for increasing feature fractions
 of a fixed-size dataset and records wall-clock training time.
 """
 import json
@@ -75,8 +75,8 @@ def train_multivi(mdata, n_topics, max_epochs, batch_size):
     return elapsed, n_epochs
 
 
-def train_omics_topic(mdata, n_topics, max_epochs, batch_size):
-    from omics_topic.models import MultimodalAmortizedLDA
+def train_topomics(mdata, n_topics, max_epochs, batch_size):
+    from topomics.models import MultimodalAmortizedLDA
     model = MultimodalAmortizedLDA.from_mudata(
         mdata, layer_dict={"rna": None, "atac": None},
         n_topics=n_topics, likelihoods=["gamma_poisson", "bernoulli"],
@@ -135,7 +135,7 @@ def main(snakemake):
     results = {
         "feature_fractions": [], "n_rna_features": [], "n_atac_features": [],
         "multivi_time": [], "multivi_epochs": [],
-        "omics_topic_time": [], "omics_topic_epochs": [],
+        "topomics_time": [], "topomics_epochs": [],
         "mofa_time": [], "mofa_factors": [],
         "n_topics": n_topics, "max_epochs": max_epochs,
     }
@@ -164,17 +164,17 @@ def main(snakemake):
             results["multivi_time"].append(None)
             results["multivi_epochs"].append(None)
 
-        # OmicsTopic
-        print("  Training OmicsTopic...", end=" ", flush=True)
+        # TopOmics
+        print("  Training TopOmics...", end=" ", flush=True)
         try:
-            t, ep = train_omics_topic(mdata, n_topics, max_epochs, batch_size)
+            t, ep = train_topomics(mdata, n_topics, max_epochs, batch_size)
             print(f"{t:.1f}s ({ep} epochs)")
-            results["omics_topic_time"].append(t)
-            results["omics_topic_epochs"].append(ep)
+            results["topomics_time"].append(t)
+            results["topomics_epochs"].append(ep)
         except Exception as e:
             print(f"FAILED: {e}")
-            results["omics_topic_time"].append(None)
-            results["omics_topic_epochs"].append(None)
+            results["topomics_time"].append(None)
+            results["topomics_epochs"].append(None)
 
         # MOFA+
         print("  Training MOFA+...", end=" ", flush=True)

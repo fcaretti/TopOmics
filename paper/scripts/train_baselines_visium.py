@@ -30,7 +30,7 @@ if not hasattr(np, "Inf"):
 warnings.filterwarnings("ignore")
 
 # Add sctm to path if needed
-SCRATCH_SITE_PACKAGES = "/scratch/fcaretti/omics_topic_uv/lib/python3.12/site-packages"
+SCRATCH_SITE_PACKAGES = "/scratch/fcaretti/topomics_uv/lib/python3.12/site-packages"
 if SCRATCH_SITE_PACKAGES not in sys.path:
     sys.path.insert(0, SCRATCH_SITE_PACKAGES)
 
@@ -54,7 +54,7 @@ def parse_args():
     parser.add_argument(
         "--output_dir",
         type=str,
-        default="/data/omics_topic_models/sctm_comparison/baselines",
+        default="/data/topomics_models/sctm_comparison/baselines",
         help="Output directory for models",
     )
     parser.add_argument(

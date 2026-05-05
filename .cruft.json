@@ -4,13 +4,13 @@
   "checkout": null,
   "context": {
     "cookiecutter": {
-      "project_name": "omics-topic",
-      "package_name": "omics_topic",
+      "project_name": "topomics",
+      "package_name": "topomics",
       "project_description": "Single-cell multiomics topic modeling",
       "author_full_name": "Federico Caretti",
       "author_email": "fcaretti@sissa.it",
       "github_user": "fcaretti",
-      "github_repo": "omics-topic",
+      "github_repo": "topomics",
       "license": "MIT License",
       "ide_integration": true,
       "_copy_without_render": [

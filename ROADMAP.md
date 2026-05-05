@@ -1,9 +1,9 @@
-# Omics-Topic
+# TopOmics
 
 The basic idea of the package is to be able to run topic modeling on any kind of (optionally spatial) multiomics data.
 In an analogy with standard topic models, cells/spots are documents, genes/proteins/chromatin accessibility areas are words, different modalities correspond to different "chapters" and the spatial information can be converted to a neighborhood graph, equivalent (although with very different statistics) to a citation network.
 
-The main content of the models is going to go in src/omics_topic/models, with some stuff that can go in src/omics_topic/module, especially NN architectures for the amortized models.
+The main content of the models is going to go in src/topomics/models, with some stuff that can go in src/topomics/module, especially NN architectures for the amortized models.
 
 So basically every model is going to inherit the class BaseTopicModel, that contains functions for the standard evaluation of topic models. 
 
@@ -53,9 +53,9 @@ So basically every model is going to inherit the class BaseTopicModel, that cont
       - Avoids expensive recomputations when calling same metric multiple times
     - [ ] Coherence with paths (future work)
 - [X] Add support for spatial data in AmortizedLDA
-  - [X] Update `MultimodalAmortizedLDA.setup_anndata/setup_mudata/from_mudata` in `src/omics_topic/models/amortizedLDA.py` to accept `spatial_key`/`spatial_modality_keys`, call the helper, and store resolved graph + metadata in `adata.uns` / `mdata.uns`
+  - [X] Update `MultimodalAmortizedLDA.setup_anndata/setup_mudata/from_mudata` in `src/topomics/models/amortizedLDA.py` to accept `spatial_key`/`spatial_modality_keys`, call the helper, and store resolved graph + metadata in `adata.uns` / `mdata.uns`
   - [X] Let `MultimodalAmortizedLDA.__init__` (same file) pick up the stored graph handle and propagate adjacency to the Pyro module; error if the requested `spatial_key` is missing
-  - [X] Add GCN encoder branch in `MultimodalLDAPyroGuide` (in `src/omics_topic/module/_amortizedLDA.py`) that is automatically used when spatial graphs are present (no user flag), otherwise fall back to MLP encoders
+  - [X] Add GCN encoder branch in `MultimodalLDAPyroGuide` (in `src/topomics/module/_amortizedLDA.py`) that is automatically used when spatial graphs are present (no user flag), otherwise fall back to MLP encoders
   - [X] Convert stored CSR adjacency from `adata.uns["_spatial_graph"]` / `["_spatial_graphs"]` into device-ready `edge_index` (+ weights) tensors for the guide; support modality-specific graphs
   - [X] Ensure the data loader / guide path passes adjacency to the GCN (full-batch or documented constraint) and raises if spatial graph is missing when required
   - [X] Add dependency handling for GCN backend (`torch_geometric` or minimal torch-sparse stack) under the spatial extra in `pyproject.toml`
@@ -99,8 +99,8 @@ So basically every model is going to inherit the class BaseTopicModel, that cont
   - Problem: Makes cell collapse WORSE (all cells become equally diverse)
 
   **Implemented in:**
-  - [X] `src/omics_topic/models/amortizedLDA.py` - parameter passing
-  - [X] `src/omics_topic/module/_amortizedLDA.py` - computation and pyro.factor
+  - [X] `src/topomics/models/amortizedLDA.py` - parameter passing
+  - [X] `src/topomics/module/_amortizedLDA.py` - computation and pyro.factor
   - [X] `tests/test_amortized.py` - comprehensive tests
 
   **TODO - Rename existing implementation:**
@@ -126,7 +126,7 @@ So basically every model is going to inherit the class BaseTopicModel, that cont
 
   **Implementation Steps:**
 
-  1. **Add `topic_variance_weight` hyperparameter** [Files: `src/omics_topic/models/amortizedLDA.py`]
+  1. **Add `topic_variance_weight` hyperparameter** [Files: `src/topomics/models/amortizedLDA.py`]
      - [X] Add `topic_variance_weight: float = 0.0` parameter to `MultimodalAmortizedLDA.__init__()` (line ~158, after entropy_weight)
      - [X] Pass to module: store in `self.module.topic_variance_weight`
      - [X] Add docstring:
@@ -139,14 +139,14 @@ So basically every model is going to inherit the class BaseTopicModel, that cont
            Typical values: 1.0-10.0 (higher than entropy_weight because variance is smaller).
        ```
 
-  2. **Store topic_variance_weight in Pyro module and guide** [Files: `src/omics_topic/module/_amortizedLDA.py`]
+  2. **Store topic_variance_weight in Pyro module and guide** [Files: `src/topomics/module/_amortizedLDA.py`]
      - [X] Add parameter to `MultimodalAmortizedLDAPyroModule.__init__()` (line ~967)
      - [X] Store as `self.topic_variance_weight = topic_variance_weight`
      - [X] Pass to guide: Add parameter to `MultimodalLDAPyroGuide.__init__()` (line ~561)
      - [X] Store in guide as `self.topic_variance_weight = topic_variance_weight`
      - [X] Initialize tracking: `self._last_topic_variance = None`
 
-  3. **Compute topic variance in guide.forward()** [Files: `src/omics_topic/module/_amortizedLDA.py`]
+  3. **Compute topic variance in guide.forward()** [Files: `src/topomics/module/_amortizedLDA.py`]
      - [X] Location: In `MultimodalLDAPyroGuide.forward()` OUTSIDE the `pyro.plate("cells", ...)` context
      - [X] After computing `theta = F.softmax(log_theta, dim=-1)` (if entropy regularization is active)
      - [X] **If entropy_weight == 0, still need to compute theta:**
@@ -187,7 +187,7 @@ So basically every model is going to inherit the class BaseTopicModel, that cont
            pyro.factor("topic_variance_bonus", self.topic_variance_weight * topic_variance.sum(), has_rsample=True)
        ```
 
-  5. **Add API methods** [Files: `src/omics_topic/module/_amortizedLDA.py`, `src/omics_topic/models/amortizedLDA.py`]
+  5. **Add API methods** [Files: `src/topomics/module/_amortizedLDA.py`, `src/topomics/models/amortizedLDA.py`]
      - [X] **Module level** (in `MultimodalAmortizedLDAPyroModule`):
        - Add `get_last_topic_variance()` → returns `self.guide._last_topic_variance`
        - Add `get_topic_variance(x, libs)` → computes variance from data
@@ -196,7 +196,7 @@ So basically every model is going to inherit the class BaseTopicModel, that cont
        - Add `get_last_topic_variance()` → returns last computed variance
        - Add `get_topic_variance()` → computes per-topic variance across all cells
 
-  6. **Update validation logging** [Files: `src/omics_topic/utils/training_plan.py`]
+  6. **Update validation logging** [Files: `src/topomics/utils/training_plan.py`]
      - [X] In `validation_step()`, after entropy logging, add:
        ```python
        if hasattr(self.module, 'guide') and hasattr(self.module.guide, '_last_topic_variance'):

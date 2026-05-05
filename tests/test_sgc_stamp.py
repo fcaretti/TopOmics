@@ -4,7 +4,7 @@ import pytest
 import scipy.sparse as sp
 import torch
 
-from omics_topic.module._amortizedLDA import precompute_sgc, SGCEncoder
+from topomics.module._amortizedLDA import precompute_sgc, SGCEncoder
 
 
 # ---------------------------------------------------------------------------
@@ -111,7 +111,7 @@ def test_sgcencoder_not_initialized_raises():
 
 def test_sgc_model_creation():
     """Test that the full model can be created with spatial_mode='sgc'."""
-    from omics_topic import MultimodalAmortizedLDA
+    from topomics import MultimodalAmortizedLDA
     import anndata
     import squidpy as sq
 
@@ -145,7 +145,7 @@ def test_sgc_model_creation():
 
 def test_sgc_model_train_smoke():
     """Smoke test: train for a few steps with spatial_mode='sgc'."""
-    from omics_topic import MultimodalAmortizedLDA
+    from topomics import MultimodalAmortizedLDA
     import anndata
     import squidpy as sq
 
