@@ -4,7 +4,7 @@ import pytest
 import torch
 from torch import Tensor
 
-from omics_topic.models import SVEM_LDA_Multi
+from topomics.models import SVEM_LDA_Multi
 
 # ---------------------------------------------------------------------
 

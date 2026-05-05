@@ -25,7 +25,7 @@ import pandas as pd
 import scanpy as sc
 from sklearn.metrics import adjusted_rand_score, normalized_mutual_info_score
 
-from omics_topic.models.amortizedLDA import MultimodalAmortizedLDA
+from topomics.models.amortizedLDA import MultimodalAmortizedLDA
 
 warnings.filterwarnings('ignore', message='.*was not registered in the param store.*')
 warnings.filterwarnings('ignore', message='.*Found plate statements in guide but not model.*')
@@ -54,7 +54,7 @@ def parse_args():
     parser.add_argument("--data_path", type=str,
                         default="/tmp/mouse_brain_data/ATAC_RNA_Seq_MouseBrain_RNA_ATAC.h5")
     parser.add_argument("--output_dir", type=str,
-                        default="/data/omics_topic_models/mouse_brain_gaussian")
+                        default="/data/topomics_models/mouse_brain_gaussian")
     return parser.parse_args()
 
 

@@ -22,7 +22,7 @@ import pandas as pd
 import scanpy as sc
 import squidpy as sq
 
-from omics_topic.models.amortizedLDA import MultimodalAmortizedLDA
+from topomics.models.amortizedLDA import MultimodalAmortizedLDA
 
 warnings.filterwarnings('ignore', message='.*was not registered in the param store.*')
 warnings.filterwarnings('ignore', message='.*Found plate statements in guide but not model.*')
@@ -99,7 +99,7 @@ def parse_args():
     parser.add_argument(
         "--output_dir",
         type=str,
-        default="/data/omics_topic_models/sctm_comparison",
+        default="/data/topomics_models/sctm_comparison",
         help="Output directory for model and plots"
     )
     return parser.parse_args()

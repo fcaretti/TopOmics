@@ -22,7 +22,7 @@ import scanpy as sc
 import seaborn as sns
 import anndata as ad
 
-from omics_topic import MultimodalAmortizedLDA
+from topomics import MultimodalAmortizedLDA
 
 warnings.filterwarnings('ignore', message='.*was not registered in the param store.*')
 warnings.filterwarnings('ignore', message='.*Found plate statements in guide but not model.*')
@@ -102,7 +102,7 @@ def parse_args():
     parser.add_argument(
         "--output_dir",
         type=str,
-        default="/data/omics_topic_models/teaseq",
+        default="/data/topomics_models/teaseq",
         help="Output directory for model and plots"
     )
     return parser.parse_args()

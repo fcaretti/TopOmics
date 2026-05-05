@@ -4,7 +4,7 @@ Generate individual figure files for the retina batch correction comparison.
 Reproduces all plots from retina_batch_correction_comparison.ipynb,
 saving each image as a separate file.
 
-Output directory: /data/omics_topic_models/figures/retina/
+Output directory: /data/topomics_models/figures/retina/
 """
 
 import numpy as np
@@ -26,7 +26,7 @@ from sklearn.metrics import (
 # Config
 # ---------------------------------------------------------------------------
 DATA_DIR = Path("/data/retina_dataset")
-FIG_DIR = Path("/data/omics_topic_models/figures/retina")
+FIG_DIR = Path("/data/topomics_models/figures/retina")
 FIG_DIR.mkdir(parents=True, exist_ok=True)
 
 sc.set_figure_params(dpi=100, frameon=False, figsize=(8, 6))
@@ -36,11 +36,11 @@ SAVE_KW = dict(dpi=300, bbox_inches="tight")
 
 # Pretty display names for the methods
 DISPLAY_NAMES = {
-    "X_omics_topic_encode_True": "omics-topic (encode=True)",
-    "X_omics_topic_encode_False": "omics-topic (encode=False)",
+    "X_topomics_encode_True": "topomics (encode=True)",
+    "X_topomics_encode_False": "topomics (encode=False)",
     "X_scvi": "scVI",
     "X_linear_scvi": "LinearSCVI",
-    "X_omics_topic_no_batch": "omics-topic (no batch)",
+    "X_topomics_no_batch": "topomics (no batch)",
     "X_scvi_no_batch": "scVI (no batch)",
     "X_linear_scvi_no_batch": "LinearSCVI (no batch)",
 }
@@ -80,11 +80,11 @@ adata = sc.read_h5ad(DATA_DIR / "retina_preprocessed.h5ad")
 print(f"Data shape: {adata.shape}")
 
 rep_sources = {
-    "X_omics_topic_encode_True": "retina_with_omics_topic.h5ad",
-    "X_omics_topic_encode_False": "retina_with_omics_topic.h5ad",
+    "X_topomics_encode_True": "retina_with_topomics.h5ad",
+    "X_topomics_encode_False": "retina_with_topomics.h5ad",
     "X_scvi": "retina_with_scvi.h5ad",
     "X_linear_scvi": "retina_with_linear_scvi.h5ad",
-    "X_omics_topic_no_batch": "retina_with_omics_topic_no_batch.h5ad",
+    "X_topomics_no_batch": "retina_with_topomics_no_batch.h5ad",
     "X_scvi_no_batch": "retina_with_scvi_no_batch.h5ad",
     "X_linear_scvi_no_batch": "retina_with_linear_scvi_no_batch.h5ad",
 }
