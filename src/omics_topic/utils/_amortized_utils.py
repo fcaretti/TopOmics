@@ -9,6 +9,7 @@ from __future__ import annotations
 import numpy as np
 import scipy.sparse as sp
 import torch
+import torch.nn as nn
 
 CLAMP_EPS = 10e-6
 CLAMP_MAX = 1.0 / CLAMP_EPS
@@ -175,3 +176,68 @@ def precompute_sgc(
     sgc_x = torch.cat(sgc, dim=1)
     sgc_x = torch.log(sgc_x + 1)
     return sgc_x
+
+
+class AttentionAggregator(nn.Module):
+    """
+    SpatialGlue-style single-head attention for mixing M modality encoder outputs.
+
+    Computes per-cell, input-dependent mixing weights alpha (B, M) from the
+    encoder means, then applies them as weights in the Gaussian mixture. This
+    is more expressive than MoE because the weight of each modality depends on
+    what each encoder actually produced for that cell.
+
+    Parameters
+    ----------
+    n_topics
+        Dimensionality of each modality embedding (= n_topics in latent space).
+    att_dim
+        Projection dimension for the attention key/value (default: 32).
+
+    Notes
+    -----
+    Missing modalities are handled by masking attention logits to -inf before
+    softmax, the same strategy used by masked_softmax in the MoE path. However,
+    if all modalities are missing for a cell the result is undefined (shouldn't
+    happen in practice). Unlike MoE, this method requires all attending modalities
+    to share the same latent dimensionality (n_topics), which is already the case.
+
+    References
+    ----------
+    Tang et al. (2023), "SpatialGlue: Deciphering multi-modal spatial omics
+    integration" – between-modality attention mechanism.
+    """
+
+    def __init__(self, n_topics: int, att_dim: int = 32) -> None:
+        super().__init__()
+        self.w_omega = nn.Parameter(torch.empty(n_topics, att_dim))
+        self.u_omega = nn.Parameter(torch.empty(att_dim, 1))
+        nn.init.xavier_uniform_(self.w_omega.unsqueeze(0))
+        nn.init.xavier_uniform_(self.u_omega.unsqueeze(0))
+
+    def forward(self, mus: torch.Tensor, masks: torch.Tensor) -> torch.Tensor:
+        """
+        Compute attention mixing weights.
+
+        Parameters
+        ----------
+        mus : (M, B, K)
+            Per-modality encoder means.
+        masks : (M, B)
+            1 if modality present for that cell, 0 if absent.
+
+        Returns
+        -------
+        w : (M, B, 1)
+            Per-cell mixing weights summing to 1 over M (absent modalities = 0).
+        """
+        emb = mus.permute(1, 0, 2)              # (B, M, K)
+        v = torch.tanh(emb @ self.w_omega)       # (B, M, att_dim)
+        vu = (v @ self.u_omega).squeeze(-1)      # (B, M)
+
+        # Mask absent modalities before softmax
+        masks_BM = masks.T                       # (B, M)
+        vu = vu.masked_fill(~masks_BM.bool(), -CLAMP_MAX)
+        alpha = torch.softmax(vu, dim=1)         # (B, M)
+
+        return alpha.T.unsqueeze(-1)             # (M, B, 1)
