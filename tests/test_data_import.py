@@ -5,14 +5,14 @@ import pytest
 from anndata import AnnData
 from mudata import MuData
 
-from omics_topic.data import (
+from topomics.data import (
     detect_data_type,
     extract_from_adata_dict,
     extract_from_anndata,
     extract_from_mudata,
     validate_data_type,
 )
-from omics_topic.models import MultimodalAmortizedLDA
+from topomics.models import MultimodalAmortizedLDA
 
 
 @pytest.fixture

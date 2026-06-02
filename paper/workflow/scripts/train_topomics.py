@@ -18,7 +18,7 @@ warnings.filterwarnings("ignore", message=".*Found plate statements in guide but
 sys.path.insert(0, os.path.dirname(__file__))
 from preprocess_data import load_dataset
 
-from omics_topic import MultimodalAmortizedLDA
+from topomics import MultimodalAmortizedLDA
 
 
 def main(snakemake):

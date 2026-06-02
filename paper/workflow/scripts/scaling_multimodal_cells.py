@@ -23,7 +23,7 @@ SHARE_TOPIC_N_SAMPLES = 200
 
 def fit_share_topic(rna_path, atac_path, model_path, n_topics):
     import anndata as ad
-    from omics_topic.models.share_topic import ShareTopic_LDA_Multi
+    from topomics.models.share_topic import ShareTopic_LDA_Multi
 
     print("Fitting SHARE-Topic on lymphoma data...")
     rna = ad.read_h5ad(rna_path)
@@ -43,7 +43,7 @@ def fit_share_topic(rna_path, atac_path, model_path, n_topics):
 def generate_synthetic(model_path, rna_orig_path, atac_orig_path, out_dir, n_cells, seed):
     import anndata as ad
     import torch
-    from omics_topic.models.share_topic import ShareTopic_LDA_Multi
+    from topomics.models.share_topic import ShareTopic_LDA_Multi
 
     rna_path = os.path.join(out_dir, f"synth_rna_{n_cells}.h5ad")
     atac_path = os.path.join(out_dir, f"synth_atac_{n_cells}.h5ad")
@@ -112,7 +112,7 @@ def train_multivi(mdata, n_topics, max_epochs, batch_size):
 
 
 def train_omics_topic(mdata, n_topics, max_epochs, batch_size):
-    from omics_topic.models import MultimodalAmortizedLDA
+    from topomics.models import MultimodalAmortizedLDA
     model = MultimodalAmortizedLDA.from_mudata(
         mdata, layer_dict={"rna": None, "atac": None},
         n_topics=n_topics, likelihoods=["gamma_poisson", "bernoulli"],

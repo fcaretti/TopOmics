@@ -3,7 +3,7 @@ build-backend = "hatchling.build"
 requires = [ "hatchling" ]
 
 [project]
-name = "omics-topic"
+name = "topomics"
 version = "0.0.1"
 description = "Single-cell multiomics topic modeling"
 readme = "README.md"
@@ -66,9 +66,9 @@ optional-dependencies.test = [
   "pytest",
 ]
 # https://docs.pypi.org/project_metadata/#project-urls
-urls.Documentation = "https://omics-topic.readthedocs.io/"
-urls.Homepage = "https://github.com/fcaretti/omics-topic"
-urls.Source = "https://github.com/fcaretti/omics-topic"
+urls.Documentation = "https://topomics.readthedocs.io/"
+urls.Homepage = "https://github.com/fcaretti/topomics"
+urls.Source = "https://github.com/fcaretti/topomics"
 
 [tool.hatch.envs.default]
 installer = "uv"
@@ -148,7 +148,7 @@ addopts = [
 ]
 
 [tool.coverage.run]
-source = [ "omics_topic" ]
+source = [ "topomics" ]
 omit = [
   "**/test_*.py",
 ]

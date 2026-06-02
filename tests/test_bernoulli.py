@@ -18,7 +18,7 @@ import numpy as np
 import pytest
 import torch
 
-from omics_topic.models import MultimodalAmortizedLDA
+from topomics.models import MultimodalAmortizedLDA
 
 
 # ============================================================================
