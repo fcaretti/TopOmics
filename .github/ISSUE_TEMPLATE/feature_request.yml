@@ -1,5 +1,5 @@
 name: Feature request
-description: Propose a new feature for omics-topic
+description: Propose a new feature for topomics
 labels: enhancement
 body:
   - type: textarea

@@ -28,7 +28,7 @@ except ImportError as err:
         "or `uv pip install scvelo`."
     ) from err
 
-from omics_topic.models.amortizedLDA import MultimodalAmortizedLDA
+from topomics.models.amortizedLDA import MultimodalAmortizedLDA
 
 warnings.filterwarnings("ignore", message=".*was not registered in the param store.*")
 warnings.filterwarnings("ignore", message=".*Found plate statements in guide but not model.*")

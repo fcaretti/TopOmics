@@ -36,11 +36,11 @@ SAVE_KW = dict(dpi=300, bbox_inches="tight")
 
 # Pretty display names for the methods
 DISPLAY_NAMES = {
-    "X_omics_topic_encode_True": "omics-topic (encode=True)",
-    "X_omics_topic_encode_False": "omics-topic (encode=False)",
+    "X_omics_topic_encode_True": "topomics (encode=True)",
+    "X_omics_topic_encode_False": "topomics (encode=False)",
     "X_scvi": "scVI",
     "X_linear_scvi": "LinearSCVI",
-    "X_omics_topic_no_batch": "omics-topic (no batch)",
+    "X_omics_topic_no_batch": "topomics (no batch)",
     "X_scvi_no_batch": "scVI (no batch)",
     "X_linear_scvi_no_batch": "LinearSCVI (no batch)",
 }

@@ -1,5 +1,5 @@
 """
-Train omics-topic on retina dataset with batch correction.
+Train topomics on retina dataset with batch correction.
 
 This script trains up to three variants:
 1. encode_covariates=True (default): Batch correction in encoder + decoder
@@ -16,7 +16,7 @@ import scanpy as sc
 import scvi
 from anndata import AnnData
 
-from omics_topic.models import MultimodalAmortizedLDA
+from topomics.models import MultimodalAmortizedLDA
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -87,7 +87,7 @@ def train_omics_topic(
     seed: int = 42
 ) -> MultimodalAmortizedLDA:
     """
-    Train omics-topic model with or without batch correction.
+    Train topomics model with or without batch correction.
 
     Parameters
     ----------
@@ -123,9 +123,9 @@ def train_omics_topic(
     adata_hvg.X = adata_hvg.layers["counts"]
 
     if batch_correction:
-        logger.info(f"Training omics-topic (encode_covariates={encode_covariates})...")
+        logger.info(f"Training topomics (encode_covariates={encode_covariates})...")
     else:
-        logger.info("Training omics-topic (no batch correction)...")
+        logger.info("Training topomics (no batch correction)...")
     logger.info(f"Data shape: {adata_hvg.shape}")
 
     # Setup data
@@ -190,7 +190,7 @@ def train_omics_topic(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Train omics-topic on retina dataset")
+    parser = argparse.ArgumentParser(description="Train topomics on retina dataset")
     parser.add_argument(
         "--data_path",
         type=str,
@@ -257,7 +257,7 @@ def main():
     # Train model(s)
     if args.encode_covariates in ["true", "both"]:
         logger.info("\n" + "="*80)
-        logger.info("Training omics-topic with encode_covariates=True")
+        logger.info("Training topomics with encode_covariates=True")
         logger.info("="*80 + "\n")
         model_true = train_omics_topic(
             adata,
@@ -271,7 +271,7 @@ def main():
 
     if args.encode_covariates in ["false", "both"]:
         logger.info("\n" + "="*80)
-        logger.info("Training omics-topic with encode_covariates=False")
+        logger.info("Training topomics with encode_covariates=False")
         logger.info("="*80 + "\n")
         model_false = train_omics_topic(
             adata,
@@ -285,7 +285,7 @@ def main():
 
     if args.encode_covariates == "none":
         logger.info("\n" + "="*80)
-        logger.info("Training omics-topic without batch correction")
+        logger.info("Training topomics without batch correction")
         logger.info("="*80 + "\n")
         model_no_batch = train_omics_topic(
             adata,

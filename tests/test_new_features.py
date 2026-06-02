@@ -19,7 +19,7 @@ import torch
 import anndata as ad
 import mudata as mu
 
-from omics_topic.models import MultimodalAmortizedLDA
+from topomics.models import MultimodalAmortizedLDA
 
 
 # ---------------------------------------------------------------------------
@@ -102,7 +102,7 @@ class TestAttentionAggregation:
 
     def test_attention_weights_sum_to_one(self, multimodal_adata):
         """Attention weights should sum to 1 per cell across modalities."""
-        from omics_topic.module._amortizedLDA import AttentionAggregator
+        from topomics.module._amortizedLDA import AttentionAggregator
         adata, N, F1, F2 = multimodal_adata
         agg = AttentionAggregator(n_topics=5, att_dim=16)
 
@@ -118,7 +118,7 @@ class TestAttentionAggregation:
 
     def test_attention_masks_absent_modality(self):
         """Absent modalities (mask=0) should receive zero attention weight."""
-        from omics_topic.module._amortizedLDA import AttentionAggregator
+        from topomics.module._amortizedLDA import AttentionAggregator
         agg = AttentionAggregator(n_topics=5, att_dim=16)
 
         M, B, K = 2, 4, 5

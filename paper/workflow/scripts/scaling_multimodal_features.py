@@ -76,7 +76,7 @@ def train_multivi(mdata, n_topics, max_epochs, batch_size):
 
 
 def train_omics_topic(mdata, n_topics, max_epochs, batch_size):
-    from omics_topic.models import MultimodalAmortizedLDA
+    from topomics.models import MultimodalAmortizedLDA
     model = MultimodalAmortizedLDA.from_mudata(
         mdata, layer_dict={"rna": None, "atac": None},
         n_topics=n_topics, likelihoods=["gamma_poisson", "bernoulli"],

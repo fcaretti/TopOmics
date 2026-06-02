@@ -2039,88 +2039,6 @@ wheels = [
 ]
 
 [[package]]
-name = "omics-topic"
-version = "0.0.1"
-source = { editable = "." }
-dependencies = [
-    { name = "anndata" },
-    { name = "muon" },
-    { name = "numpy" },
-    { name = "pyro-ppl" },
-    { name = "scanpy" },
-    { name = "scvi-tools" },
-    { name = "session-info2" },
-    { name = "torch" },
-]
-
-[package.optional-dependencies]
-dev = [
-    { name = "pre-commit" },
-    { name = "twine" },
-]
-doc = [
-    { name = "docutils" },
-    { name = "ipykernel" },
-    { name = "ipython" },
-    { name = "myst-nb" },
-    { name = "pandas" },
-    { name = "setuptools" },
-    { name = "sphinx" },
-    { name = "sphinx-autodoc-typehints" },
-    { name = "sphinx-book-theme" },
-    { name = "sphinx-copybutton" },
-    { name = "sphinx-tabs" },
-    { name = "sphinxcontrib-bibtex" },
-    { name = "sphinxext-opengraph" },
-]
-spatial = [
-    { name = "pyg-lib" },
-    { name = "spatialdata" },
-    { name = "spatialdata-plot" },
-    { name = "squidpy" },
-    { name = "torch-geometric" },
-]
-test = [
-    { name = "coverage" },
-    { name = "pytest" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "anndata", specifier = ">=0.12.0" },
-    { name = "coverage", marker = "extra == 'test'" },
-    { name = "docutils", marker = "extra == 'doc'", specifier = ">=0.8,!=0.18.*,!=0.19.*" },
-    { name = "ipykernel", marker = "extra == 'doc'" },
-    { name = "ipython", marker = "extra == 'doc'" },
-    { name = "muon" },
-    { name = "myst-nb", marker = "extra == 'doc'", specifier = ">=1.1" },
-    { name = "numpy", specifier = ">=1.24,<2.3" },
-    { name = "pandas", marker = "extra == 'doc'" },
-    { name = "pre-commit", marker = "extra == 'dev'" },
-    { name = "pyg-lib", marker = "extra == 'spatial'" },
-    { name = "pyro-ppl" },
-    { name = "pytest", marker = "extra == 'test'" },
-    { name = "scanpy", specifier = ">=1.9.8" },
-    { name = "scvi-tools" },
-    { name = "session-info2" },
-    { name = "setuptools", marker = "extra == 'doc'" },
-    { name = "spatialdata", marker = "extra == 'spatial'", specifier = ">=0.6.1" },
-    { name = "spatialdata-plot", marker = "extra == 'spatial'", specifier = ">=0.2.13" },
-    { name = "sphinx", marker = "extra == 'doc'", specifier = ">=8.1" },
-    { name = "sphinx-autodoc-typehints", marker = "extra == 'doc'" },
-    { name = "sphinx-book-theme", marker = "extra == 'doc'", specifier = ">=1" },
-    { name = "sphinx-copybutton", marker = "extra == 'doc'" },
-    { name = "sphinx-tabs", marker = "extra == 'doc'" },
-    { name = "sphinxcontrib-bibtex", marker = "extra == 'doc'", specifier = ">=1" },
-    { name = "sphinxext-opengraph", marker = "extra == 'doc'" },
-    { name = "squidpy", marker = "extra == 'spatial'", specifier = ">=1.6.6" },
-    { name = "torch" },
-    { name = "torch-geometric", marker = "extra == 'spatial'" },
-    { name = "twine", marker = "extra == 'dev'", specifier = ">=4.0.2" },
-]
-provides-extras = ["spatial", "dev", "doc", "test"]
-
-[[package]]
 name = "omnipath"
 version = "1.0.12"
 source = { registry = "https://pypi.org/simple" }
@@ -3723,6 +3641,88 @@ sdist = { url = "https://files.pythonhosted.org/packages/11/d6/114b492226588d6ff
 wheels = [
     { url = "https://files.pythonhosted.org/packages/fb/12/5911ae3eeec47800503a238d971e51722ccea5feb8569b735184d5fcdbc0/toolz-1.1.0-py3-none-any.whl", hash = "sha256:15ccc861ac51c53696de0a5d6d4607f99c210739caf987b5d2054f3efed429d8", size = 58093, upload-time = "2025-10-17T04:03:20.435Z" },
 ]
+
+[[package]]
+name = "topomics"
+version = "0.0.1"
+source = { editable = "." }
+dependencies = [
+    { name = "anndata" },
+    { name = "muon" },
+    { name = "numpy" },
+    { name = "pyro-ppl" },
+    { name = "scanpy" },
+    { name = "scvi-tools" },
+    { name = "session-info2" },
+    { name = "torch" },
+]
+
+[package.optional-dependencies]
+dev = [
+    { name = "pre-commit" },
+    { name = "twine" },
+]
+doc = [
+    { name = "docutils" },
+    { name = "ipykernel" },
+    { name = "ipython" },
+    { name = "myst-nb" },
+    { name = "pandas" },
+    { name = "setuptools" },
+    { name = "sphinx" },
+    { name = "sphinx-autodoc-typehints" },
+    { name = "sphinx-book-theme" },
+    { name = "sphinx-copybutton" },
+    { name = "sphinx-tabs" },
+    { name = "sphinxcontrib-bibtex" },
+    { name = "sphinxext-opengraph" },
+]
+spatial = [
+    { name = "pyg-lib" },
+    { name = "spatialdata" },
+    { name = "spatialdata-plot" },
+    { name = "squidpy" },
+    { name = "torch-geometric" },
+]
+test = [
+    { name = "coverage" },
+    { name = "pytest" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "anndata", specifier = ">=0.12.0" },
+    { name = "coverage", marker = "extra == 'test'" },
+    { name = "docutils", marker = "extra == 'doc'", specifier = ">=0.8,!=0.18.*,!=0.19.*" },
+    { name = "ipykernel", marker = "extra == 'doc'" },
+    { name = "ipython", marker = "extra == 'doc'" },
+    { name = "muon" },
+    { name = "myst-nb", marker = "extra == 'doc'", specifier = ">=1.1" },
+    { name = "numpy", specifier = ">=1.24,<2.3" },
+    { name = "pandas", marker = "extra == 'doc'" },
+    { name = "pre-commit", marker = "extra == 'dev'" },
+    { name = "pyg-lib", marker = "extra == 'spatial'" },
+    { name = "pyro-ppl" },
+    { name = "pytest", marker = "extra == 'test'" },
+    { name = "scanpy", specifier = ">=1.9.8" },
+    { name = "scvi-tools" },
+    { name = "session-info2" },
+    { name = "setuptools", marker = "extra == 'doc'" },
+    { name = "spatialdata", marker = "extra == 'spatial'", specifier = ">=0.6.1" },
+    { name = "spatialdata-plot", marker = "extra == 'spatial'", specifier = ">=0.2.13" },
+    { name = "sphinx", marker = "extra == 'doc'", specifier = ">=8.1" },
+    { name = "sphinx-autodoc-typehints", marker = "extra == 'doc'" },
+    { name = "sphinx-book-theme", marker = "extra == 'doc'", specifier = ">=1" },
+    { name = "sphinx-copybutton", marker = "extra == 'doc'" },
+    { name = "sphinx-tabs", marker = "extra == 'doc'" },
+    { name = "sphinxcontrib-bibtex", marker = "extra == 'doc'", specifier = ">=1" },
+    { name = "sphinxext-opengraph", marker = "extra == 'doc'" },
+    { name = "squidpy", marker = "extra == 'spatial'", specifier = ">=1.6.6" },
+    { name = "torch" },
+    { name = "torch-geometric", marker = "extra == 'spatial'" },
+    { name = "twine", marker = "extra == 'dev'", specifier = ">=4.0.2" },
+]
+provides-extras = ["spatial", "dev", "doc", "test"]
 
 [[package]]
 name = "torch"

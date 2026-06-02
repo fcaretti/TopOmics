@@ -25,7 +25,7 @@ import pandas as pd
 import scanpy as sc
 from sklearn.metrics import adjusted_rand_score, normalized_mutual_info_score
 
-from omics_topic.models.amortizedLDA import MultimodalAmortizedLDA
+from topomics.models.amortizedLDA import MultimodalAmortizedLDA
 
 warnings.filterwarnings('ignore', message='.*was not registered in the param store.*')
 warnings.filterwarnings('ignore', message='.*Found plate statements in guide but not model.*')

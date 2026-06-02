@@ -1,10 +1,10 @@
 import pytest
 
-import omics_topic
+import topomics
 
 
 def test_package_has_version():
-    assert omics_topic.__version__ is not None
+    assert topomics.__version__ is not None
 
 
 @pytest.mark.skip(reason="This decorator should be removed when test passes.")
@@ -27,7 +27,7 @@ def test_elaborate_example_adata_only_simple(
     expected_len,
     expected_substring,
 ):
-    result = omics_topic.pp.elaborate_example(
+    result = topomics.pp.elaborate_example(
         items=[adata], transform=transform, layer_key=layer_key, max_items=max_items
     )
 
