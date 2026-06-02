@@ -255,7 +255,7 @@ def extract_from_anndata(
     adata_processed = adata
 
     # Extract spatial graph if specified
-    from omics_topic.models.amortizedLDA import _resolve_spatial_graph_from_adata
+    from omics_topic.utils.amortized_utils import _resolve_spatial_graph_from_adata
 
     spatial_info = _resolve_spatial_graph_from_adata(adata_processed, spatial_key)
 
@@ -363,7 +363,7 @@ def _extract_spatial_graphs(
         - key: str - the obsp key used
     """
     # Import here to avoid circular dependency
-    from omics_topic.models.amortizedLDA import _resolve_spatial_graph_from_adata
+    from omics_topic.utils.amortized_utils import _resolve_spatial_graph_from_adata
 
     if not spatial_dict:
         return None
