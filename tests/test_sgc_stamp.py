@@ -1,15 +1,16 @@
 """Tests for STAMP-style SGC spatial mode in TopOmics."""
+
 import numpy as np
 import pytest
 import scipy.sparse as sp
 import torch
 
-from topomics.module._amortizedLDA import precompute_sgc, SGCEncoder
-
+from topomics.module._amortizedLDA import SGCEncoder, precompute_sgc
 
 # ---------------------------------------------------------------------------
 # precompute_sgc
 # ---------------------------------------------------------------------------
+
 
 def _make_ring_adj(n: int) -> sp.csr_matrix:
     """Simple ring graph: each node connected to its two neighbours."""
@@ -24,7 +25,7 @@ def test_precompute_sgc_sign_shape():
     x = torch.rand(n, g) * 100
     adj = _make_ring_adj(n)
     sgc_x = precompute_sgc(x, adj, n_layers=1, mode="sign")
-    assert sgc_x.shape == (n, g * 2), f"Expected ({n}, {g*2}), got {sgc_x.shape}"
+    assert sgc_x.shape == (n, g * 2), f"Expected ({n}, {g * 2}), got {sgc_x.shape}"
 
 
 def test_precompute_sgc_multilayer():
@@ -65,6 +66,7 @@ def test_precompute_sgc_smoothing_reduces_variance():
 # ---------------------------------------------------------------------------
 # SGCEncoder
 # ---------------------------------------------------------------------------
+
 
 def test_sgcencoder_forward():
     n, g, k, h = 64, 20, 10, 32
@@ -109,11 +111,13 @@ def test_sgcencoder_not_initialized_raises():
 # Integration: full model with spatial_mode="sgc"
 # ---------------------------------------------------------------------------
 
+
 def test_sgc_model_creation():
     """Test that the full model can be created with spatial_mode='sgc'."""
-    from topomics import MultimodalAmortizedLDA
     import anndata
     import squidpy as sq
+
+    from topomics import MultimodalAmortizedLDA
 
     np.random.seed(42)
     n_obs, n_genes = 100, 50
@@ -124,9 +128,7 @@ def test_sgc_model_creation():
     adata.obsm["spatial"] = coords
     sq.gr.spatial_neighbors(adata, coord_type="generic", n_neighs=6)
 
-    MultimodalAmortizedLDA.setup_anndata(
-        adata, spatial_keys="spatial_connectivities"
-    )
+    MultimodalAmortizedLDA.setup_anndata(adata, spatial_keys="spatial_connectivities")
     model = MultimodalAmortizedLDA(
         adata,
         n_inputs_modalities=[n_genes],
@@ -145,9 +147,10 @@ def test_sgc_model_creation():
 
 def test_sgc_model_train_smoke():
     """Smoke test: train for a few steps with spatial_mode='sgc'."""
-    from topomics import MultimodalAmortizedLDA
     import anndata
     import squidpy as sq
+
+    from topomics import MultimodalAmortizedLDA
 
     np.random.seed(42)
     n_obs, n_genes = 100, 50
@@ -158,9 +161,7 @@ def test_sgc_model_train_smoke():
     adata.obsm["spatial"] = coords
     sq.gr.spatial_neighbors(adata, coord_type="generic", n_neighs=6)
 
-    MultimodalAmortizedLDA.setup_anndata(
-        adata, spatial_keys="spatial_connectivities"
-    )
+    MultimodalAmortizedLDA.setup_anndata(adata, spatial_keys="spatial_connectivities")
     model = MultimodalAmortizedLDA(
         adata,
         n_inputs_modalities=[n_genes],

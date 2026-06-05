@@ -20,14 +20,13 @@ import argparse
 import inspect
 import os
 import warnings
-from pathlib import Path
 
 import muon as mu
 import numpy as np
 import pandas as pd
 import scanpy as sc
 
-warnings.filterwarnings('ignore')
+warnings.filterwarnings("ignore")
 
 # Data path
 DATA_PATH = "/data/GSE158013/GSM5123951.h5mu"
@@ -35,49 +34,18 @@ DATA_PATH = "/data/GSE158013/GSM5123951.h5mu"
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Train baseline models on TEA-seq dataset")
+    parser.add_argument("--n_latent", type=int, default=10, help="Number of latent dimensions (default: 10)")
+    parser.add_argument("--max_epochs", type=int, default=300, help="Maximum training epochs (default: 300)")
     parser.add_argument(
-        "--n_latent",
-        type=int,
-        default=10,
-        help="Number of latent dimensions (default: 10)"
+        "--output_dir", type=str, default="/data/topomics_models/teaseq/baselines", help="Output directory for models"
     )
+    parser.add_argument("--skip_multivi", action="store_true", help="Skip MultiVI training")
+    parser.add_argument("--skip_multivi_linear", action="store_true", help="Skip MultiVI linear decoder training")
     parser.add_argument(
-        "--max_epochs",
-        type=int,
-        default=300,
-        help="Maximum training epochs (default: 300)"
+        "--skip_scvi_lda", action="store_true", help="Skip scvi-tools AmortizedLDA training (RNA/ATAC/Protein)"
     )
-    parser.add_argument(
-        "--output_dir",
-        type=str,
-        default="/data/topomics_models/teaseq/baselines",
-        help="Output directory for models"
-    )
-    parser.add_argument(
-        "--skip_multivi",
-        action="store_true",
-        help="Skip MultiVI training"
-    )
-    parser.add_argument(
-        "--skip_multivi_linear",
-        action="store_true",
-        help="Skip MultiVI linear decoder training"
-    )
-    parser.add_argument(
-        "--skip_scvi_lda",
-        action="store_true",
-        help="Skip scvi-tools AmortizedLDA training (RNA/ATAC/Protein)"
-    )
-    parser.add_argument(
-        "--skip_mofa",
-        action="store_true",
-        help="Skip MOFA+ training"
-    )
-    parser.add_argument(
-        "--skip_glue",
-        action="store_true",
-        help="Skip GLUE training"
-    )
+    parser.add_argument("--skip_mofa", action="store_true", help="Skip MOFA+ training")
+    parser.add_argument("--skip_glue", action="store_true", help="Skip GLUE training")
     return parser.parse_args()
 
 
@@ -87,15 +55,15 @@ def load_data():
     mdata = mu.read_h5mu(DATA_PATH)
 
     # Binarize ATAC data
-    mdata.mod['atac'].layers['counts'] = (mdata.mod['atac'].layers['counts'] > 0).astype(int)
+    mdata.mod["atac"].layers["counts"] = (mdata.mod["atac"].layers["counts"] > 0).astype(int)
 
     # Filter to highly variable genes for RNA
-    sc.pp.highly_variable_genes(mdata.mod['rna'], n_top_genes=2000, flavor='seurat_v3', layer='counts')
-    mdata.mod['rna'] = mdata.mod['rna'][:, mdata.mod['rna'].var['highly_variable']].copy()
+    sc.pp.highly_variable_genes(mdata.mod["rna"], n_top_genes=2000, flavor="seurat_v3", layer="counts")
+    mdata.mod["rna"] = mdata.mod["rna"][:, mdata.mod["rna"].var["highly_variable"]].copy()
 
     # Filter to highly variable peaks for ATAC
-    sc.pp.highly_variable_genes(mdata.mod['atac'], n_top_genes=10000, flavor='seurat_v3', layer='counts')
-    mdata.mod['atac'] = mdata.mod['atac'][:, mdata.mod['atac'].var['highly_variable']].copy()
+    sc.pp.highly_variable_genes(mdata.mod["atac"], n_top_genes=10000, flavor="seurat_v3", layer="counts")
+    mdata.mod["atac"] = mdata.mod["atac"][:, mdata.mod["atac"].var["highly_variable"]].copy()
 
     # Sync MuData axes after feature filtering
     mdata.update()
@@ -176,9 +144,7 @@ def _build_linear_decoder(decoder_cls, base_decoder, n_latent, n_output_override
     if n_output is None:
         n_output = _infer_decoder_output_dim(base_decoder)
     if n_output is None:
-        raise ValueError(
-            f"Could not infer n_output for {decoder_cls.__name__}."
-        )
+        raise ValueError(f"Could not infer n_output for {decoder_cls.__name__}.")
     n_cat_list = getattr(base_decoder, "n_cat_list", []) or []
     n_hidden = getattr(base_decoder, "n_hidden", None) or n_input
 
@@ -229,9 +195,7 @@ def _build_linear_decoder(decoder_cls, base_decoder, n_latent, n_output_override
         if name not in init_kwargs or init_kwargs[name] is None:
             missing.append(name)
     if missing:
-        raise ValueError(
-            f"Missing required args for {decoder_cls.__name__}: {missing}"
-        )
+        raise ValueError(f"Missing required args for {decoder_cls.__name__}: {missing}")
 
     return decoder_cls(**init_kwargs)
 
@@ -275,10 +239,7 @@ def _linearize_multivi_decoders(model, n_latent, output_dims=None):
     replaced = []
     for name, base_decoder in decoders:
         decoder_cls = base_decoder.__class__
-        if (
-            base_decoder.__class__.__name__ == "DecoderSCVI"
-            and hasattr(scvi_nn, "LinearDecoderSCVI")
-        ):
+        if base_decoder.__class__.__name__ == "DecoderSCVI" and hasattr(scvi_nn, "LinearDecoderSCVI"):
             decoder_cls = scvi_nn.LinearDecoderSCVI
         n_output_override = _pick_output_dim(name)
         new_decoder = _build_linear_decoder(
@@ -308,9 +269,9 @@ def train_multivi(mdata, n_latent, max_epochs, output_dir):
     mdata_multivi = mdata.copy()
 
     # MultiVI needs counts in .X
-    mdata_multivi.mod['rna'].X = mdata_multivi.mod['rna'].layers['counts'].copy()
-    mdata_multivi.mod['atac'].X = mdata_multivi.mod['atac'].layers['counts'].copy()
-    mdata_multivi.mod['prot'].X = mdata_multivi.mod['prot'].layers['counts'].copy()
+    mdata_multivi.mod["rna"].X = mdata_multivi.mod["rna"].layers["counts"].copy()
+    mdata_multivi.mod["atac"].X = mdata_multivi.mod["atac"].layers["counts"].copy()
+    mdata_multivi.mod["prot"].X = mdata_multivi.mod["prot"].layers["counts"].copy()
 
     # Setup MultiVI for RNA + ATAC + Protein
     scvi.model.MULTIVI.setup_mudata(
@@ -323,7 +284,7 @@ def train_multivi(mdata, n_latent, max_epochs, output_dir):
             "rna_layer": "rna",
             "atac_layer": "atac",
             "protein_layer": "prot",
-        }
+        },
     )
 
     # Create model
@@ -472,6 +433,8 @@ def train_scvi_amortized_lda(adata, n_topics, max_epochs, output_dir, modality_n
     _save_history(model.history, os.path.join(output_dir, f"amortized_lda_{modality_name}_history.csv"))
 
     return latent, adata_lda
+
+
 # =============================================================================
 # MOFA+
 # =============================================================================
@@ -486,34 +449,34 @@ def train_mofa(mdata, n_latent, output_dir):
 
     # MOFA needs normalized data
     # RNA: log-normalize and scale
-    mdata_mofa.mod['rna'].X = mdata_mofa.mod['rna'].layers['counts'].copy()
-    sc.pp.normalize_total(mdata_mofa.mod['rna'], target_sum=1e4)
-    sc.pp.log1p(mdata_mofa.mod['rna'])
-    sc.pp.scale(mdata_mofa.mod['rna'])
+    mdata_mofa.mod["rna"].X = mdata_mofa.mod["rna"].layers["counts"].copy()
+    sc.pp.normalize_total(mdata_mofa.mod["rna"], target_sum=1e4)
+    sc.pp.log1p(mdata_mofa.mod["rna"])
+    sc.pp.scale(mdata_mofa.mod["rna"])
 
     # ATAC: normalize and scale (already binarized)
-    mdata_mofa.mod['atac'].X = mdata_mofa.mod['atac'].layers['counts'].copy()
-    sc.pp.normalize_total(mdata_mofa.mod['atac'], target_sum=1e4)
-    sc.pp.log1p(mdata_mofa.mod['atac'])
-    sc.pp.scale(mdata_mofa.mod['atac'])
+    mdata_mofa.mod["atac"].X = mdata_mofa.mod["atac"].layers["counts"].copy()
+    sc.pp.normalize_total(mdata_mofa.mod["atac"], target_sum=1e4)
+    sc.pp.log1p(mdata_mofa.mod["atac"])
+    sc.pp.scale(mdata_mofa.mod["atac"])
 
     # Protein: log-normalize and scale
-    mdata_mofa.mod['prot'].X = mdata_mofa.mod['prot'].layers['counts'].copy()
-    sc.pp.normalize_total(mdata_mofa.mod['prot'], target_sum=1e4)
-    sc.pp.log1p(mdata_mofa.mod['prot'])
-    sc.pp.scale(mdata_mofa.mod['prot'])
+    mdata_mofa.mod["prot"].X = mdata_mofa.mod["prot"].layers["counts"].copy()
+    sc.pp.normalize_total(mdata_mofa.mod["prot"], target_sum=1e4)
+    sc.pp.log1p(mdata_mofa.mod["prot"])
+    sc.pp.scale(mdata_mofa.mod["prot"])
 
     # Train MOFA+
     print("Training...")
     mu.tl.mofa(
         mdata_mofa,
         n_factors=n_latent,
-        convergence_mode='medium',
-        use_obs='intersection',
+        convergence_mode="medium",
+        use_obs="intersection",
     )
 
     # Get latent representation
-    latent = mdata_mofa.obsm['X_mofa']
+    latent = mdata_mofa.obsm["X_mofa"]
     print(f"Latent shape: {latent.shape}")
 
     # Save MuData with MOFA results
@@ -539,15 +502,15 @@ def train_glue(mdata, n_latent, max_epochs, output_dir):
     print("=" * 70)
 
     # GLUE requires separate AnnData objects and genomic coordinates
-    rna = mdata.mod['rna'].copy()
-    atac = mdata.mod['atac'].copy()
+    rna = mdata.mod["rna"].copy()
+    atac = mdata.mod["atac"].copy()
 
     # Use counts
-    rna.X = rna.layers['counts'].copy()
-    atac.X = atac.layers['counts'].copy()
+    rna.X = rna.layers["counts"].copy()
+    atac.X = atac.layers["counts"].copy()
 
     # Check if genomic coordinates are available
-    has_coords = 'chromStart' in atac.var.columns or 'start' in atac.var.columns
+    has_coords = "chromStart" in atac.var.columns or "start" in atac.var.columns
 
     if not has_coords:
         print("ATAC peaks lack genomic coordinates.")
@@ -556,12 +519,12 @@ def train_glue(mdata, n_latent, max_epochs, output_dir):
         # Try to parse coordinates from var_names
         try:
             # Try chr:start-end format first
-            coords = atac.var_names.str.extract(r'(chr[^:_]+)[:\-_](\d+)[:\-_](\d+)')
+            coords = atac.var_names.str.extract(r"(chr[^:_]+)[:\-_](\d+)[:\-_](\d+)")
             if coords.isna().any().any():
                 raise ValueError("Could not parse coordinates")
-            atac.var['chrom'] = coords[0].values
-            atac.var['chromStart'] = coords[1].astype(int).values
-            atac.var['chromEnd'] = coords[2].astype(int).values
+            atac.var["chrom"] = coords[0].values
+            atac.var["chromStart"] = coords[1].astype(int).values
+            atac.var["chromEnd"] = coords[2].astype(int).values
             has_coords = True
             print("Successfully parsed coordinates from var_names")
         except Exception as e:
@@ -573,21 +536,21 @@ def train_glue(mdata, n_latent, max_epochs, output_dir):
     print("Preprocessing for GLUE...")
 
     # RNA preprocessing
-    rna.layers['counts'] = rna.X.copy()
+    rna.layers["counts"] = rna.X.copy()
     sc.pp.normalize_total(rna)
     sc.pp.log1p(rna)
     sc.pp.scale(rna)
     sc.tl.pca(rna, n_comps=100, use_highly_variable=False)
 
     # ATAC preprocessing with LSI
-    atac.layers['counts'] = atac.X.copy()
+    atac.layers["counts"] = atac.X.copy()
     scglue.data.lsi(atac, n_components=100)
 
     # Build guidance graph
     print("Building guidance graph...")
 
     # Check if RNA has gene coordinates
-    if 'chromStart' not in rna.var.columns:
+    if "chromStart" not in rna.var.columns:
         print("RNA genes lack genomic coordinates.")
         print("Attempting to get gene coordinates from Ensembl/UCSC...")
 
@@ -596,7 +559,7 @@ def train_glue(mdata, n_latent, max_epochs, output_dir):
             scglue.data.get_gene_annotation(
                 rna,
                 gtf="http://ftp.ensembl.org/pub/release-109/gtf/homo_sapiens/Homo_sapiens.GRCh38.109.gtf.gz",
-                gtf_by="gene_name"
+                gtf_by="gene_name",
             )
             print("Successfully added gene coordinates")
         except Exception as e:
@@ -613,14 +576,8 @@ def train_glue(mdata, n_latent, max_epochs, output_dir):
         return None, None
 
     # Configure datasets
-    scglue.models.configure_dataset(
-        rna, "NB", use_highly_variable=False,
-        use_layer="counts", use_rep="X_pca"
-    )
-    scglue.models.configure_dataset(
-        atac, "NB", use_highly_variable=False,
-        use_layer="counts", use_rep="X_lsi"
-    )
+    scglue.models.configure_dataset(rna, "NB", use_highly_variable=False, use_layer="counts", use_rep="X_pca")
+    scglue.models.configure_dataset(atac, "NB", use_highly_variable=False, use_layer="counts", use_rep="X_lsi")
 
     # Train GLUE
     print("Training GLUE model...")
@@ -679,25 +636,23 @@ def main():
     # Train MultiVI (RNA + ATAC + Protein)
     if not args.skip_multivi:
         try:
-            latent, _ = train_multivi(
-                mdata, args.n_latent, args.max_epochs, args.output_dir
-            )
-            results['multivi'] = latent
+            latent, _ = train_multivi(mdata, args.n_latent, args.max_epochs, args.output_dir)
+            results["multivi"] = latent
         except Exception as e:
             print(f"MultiVI training failed: {e}")
             import traceback
+
             traceback.print_exc()
 
     # Train MultiVI Linear (RNA + ATAC + Protein)
     if not args.skip_multivi_linear:
         try:
-            latent, _ = train_multivi_linear(
-                mdata, args.n_latent, args.max_epochs, args.output_dir
-            )
-            results['multivi_linear'] = latent
+            latent, _ = train_multivi_linear(mdata, args.n_latent, args.max_epochs, args.output_dir)
+            results["multivi_linear"] = latent
         except Exception as e:
             print(f"MultiVI linear training failed: {e}")
             import traceback
+
             traceback.print_exc()
 
     # Train scvi-tools AmortizedLDA (RNA/ATAC/Protein)
@@ -710,6 +665,7 @@ def main():
         except Exception as e:
             print(f"AmortizedLDA (RNA) failed: {e}")
             import traceback
+
             traceback.print_exc()
 
         try:
@@ -720,6 +676,7 @@ def main():
         except Exception as e:
             print(f"AmortizedLDA (ATAC) failed: {e}")
             import traceback
+
             traceback.print_exc()
 
         try:
@@ -730,29 +687,30 @@ def main():
         except Exception as e:
             print(f"AmortizedLDA (Protein) failed: {e}")
             import traceback
+
             traceback.print_exc()
 
     # Train MOFA+ (all modalities)
     if not args.skip_mofa:
         try:
             latent, _ = train_mofa(mdata, args.n_latent, args.output_dir)
-            results['mofa'] = latent
+            results["mofa"] = latent
         except Exception as e:
             print(f"MOFA+ training failed: {e}")
             import traceback
+
             traceback.print_exc()
 
     # Train GLUE (RNA + ATAC)
     if not args.skip_glue:
         try:
-            latent, _ = train_glue(
-                mdata, args.n_latent, args.max_epochs, args.output_dir
-            )
+            latent, _ = train_glue(mdata, args.n_latent, args.max_epochs, args.output_dir)
             if latent is not None:
-                results['glue'] = latent
+                results["glue"] = latent
         except Exception as e:
             print(f"GLUE training failed: {e}")
             import traceback
+
             traceback.print_exc()
 
     # Summary
@@ -765,13 +723,11 @@ def main():
 
     # Save summary
     summary = {
-        'model': list(results.keys()),
-        'n_latent': [r.shape[1] for r in results.values()],
-        'n_cells': [r.shape[0] for r in results.values()],
+        "model": list(results.keys()),
+        "n_latent": [r.shape[1] for r in results.values()],
+        "n_cells": [r.shape[0] for r in results.values()],
     }
-    pd.DataFrame(summary).to_csv(
-        os.path.join(args.output_dir, "training_summary.csv"), index=False
-    )
+    pd.DataFrame(summary).to_csv(os.path.join(args.output_dir, "training_summary.csv"), index=False)
 
 
 if __name__ == "__main__":

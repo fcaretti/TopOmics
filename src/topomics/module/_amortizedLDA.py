@@ -17,12 +17,10 @@ import logging
 import math
 from collections.abc import Sequence
 
-import numpy as np
 import pyro
 import pyro.distributions as dist
 import scipy.sparse as sp
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 from pyro import poutine
 from pyro.infer import Trace_ELBO
@@ -45,7 +43,7 @@ from topomics.utils._amortized_utils import (  # noqa: F401  (AttentionAggregato
     masked_softmax,
     precompute_sgc,
 )
-from topomics.utils._encoders import (  # noqa: F401  (re-exported for backwards compatibility)
+from topomics.utils._encoders import (
     GCNEncoder,
     SGCEncoder,
 )
@@ -87,7 +85,7 @@ class MultimodalLDAPyroModel(PyroModule):
         n_topics: int,
         cell_topic_prior: torch.Tensor,
         topic_feature_priors: list[torch.Tensor],  # one tensor per modality (len = M)
-        dispersion_rna: float = 1.,  # global NB dispersion for Gamma-Poisson modalities
+        dispersion_rna: float = 1.0,  # global NB dispersion for Gamma-Poisson modalities
         learnable_dispersion: bool = False,  # whether to learn dispersion (STAMP-like)
         global_dispersion: bool = True,  # if learnable: one global vs per-gene dispersion
         topic_feature_prior_type: str = "logistic_normal",
@@ -119,16 +117,12 @@ class MultimodalLDAPyroModel(PyroModule):
         valid_weight_modes = {"none", "inverse_features", "sqrt_inverse_features"}
         if likelihood_weight_mode not in valid_weight_modes:
             raise ValueError(
-                f"likelihood_weight_mode must be one of {valid_weight_modes}, "
-                f"got '{likelihood_weight_mode}'"
+                f"likelihood_weight_mode must be one of {valid_weight_modes}, got '{likelihood_weight_mode}'"
             )
 
         valid_weight_refs = {"mean", "median", "max"}
         if likelihood_weight_ref not in valid_weight_refs:
-            raise ValueError(
-                f"likelihood_weight_ref must be one of {valid_weight_refs}, "
-                f"got '{likelihood_weight_ref}'"
-            )
+            raise ValueError(f"likelihood_weight_ref must be one of {valid_weight_refs}, got '{likelihood_weight_ref}'")
 
         feature_counts = torch.as_tensor(n_inputs_modalities, dtype=torch.float32)
         if likelihood_weight_mode == "none":
@@ -259,7 +253,7 @@ class MultimodalLDAPyroModel(PyroModule):
                             with poutine.scale(scale=kl_weight):
                                 bg_m = pyro.sample(
                                     f"bg_{m}",
-                                    dist.Normal(torch.zeros_like(init_bg), torch.ones_like(init_bg)).to_event(1)
+                                    dist.Normal(torch.zeros_like(init_bg), torch.ones_like(init_bg)).to_event(1),
                                 )
                             bg_m = bg_m + init_bg  # Add empirical baseline
                         else:
@@ -296,26 +290,20 @@ class MultimodalLDAPyroModel(PyroModule):
                         f"caux_{m}",
                         dist.InverseGamma(
                             torch.ones(1, device=self._dummy.device) * 0.5,
-                            torch.ones(1, device=self._dummy.device) * 0.5
-                        )
+                            torch.ones(1, device=self._dummy.device) * 0.5,
+                        ),
                     )
 
                 # 2. Per-topic local shrinkage
                 with pyro.plate(f"topics_tau_{m}", self.n_topics):
                     with poutine.scale(scale=kl_weight):
-                        tau_m = pyro.sample(
-                            f"tau_{m}",
-                            dist.HalfCauchy(torch.ones(1, device=self._dummy.device))
-                        )
+                        tau_m = pyro.sample(f"tau_{m}", dist.HalfCauchy(torch.ones(1, device=self._dummy.device)))
                 tau_m = tau_m.unsqueeze(-1)  # (K, 1)
 
                 # 3. Per-feature local shrinkage
                 with pyro.plate(f"features_delta_{m}", F_m):
                     with poutine.scale(scale=kl_weight):
-                        delta_m = pyro.sample(
-                            f"delta_{m}",
-                            dist.HalfCauchy(torch.ones(1, device=self._dummy.device))
-                        )
+                        delta_m = pyro.sample(f"delta_{m}", dist.HalfCauchy(torch.ones(1, device=self._dummy.device)))
                 # delta_m is (F_m,)
 
                 # 4. Per-topic-feature interaction shrinkage
@@ -324,8 +312,7 @@ class MultimodalLDAPyroModel(PyroModule):
                     with pyro.plate(f"topics_lambda_{m}", self.n_topics):
                         with poutine.scale(scale=kl_weight):
                             lambda_m = pyro.sample(
-                                f"lambda_{m}",
-                                dist.HalfCauchy(torch.ones(1, device=self._dummy.device))
+                                f"lambda_{m}", dist.HalfCauchy(torch.ones(1, device=self._dummy.device))
                             )
                 # lambda_m is now (K, F_m) after plate ordering
 
@@ -338,8 +325,9 @@ class MultimodalLDAPyroModel(PyroModule):
                         with poutine.scale(scale=kl_weight):
                             beta_m = pyro.sample(
                                 f"beta_{m}",
-                                dist.Normal(torch.zeros(1, device=self._dummy.device),
-                                           torch.ones(1, device=self._dummy.device))
+                                dist.Normal(
+                                    torch.zeros(1, device=self._dummy.device), torch.ones(1, device=self._dummy.device)
+                                ),
                             )
                 # beta_m is now (K, F_m) after plate ordering
 
@@ -354,7 +342,7 @@ class MultimodalLDAPyroModel(PyroModule):
                             with poutine.scale(scale=kl_weight):
                                 bg_m = pyro.sample(
                                     f"bg_{m}",
-                                    dist.Normal(torch.zeros_like(init_bg), torch.ones_like(init_bg)).to_event(1)
+                                    dist.Normal(torch.zeros_like(init_bg), torch.ones_like(init_bg)).to_event(1),
                                 )
                             bg_m = bg_m + init_bg  # Add empirical baseline
                         else:
@@ -376,18 +364,14 @@ class MultimodalLDAPyroModel(PyroModule):
                     if self.global_dispersion:
                         # Single global dispersion for this modality
                         with poutine.scale(scale=kl_weight):
-                            disp = pyro.sample(
-                                f"disp_{m}",
-                                dist.HalfCauchy(torch.ones(1, device=self._dummy.device))
-                            )
+                            disp = pyro.sample(f"disp_{m}", dist.HalfCauchy(torch.ones(1, device=self._dummy.device)))
                         dispersion_samples[m] = disp
                     else:
                         # Per-gene dispersion (STAMP-like)
                         with pyro.plate(f"genes_disp_{m}", F_m):
                             with poutine.scale(scale=kl_weight):
                                 disp = pyro.sample(
-                                    f"disp_{m}",
-                                    dist.HalfCauchy(torch.ones(1, device=self._dummy.device))
+                                    f"disp_{m}", dist.HalfCauchy(torch.ones(1, device=self._dummy.device))
                                 )
                         dispersion_samples[m] = disp  # shape: (F_m,)
 
@@ -433,8 +417,7 @@ class MultimodalLDAPyroModel(PyroModule):
             if L_m == "gaussian":
                 with poutine.scale(scale=kl_weight):
                     gaussian_sigma_samples[m] = pyro.sample(
-                        f"gaussian_sigma_{m}",
-                        dist.HalfCauchy(torch.ones(F_m, device=self._dummy.device)).to_event(1)
+                        f"gaussian_sigma_{m}", dist.HalfCauchy(torch.ones(F_m, device=self._dummy.device)).to_event(1)
                     )
 
         # ----- cells plate -----
@@ -467,7 +450,7 @@ class MultimodalLDAPyroModel(PyroModule):
                         batch_idx = cat_covs[:, 0].long()
                         mean_m = torch.zeros_like(x_m)
                         for b in range(self.n_batches):
-                            mask_b = (batch_idx == b)
+                            mask_b = batch_idx == b
                             if mask_b.any():
                                 offset = batch_tau_m * batch_delta_m[b]
                                 mu_b = log_phi_m + offset  # additive offset, no softmax
@@ -500,7 +483,7 @@ class MultimodalLDAPyroModel(PyroModule):
                         batch_idx = cat_covs[:, 0].long()  # (B,)
                         rate_m = torch.zeros_like(x_m)
                         for b in range(self.n_batches):
-                            mask_b = (batch_idx == b)
+                            mask_b = batch_idx == b
                             if mask_b.any():
                                 offset = batch_tau_m * batch_delta_m[b]  # (K, 1) * (F_m,) -> (K, F_m)
                                 phi_b = F.softmax(log_phi_m + offset, dim=-1)  # (K, F_m)
@@ -526,14 +509,11 @@ class MultimodalLDAPyroModel(PyroModule):
                             if self.learnable_dispersion and m in dispersion_samples:
                                 # Use sampled dispersion (STAMP-like parameterization)
                                 disp = dispersion_samples[m]
-                                inv_disp = 1.0 / (disp ** 2 + 1e-8)
+                                inv_disp = 1.0 / (disp**2 + 1e-8)
                                 # GammaPoisson(concentration, rate) where mean = concentration/rate
                                 pyro.sample(
                                     f"feature_counts_{m}",
-                                    dist.GammaPoisson(
-                                        concentration=inv_disp,
-                                        rate=inv_disp / mu
-                                    ).to_event(1),
+                                    dist.GammaPoisson(concentration=inv_disp, rate=inv_disp / mu).to_event(1),
                                     obs=x_m_obs,
                                 )
                             else:
@@ -575,7 +555,7 @@ class MultimodalLDAPyroGuide(PyroModule):
         gcn_n_layers: int = 1,
         gcn_hidden_dims: list[int] | None = None,
         gcn_n_pre_layers: int = 0,
-        gcn_conv_type: str='GATv2Conv',
+        gcn_conv_type: str = "GATv2Conv",
         gcn_alpha_init: float = 0.7,
         gcn_use_learned_alpha: bool = True,
         weight_mode: str = "equal",
@@ -601,7 +581,7 @@ class MultimodalLDAPyroGuide(PyroModule):
         n_extra_encoder_features: int = 0,
         # Aggregation mode
         aggregation_type: str = "moe",  # "moe" or "attention"
-        att_dim: int = 32,              # attention projection dim (used when aggregation_type="attention")
+        att_dim: int = 32,  # attention projection dim (used when aggregation_type="attention")
         # Spatial mode: "gcn" (default, trainable GCN/GAT) or "sgc" (STAMP-style precomputed)
         spatial_mode: str = "gcn",
         sgc_n_layers: int = 1,  # number of SGC hops (only used when spatial_mode="sgc")
@@ -671,7 +651,7 @@ class MultimodalLDAPyroGuide(PyroModule):
                 for n_in in n_inputs_modalities
             ]
         )
-        
+
         # Spatial encoders (if spatial)
         if self.use_gcn:
             if adjacency is None:
@@ -799,7 +779,7 @@ class MultimodalLDAPyroGuide(PyroModule):
         if use_feature_background:
             self.bg_loc = torch.nn.ParameterList()
             self.bg_scale = torch.nn.ParameterList()
-            for m, (F_m, likelihood) in enumerate(zip(n_inputs_modalities, self.likelihoods)):
+            for m, (F_m, likelihood) in enumerate(zip(n_inputs_modalities, self.likelihoods, strict=False)):
                 if likelihood == "gamma_poisson":
                     # Create background parameters for gamma_poisson modalities
                     # STAMP: bg_scale init = 0.1, so raw param = softplus_inv(0.1)
@@ -820,7 +800,7 @@ class MultimodalLDAPyroGuide(PyroModule):
         if has_gaussian:
             self.gaussian_sigma_loc = torch.nn.ParameterList()
             self.gaussian_sigma_scale = torch.nn.ParameterList()
-            for m, (F_m, likelihood) in enumerate(zip(n_inputs_modalities, self.likelihoods)):
+            for m, (F_m, likelihood) in enumerate(zip(n_inputs_modalities, self.likelihoods, strict=False)):
                 if likelihood == "gaussian":
                     _sp_inv_01 = float(torch.log(torch.exp(torch.tensor(0.1)) - 1))
                     self.gaussian_sigma_loc.append(torch.nn.Parameter(torch.zeros(F_m)))
@@ -837,7 +817,7 @@ class MultimodalLDAPyroGuide(PyroModule):
         if learnable_dispersion:
             self.disp_loc = torch.nn.ParameterList()
             self.disp_scale = torch.nn.ParameterList()
-            for m, (F_m, likelihood) in enumerate(zip(n_inputs_modalities, self.likelihoods)):
+            for m, (F_m, likelihood) in enumerate(zip(n_inputs_modalities, self.likelihoods, strict=False)):
                 if likelihood in {"gamma_poisson", "nb"}:
                     _sp_inv_01 = float(torch.log(torch.exp(torch.tensor(0.1)) - 1))
                     if global_dispersion:
@@ -920,7 +900,7 @@ class MultimodalLDAPyroGuide(PyroModule):
         # E[Var[X|M]] - expected variance within each encoder
         expected_var = (w * vars_).sum(0)
         # Var[E[X|M]] - variance of means across encoders
-        var_of_means = (w * (mus - mu.unsqueeze(0))**2).sum(0)
+        var_of_means = (w * (mus - mu.unsqueeze(0)) ** 2).sum(0)
         var = expected_var + var_of_means
         var = clamp_positive(var)
         return mu, var
@@ -929,7 +909,7 @@ class MultimodalLDAPyroGuide(PyroModule):
         """Get edge_index for a specific modality."""
         if not self.use_gcn:
             raise RuntimeError("Cannot get edge_index when spatial=False")
-        
+
         if self.multiple_adjacencies:
             return getattr(self, f"edge_index_{modality_idx}")
         else:
@@ -985,7 +965,7 @@ class MultimodalLDAPyroGuide(PyroModule):
             if adjacency_scipy is None:
                 raise ValueError("adjacency_scipy is required for SGC mode.")
 
-            for idx, (sgc_enc, x_full_m) in enumerate(zip(self.gcn_encoders, x_full_list)):
+            for idx, (sgc_enc, x_full_m) in enumerate(zip(self.gcn_encoders, x_full_list, strict=False)):
                 sgc_x = precompute_sgc(x_full_m, adjacency_scipy, n_layers=self.sgc_n_layers)
                 sgc_enc.set_sgc_data(sgc_x)
 
@@ -998,7 +978,7 @@ class MultimodalLDAPyroGuide(PyroModule):
             if self.normalize_encoder_inputs:
                 libs = [x_full_m.sum(dim=1, keepdim=True) for x_full_m in x_full_list]
                 x_full_normalized = []
-                for m, (x_full_m, lib_m) in enumerate(zip(x_full_list, libs)):
+                for m, (x_full_m, lib_m) in enumerate(zip(x_full_list, libs, strict=False)):
                     if self.likelihoods[m] == "gaussian":
                         x_full_normalized.append(x_full_m)
                     else:
@@ -1009,13 +989,12 @@ class MultimodalLDAPyroGuide(PyroModule):
                 x_full_list = x_full_normalized
                 logger.info("Applied library-size and log-normalization to full graph BEFORE spatial convolution")
 
-            for idx, (gcn_enc, x_full_m) in enumerate(zip(self.gcn_encoders, x_full_list)):
+            for idx, (gcn_enc, x_full_m) in enumerate(zip(self.gcn_encoders, x_full_list, strict=False)):
                 edge_index = self._get_edge_index(idx)
                 gcn_enc.set_full_graph_data(x_full_m, edge_index)
 
             logger.info(
-                f"GCN encoders initialized with full graph "
-                f"(normalize_encoder_inputs={self.normalize_encoder_inputs})"
+                f"GCN encoders initialized with full graph (normalize_encoder_inputs={self.normalize_encoder_inputs})"
             )
 
     # ---------- forward ----------
@@ -1047,17 +1026,20 @@ class MultimodalLDAPyroGuide(PyroModule):
                         pyro.sample(
                             f"log_topic_feature_dist_{m}",
                             dist.Normal(
-                                self.topic_feature_posterior_mu[m],
-                                self.topic_feature_posterior_sigma[m]
+                                self.topic_feature_posterior_mu[m], self.topic_feature_posterior_sigma[m]
                             ).to_event(1),
                         )
 
                 # Feature background variational posterior (scTM-style)
-                if self.learnable_bg and self.use_feature_background and self.bg_loc is not None and self.bg_loc[m] is not None:
+                if (
+                    self.learnable_bg
+                    and self.use_feature_background
+                    and self.bg_loc is not None
+                    and self.bg_loc[m] is not None
+                ):
                     with poutine.scale(scale=kl_weight):
                         pyro.sample(
-                            f"bg_{m}",
-                            dist.Normal(self.bg_loc[m], self._softplus(self.bg_scale[m])).to_event(1)
+                            f"bg_{m}", dist.Normal(self.bg_loc[m], self._softplus(self.bg_scale[m])).to_event(1)
                         )
 
         elif self.topic_feature_prior_type == "horseshoe":
@@ -1067,25 +1049,18 @@ class MultimodalLDAPyroGuide(PyroModule):
 
                 # 1. caux variational posterior
                 with poutine.scale(scale=kl_weight):
-                    pyro.sample(
-                        f"caux_{m}",
-                        dist.LogNormal(self.caux_loc[m], self._softplus(self.caux_scale[m]))
-                    )
+                    pyro.sample(f"caux_{m}", dist.LogNormal(self.caux_loc[m], self._softplus(self.caux_scale[m])))
 
                 # 2. tau variational posterior
                 with pyro.plate(f"topics_tau_{m}", self.n_topics):
                     with poutine.scale(scale=kl_weight):
-                        pyro.sample(
-                            f"tau_{m}",
-                            dist.LogNormal(self.tau_loc[m], self._softplus(self.tau_scale[m]))
-                        )
+                        pyro.sample(f"tau_{m}", dist.LogNormal(self.tau_loc[m], self._softplus(self.tau_scale[m])))
 
                 # 3. delta variational posterior
                 with pyro.plate(f"features_delta_{m}", F_m):
                     with poutine.scale(scale=kl_weight):
                         pyro.sample(
-                            f"delta_{m}",
-                            dist.LogNormal(self.delta_loc[m], self._softplus(self.delta_scale[m]))
+                            f"delta_{m}", dist.LogNormal(self.delta_loc[m], self._softplus(self.delta_scale[m]))
                         )
 
                 # 4. lambda variational posterior
@@ -1093,31 +1068,25 @@ class MultimodalLDAPyroGuide(PyroModule):
                     with pyro.plate(f"topics_lambda_{m}", self.n_topics):
                         with poutine.scale(scale=kl_weight):
                             pyro.sample(
-                                f"lambda_{m}",
-                                dist.LogNormal(
-                                    self.lambda_loc[m],
-                                    self._softplus(self.lambda_scale[m])
-                                )
+                                f"lambda_{m}", dist.LogNormal(self.lambda_loc[m], self._softplus(self.lambda_scale[m]))
                             )
 
                 # 5. beta variational posterior
                 with pyro.plate(f"features_beta_{m}", F_m):
                     with pyro.plate(f"topics_beta_{m}", self.n_topics):
                         with poutine.scale(scale=kl_weight):
-                            pyro.sample(
-                                f"beta_{m}",
-                                dist.Normal(
-                                    self.beta_loc[m],
-                                    self._softplus(self.beta_scale[m])
-                                )
-                            )
+                            pyro.sample(f"beta_{m}", dist.Normal(self.beta_loc[m], self._softplus(self.beta_scale[m])))
 
                 # Feature background variational posterior (scTM-style)
-                if self.learnable_bg and self.use_feature_background and self.bg_loc is not None and self.bg_loc[m] is not None:
+                if (
+                    self.learnable_bg
+                    and self.use_feature_background
+                    and self.bg_loc is not None
+                    and self.bg_loc[m] is not None
+                ):
                     with poutine.scale(scale=kl_weight):
                         pyro.sample(
-                            f"bg_{m}",
-                            dist.Normal(self.bg_loc[m], self._softplus(self.bg_scale[m])).to_event(1)
+                            f"bg_{m}", dist.Normal(self.bg_loc[m], self._softplus(self.bg_scale[m])).to_event(1)
                         )
 
         # STAMP-style batch effect variational posteriors
@@ -1161,22 +1130,14 @@ class MultimodalLDAPyroGuide(PyroModule):
                         # Single dispersion per modality
                         with poutine.scale(scale=kl_weight):
                             pyro.sample(
-                                f"disp_{m}",
-                                dist.LogNormal(
-                                    self.disp_loc[m],
-                                    self._softplus(self.disp_scale[m])
-                                )
+                                f"disp_{m}", dist.LogNormal(self.disp_loc[m], self._softplus(self.disp_scale[m]))
                             )
                     else:
                         # Per-gene dispersion
                         with pyro.plate(f"genes_disp_{m}", F_m):
                             with poutine.scale(scale=kl_weight):
                                 pyro.sample(
-                                    f"disp_{m}",
-                                    dist.LogNormal(
-                                        self.disp_loc[m],
-                                        self._softplus(self.disp_scale[m])
-                                    )
+                                    f"disp_{m}", dist.LogNormal(self.disp_loc[m], self._softplus(self.disp_scale[m]))
                                 )
 
         # Gaussian sigma variational posterior (for Gaussian likelihood modalities)
@@ -1188,9 +1149,8 @@ class MultimodalLDAPyroGuide(PyroModule):
                         pyro.sample(
                             f"gaussian_sigma_{m}",
                             dist.LogNormal(
-                                self.gaussian_sigma_loc[m],
-                                self._softplus(self.gaussian_sigma_scale[m])
-                            ).to_event(1)
+                                self.gaussian_sigma_loc[m], self._softplus(self.gaussian_sigma_scale[m])
+                            ).to_event(1),
                         )
 
         # θₙ variational
@@ -1202,7 +1162,7 @@ class MultimodalLDAPyroGuide(PyroModule):
             libs = [x_m.sum(dim=1, keepdim=True) for x_m in xs]  # List of (B, 1)
             # Normalize to median depth per modality
             xs_normalized = []
-            for m, (x_m, lib_m) in enumerate(zip(xs, libs)):
+            for m, (x_m, lib_m) in enumerate(zip(xs, libs, strict=False)):
                 if self.likelihoods[m] == "gaussian":
                     # Gaussian modalities: pass through (data is already continuous)
                     xs_normalized.append(x_m)
@@ -1231,7 +1191,9 @@ class MultimodalLDAPyroGuide(PyroModule):
                 # Encoder expects categorical covariates but none were provided
                 # Create dummy zeros as placeholders
                 device = x.device
-                cat_list = [torch.zeros((B, 1), dtype=torch.long, device=device) for _ in range(len(self.n_cats_per_cov))]
+                cat_list = [
+                    torch.zeros((B, 1), dtype=torch.long, device=device) for _ in range(len(self.n_cats_per_cov))
+                ]
 
         # Handle continuous covariates - if encoder expects them but they're not provided, create dummies
         if cont_covs is None and self.n_continuous_cov > 0:
@@ -1252,14 +1214,18 @@ class MultimodalLDAPyroGuide(PyroModule):
                 if self.spatial_mode == "sgc":
                     # SGC encoder uses precomputed features; pass cat_list for per-batch BN
                     q_m, _ = self.gcn_encoders[idx](
-                        x_m_with_cov, None, batch_indices=batch_indices,
+                        x_m_with_cov,
+                        None,
+                        batch_indices=batch_indices,
                         cat_list=cat_list,
                     )
                 else:
                     edge_index = self._get_edge_index(idx)
                     q_m, _ = self.gcn_encoders[idx](
-                        x_m_with_cov, edge_index, batch_indices=batch_indices,
-                        cat_list=None  # Not supported in full-graph mode
+                        x_m_with_cov,
+                        edge_index,
+                        batch_indices=batch_indices,
+                        cat_list=None,  # Not supported in full-graph mode
                     )
             else:
                 # scvi Encoder: forward(x, *cat_list)
@@ -1338,7 +1304,7 @@ class MultimodalAmortizedLDAPyroModule(PyroBaseModuleClass):
         adjacency: torch.Tensor | Sequence[torch.Tensor] | None = None,
         gcn_n_layers: int = 1,
         gcn_n_pre_layers: int = 0,
-        gcn_conv_type: str = 'GATv2Conv',
+        gcn_conv_type: str = "GATv2Conv",
         gcn_hidden_dims: list[int] | None = None,
         gcn_alpha_init: float = 0.7,
         gcn_use_learned_alpha: bool = True,
@@ -1428,7 +1394,7 @@ class MultimodalAmortizedLDAPyroModule(PyroBaseModuleClass):
             n_continuous_cov=n_continuous_cov,
         )
         # Compute batch effect parameters for guide (decoder-side, independent of encode_covariates)
-        use_batch_covariates = (n_cats_per_cov is not None and len(n_cats_per_cov) > 0)
+        use_batch_covariates = n_cats_per_cov is not None and len(n_cats_per_cov) > 0
         _n_batches = n_cats_per_cov[0] if use_batch_covariates else 0
 
         self._guide = MultimodalLDAPyroGuide(
@@ -1509,10 +1475,7 @@ class MultimodalAmortizedLDAPyroModule(PyroBaseModuleClass):
 
     def load_state_dict(self, state_dict, strict: bool = True):
         incompatible = super().load_state_dict(state_dict, strict=False)
-        missing = [
-            key for key in incompatible.missing_keys
-            if key != "_model.likelihood_weights"
-        ]
+        missing = [key for key in incompatible.missing_keys if key != "_model.likelihood_weights"]
         unexpected = list(incompatible.unexpected_keys)
         if strict and (missing or unexpected):
             raise RuntimeError(
@@ -1521,7 +1484,6 @@ class MultimodalAmortizedLDAPyroModule(PyroBaseModuleClass):
                 f"Missing keys: {missing}, Unexpected keys: {unexpected}"
             )
         return incompatible
-
 
     def set_full_graph_data(self, x_full: torch.Tensor, adjacency_scipy=None):
         """
@@ -1560,9 +1522,7 @@ class MultimodalAmortizedLDAPyroModule(PyroBaseModuleClass):
 
         if self.guide.topic_feature_prior_type == "logistic_normal":
             for m, (mu, sig) in enumerate(
-                zip(self.guide.topic_feature_posterior_mu,
-                    self.guide.topic_feature_posterior_sigma,
-                    strict=False)
+                zip(self.guide.topic_feature_posterior_mu, self.guide.topic_feature_posterior_sigma, strict=False)
             ):
                 samples = dist.Normal(mu.detach().cpu(), sig.detach().cpu()).sample((n_samples,))
                 if self.guide.likelihoods[m] == "gaussian":
@@ -1620,7 +1580,9 @@ class MultimodalAmortizedLDAPyroModule(PyroBaseModuleClass):
         return out
 
     def get_topic_distribution(
-        self, x: torch.Tensor, n_samples: int = 5_000,
+        self,
+        x: torch.Tensor,
+        n_samples: int = 5_000,
         encoder_extra: torch.Tensor | None = None,
         batch_indices: torch.Tensor | None = None,
     ) -> torch.Tensor:
@@ -1636,7 +1598,7 @@ class MultimodalAmortizedLDAPyroModule(PyroBaseModuleClass):
         if self.guide.normalize_encoder_inputs:
             libs = [x_m.sum(dim=1, keepdim=True) for x_m in xs]
             xs_normalized = []
-            for m, (x_m, lib_m) in enumerate(zip(xs, libs)):
+            for m, (x_m, lib_m) in enumerate(zip(xs, libs, strict=False)):
                 if self.guide.likelihoods[m] == "gaussian":
                     xs_normalized.append(x_m)
                 else:
@@ -1657,7 +1619,9 @@ class MultimodalAmortizedLDAPyroModule(PyroBaseModuleClass):
         cat_list = []
         if self.guide.n_cats_per_cov is not None and len(self.guide.n_cats_per_cov) > 0:
             # Create dummy zeros since we don't have actual covariate values during inference
-            cat_list = [torch.zeros((B, 1), dtype=torch.long, device=device) for _ in range(len(self.guide.n_cats_per_cov))]
+            cat_list = [
+                torch.zeros((B, 1), dtype=torch.long, device=device) for _ in range(len(self.guide.n_cats_per_cov))
+            ]
 
         # Prepare dummy continuous covariates if encoder expects them
         if self.guide.n_continuous_cov > 0:
@@ -1679,7 +1643,9 @@ class MultimodalAmortizedLDAPyroModule(PyroBaseModuleClass):
             if self.guide.use_gcn:
                 if self.guide.spatial_mode == "sgc":
                     q_m, _ = self.guide.gcn_encoders[idx](
-                        x_m_with_cov, None, batch_indices=batch_indices,
+                        x_m_with_cov,
+                        None,
+                        batch_indices=batch_indices,
                         cat_list=cat_list,
                     )
                 else:
@@ -1749,7 +1715,7 @@ class MultimodalAmortizedLDAPyroModule(PyroBaseModuleClass):
         float | None
             Mean entropy from the last forward pass, or None if not available
         """
-        if hasattr(self.guide, '_last_entropy') and self.guide._last_entropy is not None:
+        if hasattr(self.guide, "_last_entropy") and self.guide._last_entropy is not None:
             return float(self.guide._last_entropy)
         return None
 
@@ -1762,7 +1728,7 @@ class MultimodalAmortizedLDAPyroModule(PyroBaseModuleClass):
         float | None
             Mean topic variance from the last forward pass, or None if not available
         """
-        if hasattr(self.guide, '_last_topic_variance') and self.guide._last_topic_variance is not None:
+        if hasattr(self.guide, "_last_topic_variance") and self.guide._last_topic_variance is not None:
             return float(self.guide._last_topic_variance)
         return None
 

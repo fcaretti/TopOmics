@@ -50,10 +50,12 @@ def anndata_to_sparse_coords(X) -> Tensor:
     else:
         arr = np.asarray(X)
         rows, cols = arr.nonzero()
-    return torch.stack([
-        torch.tensor(rows, dtype=torch.long),
-        torch.tensor(cols, dtype=torch.long),
-    ])
+    return torch.stack(
+        [
+            torch.tensor(rows, dtype=torch.long),
+            torch.tensor(cols, dtype=torch.long),
+        ]
+    )
 
 
 def to_numpy(tensor: Tensor) -> np.ndarray:
@@ -72,6 +74,7 @@ def to_numpy(tensor: Tensor) -> np.ndarray:
 @dataclass
 class CellBatches:
     """Partitioning of cells into batches with ATAC coordinate boundaries."""
+
     cell_boundaries: Tensor
     atac_cell_boundaries: Tensor
     region_counts_per_cell: Tensor
@@ -82,6 +85,7 @@ class CellBatches:
 @dataclass
 class RegionBatches:
     """Region grouping per cell-batch with sort/unsort index arrays."""
+
     regions: Tensor
     region_batch_boundaries: Tensor
     region_rep: Tensor
@@ -97,12 +101,16 @@ def create_cell_batches(atac: Tensor, batch_size: int, n_cells: int) -> CellBatc
     cell_boundaries = torch.hstack((cell_boundaries, torch.tensor(n_cells)))
 
     _, _, region_counts_per_cell = torch.unique(
-        atac[0, :], return_inverse=True, return_counts=True,
+        atac[0, :],
+        return_inverse=True,
+        return_counts=True,
     )
     region_counts_per_cell = region_counts_per_cell.long()
     cell_array = torch.arange(n_cells)
     cell_indices_expanded = torch.repeat_interleave(
-        cell_array, region_counts_per_cell, dim=0,
+        cell_array,
+        region_counts_per_cell,
+        dim=0,
     )
 
     atac_cell_boundaries = torch.zeros(cell_boundaries.shape[0], dtype=torch.long)
@@ -150,7 +158,9 @@ def create_region_batches(atac: Tensor, cell_batches: CellBatches) -> RegionBatc
         unsort_indices[lo:hi] = ui
 
         unique_regions, _, counts = torch.unique(
-            sorted_vals, return_inverse=True, return_counts=True,
+            sorted_vals,
+            return_inverse=True,
+            return_counts=True,
         )
         regions = torch.cat((regions, unique_regions), 0)
         region_batch_boundaries[i] = unique_regions.shape[0] + region_batch_boundaries[i - 1]
@@ -184,7 +194,7 @@ def _move_batching_to_device(
         cb.cell_indices_expanded.to(device),
         cb.atac_cell_boundaries.to(device),
         rb.regions.to(device),
-        rb.region_batch_boundaries,        # kept on CPU (python indexing)
+        rb.region_batch_boundaries,  # kept on CPU (python indexing)
         rb.region_rep.to(device),
         rb.region_rep_expanded.to(device),
         rb.sort_indices.to(device),
@@ -326,33 +336,33 @@ class BurninMonitor:
 
 
 def _exp_counts_poisson(
-    x: Tensor,       # B × G
-    theta: Tensor,   # B × K
-    lam: Tensor,     # K × G
+    x: Tensor,  # B × G
+    theta: Tensor,  # B × K
+    lam: Tensor,  # K × G
 ) -> tuple[Tensor, Tensor]:
     """Expected topic allocations under a Poisson (Gamma-Poisson) likelihood."""
-    rate = theta @ lam + _EPS   # B × G
-    p = (theta.unsqueeze(2) * lam.unsqueeze(0)) / rate.unsqueeze(1)   # B × K × G
+    rate = theta @ lam + _EPS  # B × G
+    p = (theta.unsqueeze(2) * lam.unsqueeze(0)) / rate.unsqueeze(1)  # B × K × G
     exp_n = x.unsqueeze(1) * p  # B × K × G
     return exp_n.sum(2), exp_n.sum(0)  # n_ck (B×K), n_kg (K×G)
 
 
 def _exp_counts_multinomial(
-    x: Tensor,       # B × P
-    theta: Tensor,   # B × K
-    phi: Tensor,     # K × P
+    x: Tensor,  # B × P
+    theta: Tensor,  # B × K
+    phi: Tensor,  # K × P
 ) -> tuple[Tensor, Tensor]:
     """Expected topic allocations under a Multinomial (Dirichlet) likelihood."""
-    prob = theta @ phi + _EPS   # B × P
-    p = (theta.unsqueeze(2) * phi.unsqueeze(0)) / prob.unsqueeze(1)   # B × K × P
+    prob = theta @ phi + _EPS  # B × P
+    p = (theta.unsqueeze(2) * phi.unsqueeze(0)) / prob.unsqueeze(1)  # B × K × P
     exp_n = x.unsqueeze(1) * p  # B × K × P
     return exp_n.sum(2), exp_n.sum(0)
 
 
 def _resample_gamma(suff: Tensor, gamma: Tensor, tau: Tensor, theta_sum: Tensor) -> Tensor:
     """Gamma posterior for rate parameters (RNA / protein-NB)."""
-    shape = gamma + suff                  # K × G
-    rate = tau + theta_sum.unsqueeze(1)   # K × 1  broadcast
+    shape = gamma + suff  # K × G
+    rate = tau + theta_sum.unsqueeze(1)  # K × 1  broadcast
     return Gamma(shape, rate).sample()
 
 
@@ -368,22 +378,24 @@ def _resample_dirichlet(suff: Tensor, beta: Tensor) -> Tensor:
 
 
 def _atac_sparse_batch(
-    theta_batch: Tensor,     # B × K
-    phi_atac: Tensor,        # K × R
+    theta_batch: Tensor,  # B × K
+    phi_atac: Tensor,  # K × R
     n_topics: int,
     batch_size: int,
     # batching metadata (sliced for this cell batch)
-    c_lo: int, c_hi: int,
-    rep_c: Tensor,           # region_counts_per_cell  (full, on device)
+    c_lo: int,
+    c_hi: int,
+    rep_c: Tensor,  # region_counts_per_cell  (full, on device)
     rep_c_expanded: Tensor,  # cell_indices_expanded   (full, on device)
-    acb_lo: int, acb_hi: int,
+    acb_lo: int,
+    acb_hi: int,
     regions_slice: Tensor,
     region_rep_slice: Tensor,
     region_rep_expanded_slice: Tensor,
     sort_indices_slice: Tensor,
     unsort_indices_slice: Tensor,
     device: torch.device,
-    t_range: Tensor,         # arange(n_topics) on device, shape (K, 1)
+    t_range: Tensor,  # arange(n_topics) on device, shape (K, 1)
 ) -> tuple[Tensor, tuple[Tensor, Tensor] | None]:
     """Sparse Bernoulli ATAC update for one cell batch.
 
@@ -400,30 +412,33 @@ def _atac_sparse_batch(
 
     # Expand theta by number of ATAC entries per cell
     z_atac = torch.repeat_interleave(
-        theta_batch, rep_c[c_lo:c_hi], dim=0,
+        theta_batch,
+        rep_c[c_lo:c_hi],
+        dim=0,
     )  # (nnz_batch, K)
 
     # Expand phi for the relevant regions
-    phi_ = phi_atac[:, regions_slice]                                  # K × n_unique
-    phi_ = torch.repeat_interleave(phi_, region_rep_slice, dim=1)      # K × nnz_sorted
-    phi_ = torch.index_select(phi_, 1, unsort_indices_slice)           # K × nnz_batch
+    phi_ = phi_atac[:, regions_slice]  # K × n_unique
+    phi_ = torch.repeat_interleave(phi_, region_rep_slice, dim=1)  # K × nnz_sorted
+    phi_ = torch.index_select(phi_, 1, unsort_indices_slice)  # K × nnz_batch
 
     # z ∝ theta * phi  (element-wise per ATAC entry)
-    z_atac = z_atac.T * phi_                                           # K × nnz_batch
+    z_atac = z_atac.T * phi_  # K × nnz_batch
     z_atac = z_atac / (z_atac.sum(0, keepdim=True) + _EPS)
 
     # Sample topic assignment via inverse-CDF
     z_atac_cum = torch.cumsum(z_atac, dim=0)
     u = torch.rand(1, z_atac.shape[1], device=device)
     z_idx = torch.searchsorted(
-        z_atac_cum.T.contiguous(), u.T.contiguous(),
-    ).contiguous()                                                     # (nnz_batch, 1)
+        z_atac_cum.T.contiguous(),
+        u.T.contiguous(),
+    ).contiguous()  # (nnz_batch, 1)
 
     # One-hot encode
-    z_onehot = (z_idx == t_range.T).int()                              # (nnz_batch, K)
+    z_onehot = (z_idx == t_range.T).int()  # (nnz_batch, K)
 
     # --- Accumulate n_ck for this batch (scatter_add by cell) ---
-    h_cell = rep_c_expanded[acb_lo:acb_hi] % batch_size                # local cell idx
+    h_cell = rep_c_expanded[acb_lo:acb_hi] % batch_size  # local cell idx
     n_ck_atac = torch.zeros(B, n_topics, device=device)
     n_ck_atac.scatter_add_(0, h_cell.unsqueeze(1).expand_as(z_onehot), z_onehot.float())
 
@@ -545,10 +560,21 @@ def run_gibbs_sampler(
     # Prepare ATAC batching tensors on device
     has_atac = "chromatin" in modalities and cell_batches is not None
     if has_atac:
-        (c_bounds, rep_c, rep_c_exp, acb,
-         regions_all, region_batching, region_rep_all, region_rep_exp_all,
-         sort_idx_all, unsort_idx_all) = _move_batching_to_device(
-            cell_batches, region_batches, device,
+        (
+            c_bounds,
+            rep_c,
+            rep_c_exp,
+            acb,
+            regions_all,
+            region_batching,
+            region_rep_all,
+            region_rep_exp_all,
+            sort_idx_all,
+            unsort_idx_all,
+        ) = _move_batching_to_device(
+            cell_batches,
+            region_batches,
+            device,
         )
         t_range = torch.arange(K, device=device).reshape(K, 1)
     else:
@@ -563,14 +589,12 @@ def run_gibbs_sampler(
     def gibbs_epoch():
         nonlocal theta
         n_ck = torch.zeros(C, K, device=device)
-        suff_stats: dict[str, Tensor] = {
-            m: torch.zeros_like(lambda_dict[m]) for m in modalities
-        }
+        suff_stats: dict[str, Tensor] = {m: torch.zeros_like(lambda_dict[m]) for m in modalities}
 
         # --- dense modalities (RNA, protein) via random mini-batches ---
         perm = torch.randperm(C, device=device)
         for start in range(0, C, batch_size):
-            idx = perm[start: start + batch_size]
+            idx = perm[start : start + batch_size]
             theta_b = theta[idx]
 
             for m in dense_mods:
@@ -602,16 +626,21 @@ def run_gibbs_sampler(
                 n_ck_atac, atac_suff = _atac_sparse_batch(
                     theta[c_lo:c_hi],
                     lambda_dict["chromatin"],
-                    K, batch_size,
-                    c_lo, c_hi,
-                    rep_c, rep_c_exp,
-                    acb_lo, acb_hi,
+                    K,
+                    batch_size,
+                    c_lo,
+                    c_hi,
+                    rep_c,
+                    rep_c_exp,
+                    acb_lo,
+                    acb_hi,
                     regions_all[rb_lo:rb_hi],
                     region_rep_all[rb_lo:rb_hi],
                     region_rep_exp_all[acb_lo:acb_hi],
                     sort_idx_all[acb_lo:acb_hi],
                     unsort_idx_all[acb_lo:acb_hi],
-                    device, t_range,
+                    device,
+                    t_range,
                 )
                 n_ck[c_lo:c_hi] += n_ck_atac
                 if atac_suff is not None:
@@ -625,7 +654,10 @@ def run_gibbs_sampler(
         for m in modalities:
             if m == "rna" or (m == "protein" and protein_likelihood == "nb"):
                 lambda_dict[m] = _resample_gamma(
-                    suff_stats[m], priors[m]["gamma"], priors[m]["tau"], theta_sum,
+                    suff_stats[m],
+                    priors[m]["gamma"],
+                    priors[m]["tau"],
+                    theta_sum,
                 )
             else:
                 lambda_dict[m] = _resample_dirichlet(suff_stats[m], priors[m]["beta"])
@@ -637,10 +669,16 @@ def run_gibbs_sampler(
     # ---------------------------------------------------------------
     # PHASE 1:  Initial burn-in (with optional auto-detection)
     # ---------------------------------------------------------------
-    monitor = BurninMonitor(
-        window=burnin_window, rtol=burnin_rtol,
-        patience=burnin_patience, min_iters=min_initial_burnin,
-    ) if auto_burnin else None
+    monitor = (
+        BurninMonitor(
+            window=burnin_window,
+            rtol=burnin_rtol,
+            patience=burnin_patience,
+            min_iters=min_initial_burnin,
+        )
+        if auto_burnin
+        else None
+    )
     burnin_ll_trace: list[float] = []
     burnin_converged_at: int | None = None
 
@@ -651,7 +689,11 @@ def run_gibbs_sampler(
         gibbs_epoch()
         if it % ll_every == 0:
             ll = compute_log_likelihood(
-                dense_data, theta, lambda_dict, modalities, protein_likelihood,
+                dense_data,
+                theta,
+                lambda_dict,
+                modalities,
+                protein_likelihood,
             )["total"]
             burnin_ll_trace.append(ll)
             if progress:
@@ -680,10 +722,7 @@ def run_gibbs_sampler(
     S = n_samples
     total_sampling_iters = n_samples * thin
     theta_samps = torch.empty(S, C, K, dtype=torch.float32)
-    lambda_samps: dict[str, Tensor] = {
-        m: torch.empty(S, K, feature_dims[m], dtype=torch.float32)
-        for m in modalities
-    }
+    lambda_samps: dict[str, Tensor] = {m: torch.empty(S, K, feature_dims[m], dtype=torch.float32) for m in modalities}
     ll_history: list[float] = []
     store_idx = 0
 
@@ -695,7 +734,11 @@ def run_gibbs_sampler(
 
         if it % ll_every == 0:
             ll = compute_log_likelihood(
-                dense_data, theta, lambda_dict, modalities, protein_likelihood,
+                dense_data,
+                theta,
+                lambda_dict,
+                modalities,
+                protein_likelihood,
             )["total"]
             ll_history.append(ll)
             if progress:

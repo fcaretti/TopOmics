@@ -15,11 +15,9 @@ import anndata as ad
 import mudata as mu
 import numpy as np
 import pytest
-import torch
 import scipy.sparse as sp
 
 from topomics.models import MultimodalAmortizedLDA
-
 
 # ============================================================================
 # Fixtures

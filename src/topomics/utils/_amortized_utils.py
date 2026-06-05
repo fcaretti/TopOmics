@@ -16,15 +16,11 @@ CLAMP_MAX = 1.0 / CLAMP_EPS
 
 
 def clamp_symmetric(t: torch.Tensor) -> torch.Tensor:
-    return torch.nan_to_num(
-        t, nan=0.0, posinf=CLAMP_MAX, neginf=-CLAMP_MAX
-    ).clamp(min=-CLAMP_MAX, max=CLAMP_MAX)
+    return torch.nan_to_num(t, nan=0.0, posinf=CLAMP_MAX, neginf=-CLAMP_MAX).clamp(min=-CLAMP_MAX, max=CLAMP_MAX)
 
 
 def clamp_positive(t: torch.Tensor) -> torch.Tensor:
-    return torch.nan_to_num(
-        t, nan=CLAMP_EPS, posinf=CLAMP_MAX, neginf=CLAMP_EPS
-    ).clamp(min=CLAMP_EPS, max=CLAMP_MAX)
+    return torch.nan_to_num(t, nan=CLAMP_EPS, posinf=CLAMP_MAX, neginf=CLAMP_EPS).clamp(min=CLAMP_EPS, max=CLAMP_MAX)
 
 
 def logistic_normal_approximation(alpha: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -36,9 +32,9 @@ def logistic_normal_approximation(alpha: torch.Tensor) -> tuple[torch.Tensor, to
 
 
 def horseshoe_shrinkage(
-    caux: torch.Tensor,     # scalar
-    tau: torch.Tensor,      # (K, 1)
-    delta: torch.Tensor,    # (F,)
+    caux: torch.Tensor,  # scalar
+    tau: torch.Tensor,  # (K, 1)
+    delta: torch.Tensor,  # (F,)
     lambda_: torch.Tensor,  # (K, F)
 ) -> torch.Tensor:
     """
@@ -72,10 +68,10 @@ def horseshoe_shrinkage(
     When τ²δ²λ² >> c²: λ̃ → 1 (no shrinkage, signal preserved)
     When τ²δ²λ² << c²: λ̃ → 0 (strong shrinkage, noise removed)
     """
-    caux_sq = caux ** 2
-    tau_sq = tau ** 2              # (K, 1)
-    delta_sq = delta.unsqueeze(0) ** 2   # (1, F)
-    lambda_sq = lambda_ ** 2       # (K, F)
+    caux_sq = caux**2
+    tau_sq = tau**2  # (K, 1)
+    delta_sq = delta.unsqueeze(0) ** 2  # (1, F)
+    lambda_sq = lambda_**2  # (K, F)
 
     numerator = caux_sq * tau_sq * delta_sq * lambda_sq
     denominator = caux_sq + tau_sq * delta_sq * lambda_sq
@@ -231,13 +227,13 @@ class AttentionAggregator(nn.Module):
         w : (M, B, 1)
             Per-cell mixing weights summing to 1 over M (absent modalities = 0).
         """
-        emb = mus.permute(1, 0, 2)              # (B, M, K)
-        v = torch.tanh(emb @ self.w_omega)       # (B, M, att_dim)
-        vu = (v @ self.u_omega).squeeze(-1)      # (B, M)
+        emb = mus.permute(1, 0, 2)  # (B, M, K)
+        v = torch.tanh(emb @ self.w_omega)  # (B, M, att_dim)
+        vu = (v @ self.u_omega).squeeze(-1)  # (B, M)
 
         # Mask absent modalities before softmax
-        masks_BM = masks.T                       # (B, M)
+        masks_BM = masks.T  # (B, M)
         vu = vu.masked_fill(~masks_BM.bool(), -CLAMP_MAX)
-        alpha = torch.softmax(vu, dim=1)         # (B, M)
+        alpha = torch.softmax(vu, dim=1)  # (B, M)
 
-        return alpha.T.unsqueeze(-1)             # (M, B, 1)
+        return alpha.T.unsqueeze(-1)  # (M, B, 1)

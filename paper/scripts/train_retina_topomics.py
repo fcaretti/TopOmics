@@ -13,7 +13,6 @@ from pathlib import Path
 
 import numpy as np
 import scanpy as sc
-import scvi
 from anndata import AnnData
 
 from topomics.models import MultimodalAmortizedLDA
@@ -63,12 +62,7 @@ def prepare_retina_data(save_path: str = "/data/retina_dataset") -> AnnData:
     adata.raw = adata
 
     # Find highly variable genes
-    sc.pp.highly_variable_genes(
-        adata,
-        n_top_genes=2000,
-        batch_key="batch",
-        flavor="seurat_v3"
-    )
+    sc.pp.highly_variable_genes(adata, n_top_genes=2000, batch_key="batch", flavor="seurat_v3")
 
     logger.info(f"After filtering: {adata.shape}")
     logger.info(f"Highly variable genes: {adata.var['highly_variable'].sum()}")
@@ -84,7 +78,7 @@ def train_topomics(
     n_hidden: int = 128,
     max_epochs: int = 100,
     output_dir: str = "paper/models",
-    seed: int = 42
+    seed: int = 42,
 ) -> MultimodalAmortizedLDA:
     """
     Train topomics model with or without batch correction.
@@ -119,7 +113,7 @@ def train_topomics(
     np.random.seed(seed)
 
     # Use HVGs and raw counts
-    adata_hvg = adata[:, adata.var['highly_variable']].copy()
+    adata_hvg = adata[:, adata.var["highly_variable"]].copy()
     adata_hvg.X = adata_hvg.layers["counts"]
 
     if batch_correction:
@@ -133,7 +127,7 @@ def train_topomics(
         MultimodalAmortizedLDA.setup_anndata(
             adata_hvg,
             layer=None,  # Use .X which has counts
-            categorical_covariate_keys=["batch"]
+            categorical_covariate_keys=["batch"],
         )
     else:
         MultimodalAmortizedLDA.setup_anndata(
@@ -192,47 +186,21 @@ def train_topomics(
 def main():
     parser = argparse.ArgumentParser(description="Train topomics on retina dataset")
     parser.add_argument(
-        "--data_path",
-        type=str,
-        default="/data/retina_dataset",
-        help="Path to save/load retina dataset"
+        "--data_path", type=str, default="/data/retina_dataset", help="Path to save/load retina dataset"
     )
     parser.add_argument(
-        "--output_dir",
-        type=str,
-        default="/data/topomics_models/retina",
-        help="Directory to save trained models"
+        "--output_dir", type=str, default="/data/topomics_models/retina", help="Directory to save trained models"
     )
-    parser.add_argument(
-        "--n_topics",
-        type=int,
-        default=30,
-        help="Number of topics"
-    )
-    parser.add_argument(
-        "--n_hidden",
-        type=int,
-        default=128,
-        help="Hidden layer size"
-    )
-    parser.add_argument(
-        "--max_epochs",
-        type=int,
-        default=100,
-        help="Maximum training epochs"
-    )
-    parser.add_argument(
-        "--seed",
-        type=int,
-        default=42,
-        help="Random seed"
-    )
+    parser.add_argument("--n_topics", type=int, default=30, help="Number of topics")
+    parser.add_argument("--n_hidden", type=int, default=128, help="Hidden layer size")
+    parser.add_argument("--max_epochs", type=int, default=100, help="Maximum training epochs")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument(
         "--encode_covariates",
         type=str,
         default="both",
         choices=["true", "false", "both", "none"],
-        help="Train with encode_covariates=True, False, both, or none (no batch correction)"
+        help="Train with encode_covariates=True, False, both, or none (no batch correction)",
     )
 
     args = parser.parse_args()
@@ -256,9 +224,9 @@ def main():
 
     # Train model(s)
     if args.encode_covariates in ["true", "both"]:
-        logger.info("\n" + "="*80)
+        logger.info("\n" + "=" * 80)
         logger.info("Training topomics with encode_covariates=True")
-        logger.info("="*80 + "\n")
+        logger.info("=" * 80 + "\n")
         model_true = train_topomics(
             adata,
             encode_covariates=True,
@@ -266,13 +234,13 @@ def main():
             n_hidden=args.n_hidden,
             max_epochs=args.max_epochs,
             output_dir=args.output_dir,
-            seed=args.seed
+            seed=args.seed,
         )
 
     if args.encode_covariates in ["false", "both"]:
-        logger.info("\n" + "="*80)
+        logger.info("\n" + "=" * 80)
         logger.info("Training topomics with encode_covariates=False")
-        logger.info("="*80 + "\n")
+        logger.info("=" * 80 + "\n")
         model_false = train_topomics(
             adata,
             encode_covariates=False,
@@ -280,13 +248,13 @@ def main():
             n_hidden=args.n_hidden,
             max_epochs=args.max_epochs,
             output_dir=args.output_dir,
-            seed=args.seed
+            seed=args.seed,
         )
 
     if args.encode_covariates == "none":
-        logger.info("\n" + "="*80)
+        logger.info("\n" + "=" * 80)
         logger.info("Training topomics without batch correction")
-        logger.info("="*80 + "\n")
+        logger.info("=" * 80 + "\n")
         model_no_batch = train_topomics(
             adata,
             encode_covariates=False,
@@ -295,7 +263,7 @@ def main():
             n_hidden=args.n_hidden,
             max_epochs=args.max_epochs,
             output_dir=args.output_dir,
-            seed=args.seed
+            seed=args.seed,
         )
 
     # Save final adata with all representations to /data

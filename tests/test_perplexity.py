@@ -18,10 +18,10 @@ import pytest
 
 from topomics.models import MultimodalAmortizedLDA
 
-
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
+
 
 @pytest.fixture(scope="module")
 def rna_adata():
@@ -60,6 +60,7 @@ def trained_model_with_regularization(rna_adata):
 # ELBO tests
 # ---------------------------------------------------------------------------
 
+
 def test_elbo_is_finite(trained_model):
     elbo = trained_model.get_elbo()
     assert np.isfinite(elbo), f"ELBO is not finite: {elbo}"
@@ -75,6 +76,7 @@ def test_elbo_is_negative(trained_model):
 # Perplexity tests
 # ---------------------------------------------------------------------------
 
+
 def test_perplexity_is_finite(trained_model):
     ppl = trained_model.get_perplexity()
     assert np.isfinite(ppl), f"Perplexity is not finite: {ppl}"
@@ -88,7 +90,7 @@ def test_perplexity_greater_than_one(trained_model):
 
 def test_perplexity_not_nan(trained_model):
     ppl = trained_model.get_perplexity()
-    assert not np.isnan(ppl), f"Perplexity is NaN"
+    assert not np.isnan(ppl), "Perplexity is NaN"
 
 
 def test_perplexity_finite_with_regularization(trained_model_with_regularization):
@@ -112,6 +114,7 @@ def test_perplexity_reasonable_range(trained_model):
 # Per-modality perplexity tests
 # ---------------------------------------------------------------------------
 
+
 def test_perplexity_per_modality_finite(trained_model):
     result = trained_model.get_perplexity_per_modality()
     for mod_name, ppl in result.items():
@@ -127,9 +130,7 @@ def test_perplexity_per_modality_greater_than_one(trained_model):
 def test_perplexity_per_modality_finite_with_regularization(trained_model_with_regularization):
     result = trained_model_with_regularization.get_perplexity_per_modality()
     for mod_name, ppl in result.items():
-        assert np.isfinite(ppl), (
-            f"Per-modality perplexity for {mod_name} is not finite with regularization: {ppl}"
-        )
+        assert np.isfinite(ppl), f"Per-modality perplexity for {mod_name} is not finite with regularization: {ppl}"
 
 
 def test_perplexity_per_modality_keys(trained_model, rna_adata):

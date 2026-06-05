@@ -12,19 +12,18 @@ Tests for two new optional architecture features:
 
 from __future__ import annotations
 
+import anndata as ad
 import numpy as np
 import pytest
 import scipy.sparse as sp
 import torch
-import anndata as ad
-import mudata as mu
 
 from topomics.models import MultimodalAmortizedLDA
-
 
 # ---------------------------------------------------------------------------
 # Shared fixtures
 # ---------------------------------------------------------------------------
+
 
 @pytest.fixture(scope="module")
 def rna_adata():
@@ -38,10 +37,12 @@ def rna_adata():
 def multimodal_adata():
     N, F1, F2 = 120, 40, 30
     rng = np.random.default_rng(seed=8)
-    X = np.hstack([
-        rng.negative_binomial(5, 0.4, size=(N, F1)),
-        rng.negative_binomial(3, 0.5, size=(N, F2)),
-    ]).astype(np.float32)
+    X = np.hstack(
+        [
+            rng.negative_binomial(5, 0.4, size=(N, F1)),
+            rng.negative_binomial(3, 0.5, size=(N, F2)),
+        ]
+    ).astype(np.float32)
     return ad.AnnData(X=X), N, F1, F2
 
 
@@ -67,8 +68,8 @@ def spatial_adata():
 # Feature 1: Attention aggregation
 # ===========================================================================
 
-class TestAttentionAggregation:
 
+class TestAttentionAggregation:
     def test_attention_single_modality_runs(self, rna_adata):
         """Attention aggregation should work with a single modality."""
         adata, _, F = rna_adata
@@ -103,6 +104,7 @@ class TestAttentionAggregation:
     def test_attention_weights_sum_to_one(self, multimodal_adata):
         """Attention weights should sum to 1 per cell across modalities."""
         from topomics.module._amortizedLDA import AttentionAggregator
+
         adata, N, F1, F2 = multimodal_adata
         agg = AttentionAggregator(n_topics=5, att_dim=16)
 
@@ -119,6 +121,7 @@ class TestAttentionAggregation:
     def test_attention_masks_absent_modality(self):
         """Absent modalities (mask=0) should receive zero attention weight."""
         from topomics.module._amortizedLDA import AttentionAggregator
+
         agg = AttentionAggregator(n_topics=5, att_dim=16)
 
         M, B, K = 2, 4, 5
@@ -151,13 +154,19 @@ class TestAttentionAggregation:
         MultimodalAmortizedLDA.setup_anndata(adata)
 
         model_moe = MultimodalAmortizedLDA(
-            adata, n_topics=5, n_inputs_modalities=[F1, F2],
-            likelihoods=["gamma_poisson", "gamma_poisson"], aggregation_type="moe",
+            adata,
+            n_topics=5,
+            n_inputs_modalities=[F1, F2],
+            likelihoods=["gamma_poisson", "gamma_poisson"],
+            aggregation_type="moe",
         )
         model_att = MultimodalAmortizedLDA(
-            adata, n_topics=5, n_inputs_modalities=[F1, F2],
+            adata,
+            n_topics=5,
+            n_inputs_modalities=[F1, F2],
             likelihoods=["gamma_poisson", "gamma_poisson"],
-            aggregation_type="attention", att_dim=16,
+            aggregation_type="attention",
+            att_dim=16,
         )
         n_params_moe = sum(p.numel() for p in model_moe.module.parameters())
         n_params_att = sum(p.numel() for p in model_att.module.parameters())
@@ -169,8 +178,8 @@ class TestAttentionAggregation:
 # Feature 2: Pre-GCN FC layers
 # ===========================================================================
 
-class TestPreGCNLayers:
 
+class TestPreGCNLayers:
     def test_pre_gcn_layers_spatial_runs(self, spatial_adata):
         """Spatial model with gcn_n_pre_layers=1 should train without error."""
         adata, _, F = spatial_adata
@@ -220,12 +229,18 @@ class TestPreGCNLayers:
         MultimodalAmortizedLDA.setup_anndata(adata)
 
         model_base = MultimodalAmortizedLDA(
-            adata, n_topics=5, n_inputs_modalities=[F],
-            likelihoods=["gamma_poisson"], gcn_n_pre_layers=0,
+            adata,
+            n_topics=5,
+            n_inputs_modalities=[F],
+            likelihoods=["gamma_poisson"],
+            gcn_n_pre_layers=0,
         )
         model_pre = MultimodalAmortizedLDA(
-            adata, n_topics=5, n_inputs_modalities=[F],
-            likelihoods=["gamma_poisson"], gcn_n_pre_layers=1,
+            adata,
+            n_topics=5,
+            n_inputs_modalities=[F],
+            likelihoods=["gamma_poisson"],
+            gcn_n_pre_layers=1,
         )
         n_base = sum(p.numel() for p in model_base.module.parameters())
         n_pre = sum(p.numel() for p in model_pre.module.parameters())
@@ -240,7 +255,7 @@ class TestPreGCNLayers:
             n_topics=5,
             n_inputs_modalities=[F],
             likelihoods=["gamma_poisson"],
-            gcn_n_pre_layers=2,   # ignored when spatial=False
+            gcn_n_pre_layers=2,  # ignored when spatial=False
         )
         model.train(max_epochs=3, batch_size=32)
         assert model.module._guide.gcn_encoders is None

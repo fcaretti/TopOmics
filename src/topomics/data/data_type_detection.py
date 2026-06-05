@@ -87,6 +87,5 @@ def validate_data_type(data) -> None:
     data_type = detect_data_type(data)
     if data_type == "unknown":
         raise TypeError(
-            f"Unsupported data type: {type(data)}. "
-            "Supported types: AnnData, MuData, SpatialData, or dict[str, AnnData]"
+            f"Unsupported data type: {type(data)}. Supported types: AnnData, MuData, SpatialData, or dict[str, AnnData]"
         )

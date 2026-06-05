@@ -23,7 +23,6 @@ import torch
 
 from topomics.models import MultimodalAmortizedLDA
 
-
 # ============================================================================
 # Fixtures
 # ============================================================================
@@ -99,7 +98,7 @@ def multimodal_mudata_rna_harmony():
     adata_rna = ad.AnnData(
         X=rna_counts.astype(np.float32),
         obs={"cell_id": [f"cell_{i}" for i in range(N)]},
-        var={"gene_names": [f"gene_{i}" for i in range(G)]}
+        var={"gene_names": [f"gene_{i}" for i in range(G)]},
     )
 
     # Harmony modality - continuous embeddings
@@ -107,7 +106,7 @@ def multimodal_mudata_rna_harmony():
     adata_harmony = ad.AnnData(
         X=harmony_emb.astype(np.float32),
         obs={"cell_id": [f"cell_{i}" for i in range(N)]},
-        var={"dim_names": [f"harmony_{i}" for i in range(D)]}
+        var={"dim_names": [f"harmony_{i}" for i in range(D)]},
     )
 
     mdata = mu.MuData({"rna": adata_rna, "harmony": adata_harmony})
@@ -196,8 +195,8 @@ def test_gaussian_forward_pass(continuous_adata):
         likelihoods=["gaussian"],
     )
 
-    from scvi.dataloaders import DataSplitter
     from scvi._constants import REGISTRY_KEYS
+    from scvi.dataloaders import DataSplitter
 
     data_splitter = DataSplitter(
         adata_manager=model.adata_manager,
@@ -283,9 +282,7 @@ def test_gaussian_topic_by_feature_no_softmax(continuous_adata):
     # For Gaussian, topic-feature values should NOT sum to 1 per topic (not on simplex)
     # and can be negative. Column sums (per-topic) should NOT be ~1.
     col_sums = tbf.values.sum(axis=0)
-    assert not np.allclose(col_sums, 1.0, atol=0.1), (
-        "Gaussian topic-feature dist should NOT be on the simplex"
-    )
+    assert not np.allclose(col_sums, 1.0, atol=0.1), "Gaussian topic-feature dist should NOT be on the simplex"
 
 
 # ============================================================================
@@ -298,7 +295,8 @@ def test_gaussian_with_batch_correction(continuous_adata_with_batch):
     adata, N, F = continuous_adata_with_batch
 
     MultimodalAmortizedLDA.setup_anndata(
-        adata, layer=None,
+        adata,
+        layer=None,
         categorical_covariate_keys=["batch"],
     )
     model = MultimodalAmortizedLDA(
@@ -412,16 +410,12 @@ def test_multimodal_gaussian_topic_by_feature(multimodal_mudata_rna_harmony):
     # RNA (modality 0): should be on simplex — columns (topics) sum to ~1
     rna_tbf = tbf[0]
     rna_col_sums = rna_tbf.sum(axis=0)
-    assert np.allclose(rna_col_sums, 1.0, atol=0.05), (
-        f"RNA topic-feature columns should sum to ~1, got {rna_col_sums}"
-    )
+    assert np.allclose(rna_col_sums, 1.0, atol=0.05), f"RNA topic-feature columns should sum to ~1, got {rna_col_sums}"
 
     # Harmony (modality 1): should NOT be on simplex
     harmony_tbf = tbf[1]
     harmony_col_sums = harmony_tbf.sum(axis=0)
-    assert not np.allclose(harmony_col_sums, 1.0, atol=0.1), (
-        "Gaussian topic-feature columns should NOT sum to 1"
-    )
+    assert not np.allclose(harmony_col_sums, 1.0, atol=0.1), "Gaussian topic-feature columns should NOT sum to 1"
 
 
 # ============================================================================

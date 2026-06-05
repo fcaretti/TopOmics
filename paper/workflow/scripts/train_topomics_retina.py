@@ -9,7 +9,6 @@ import sys
 import warnings
 
 import numpy as np
-import scanpy as sc
 
 warnings.filterwarnings("ignore", message=".*was not registered in the param store.*")
 warnings.filterwarnings("ignore", message=".*Found plate statements in guide but not model.*")

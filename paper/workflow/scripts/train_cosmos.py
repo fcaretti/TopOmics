@@ -1,10 +1,16 @@
 """Train COSMOS baseline."""
-import json, os, sys, warnings
-import numpy as np
+
+import json
+import os
+import sys
+import warnings
+
 import anndata as ad
+import numpy as np
 import scanpy as sc
 import scipy.sparse as sp
 import torch
+
 warnings.filterwarnings("ignore")
 
 sys.path.insert(0, os.path.dirname(__file__))

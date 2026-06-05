@@ -10,12 +10,11 @@ import argparse
 import os
 from pathlib import Path
 
+import celltypist
 import muon as mu
 import numpy as np
 import pandas as pd
 import scanpy as sc
-
-import celltypist
 from celltypist import models
 
 

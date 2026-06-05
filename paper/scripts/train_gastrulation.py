@@ -12,7 +12,6 @@ Hyperparameters configurable via command line:
 import argparse
 import os
 import warnings
-from pathlib import Path
 
 import matplotlib.pyplot as plt
 import mudata as md
@@ -24,8 +23,7 @@ try:
     import scvelo as scv
 except ImportError as err:
     raise ImportError(
-        "scvelo is required for this script. Install with `pip install scvelo` "
-        "or `uv pip install scvelo`."
+        "scvelo is required for this script. Install with `pip install scvelo` or `uv pip install scvelo`."
     ) from err
 
 from topomics.models.amortizedLDA import MultimodalAmortizedLDA
@@ -41,61 +39,37 @@ def parse_args():
         type=str,
         default="logistic_normal",
         choices=["logistic_normal", "horseshoe"],
-        help="Feature prior type (default: logistic_normal)"
+        help="Feature prior type (default: logistic_normal)",
     )
     parser.add_argument(
         "--weight_mode",
         type=str,
         default="cell",
         choices=["equal", "universal", "cell"],
-        help="Aggregation strategy for modalities (default: cell)"
+        help="Aggregation strategy for modalities (default: cell)",
     )
     parser.add_argument(
-        "--learnable_dispersion",
-        action="store_true",
-        help="Learn dispersion parameters (default: False)"
+        "--learnable_dispersion", action="store_true", help="Learn dispersion parameters (default: False)"
     )
     parser.add_argument(
-        "--global_dispersion",
-        action="store_true",
-        help="Use global dispersion instead of per-gene (default: False)"
+        "--global_dispersion", action="store_true", help="Use global dispersion instead of per-gene (default: False)"
     )
     parser.add_argument(
         "--aggregation_type",
         type=str,
         default="moe",
         choices=["moe", "attention"],
-        help="Aggregation type for multimodal (default: moe)"
+        help="Aggregation type for multimodal (default: moe)",
     )
-    parser.add_argument(
-        "--att_dim",
-        type=int,
-        default=16,
-        help="Attention projection dimension (default: 16)"
-    )
-    parser.add_argument(
-        "--n_topics",
-        type=int,
-        default=10,
-        help="Number of topics (default: 10)"
-    )
-    parser.add_argument(
-        "--max_epochs",
-        type=int,
-        default=300,
-        help="Maximum training epochs (default: 100)"
-    )
-    parser.add_argument(
-        "--batch_size",
-        type=int,
-        default=256,
-        help="Batch size (default: 256)"
-    )
+    parser.add_argument("--att_dim", type=int, default=16, help="Attention projection dimension (default: 16)")
+    parser.add_argument("--n_topics", type=int, default=10, help="Number of topics (default: 10)")
+    parser.add_argument("--max_epochs", type=int, default=300, help="Maximum training epochs (default: 100)")
+    parser.add_argument("--batch_size", type=int, default=256, help="Batch size (default: 256)")
     parser.add_argument(
         "--output_dir",
         type=str,
         default="/data/topomics_models/gastrulation",
-        help="Output directory for model and plots"
+        help="Output directory for model and plots",
     )
     return parser.parse_args()
 
@@ -139,7 +113,7 @@ def create_model(mdata, args):
         weight_mode=args.weight_mode,
         aggregation_type=args.aggregation_type,
         att_dim=args.att_dim,
-        cell_topic_prior=1/args.n_topics,
+        cell_topic_prior=1 / args.n_topics,
         topic_feature_prior_type=args.feature_prior_type,
         learnable_dispersion=args.learnable_dispersion,
         global_dispersion=args.global_dispersion,
@@ -192,13 +166,13 @@ def save_results(model, mdata, adata, output_dir):
     n_train = int(mdata.n_obs * 0.8)
     n_val = mdata.n_obs - n_train
     fig, ax = plt.subplots(figsize=(10, 6))
-    ax.plot(model.history['elbo_train'] / n_train, label='Train ELBO (per cell)')
-    ax.plot(model.history['elbo_val'] / n_val, label='Val ELBO (per cell)')
-    ax.set_xlabel('Epoch')
-    ax.set_ylabel('ELBO / cell')
-    ax.set_title('Training Curve')
+    ax.plot(model.history["elbo_train"] / n_train, label="Train ELBO (per cell)")
+    ax.plot(model.history["elbo_val"] / n_val, label="Val ELBO (per cell)")
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("ELBO / cell")
+    ax.set_title("Training Curve")
     ax.legend()
-    plt.savefig(os.path.join(output_dir, "training_curve.png"), dpi=150, bbox_inches='tight')
+    plt.savefig(os.path.join(output_dir, "training_curve.png"), dpi=150, bbox_inches="tight")
     plt.close()
 
     # Topic UMAP colored by stage and leiden
@@ -206,7 +180,7 @@ def save_results(model, mdata, adata, output_dir):
     sc.pl.embedding(adata, basis="topic_umap", color="leiden", frameon=False, ax=axes[0], show=False)
     sc.pl.embedding(adata, basis="topic_umap", color="stage", frameon=False, ax=axes[1], show=False)
     plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, "umap_topic.png"), dpi=150, bbox_inches='tight')
+    plt.savefig(os.path.join(output_dir, "umap_topic.png"), dpi=150, bbox_inches="tight")
     plt.close()
 
     # Topic distribution
@@ -219,29 +193,29 @@ def save_results(model, mdata, adata, output_dir):
     ax.set_ylabel("Topic proportion")
     ax.set_title("Global topic distribution (mean +/- std)")
     plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, "topic_distribution.png"), dpi=150, bbox_inches='tight')
+    plt.savefig(os.path.join(output_dir, "topic_distribution.png"), dpi=150, bbox_inches="tight")
     plt.close()
 
     # Metrics
     metrics = {}
-    metrics['perplexity'] = model.get_perplexity()
-    metrics['entropy'] = model.get_entropy(normalised=True)
-    metrics['diversity'] = model.get_topic_diversity()
+    metrics["perplexity"] = model.get_perplexity()
+    metrics["entropy"] = model.get_entropy(normalised=True)
+    metrics["diversity"] = model.get_topic_diversity()
 
     # Per-modality metrics
     perplexity_per_mod = model.get_perplexity_per_modality()
     for mod_name, ppl in perplexity_per_mod.items():
-        metrics[f'perplexity_{mod_name}'] = ppl
+        metrics[f"perplexity_{mod_name}"] = ppl
 
-    diversity_mature = model.get_topic_diversity(modality='mature')
-    diversity_immature = model.get_topic_diversity(modality='immature')
-    metrics['diversity_mature'] = diversity_mature
-    metrics['diversity_immature'] = diversity_immature
+    diversity_mature = model.get_topic_diversity(modality="mature")
+    diversity_immature = model.get_topic_diversity(modality="immature")
+    metrics["diversity_mature"] = diversity_mature
+    metrics["diversity_immature"] = diversity_immature
 
     # Modality weights
     weights = model.get_modality_weights()
-    metrics['mean_mature_weight'] = weights['mature'].mean()
-    metrics['mean_immature_weight'] = weights['immature'].mean()
+    metrics["mean_mature_weight"] = weights["mature"].mean()
+    metrics["mean_immature_weight"] = weights["immature"].mean()
 
     # Save metrics
     metrics_df = pd.DataFrame([metrics])
@@ -265,7 +239,7 @@ def main():
     # Create output directory with hyperparameter info
     hyperparam_str = f"prior_{args.feature_prior_type}_weight_{args.weight_mode}"
     if args.learnable_dispersion:
-        hyperparam_str += f"_learnable_disp"
+        hyperparam_str += "_learnable_disp"
         if args.global_dispersion:
             hyperparam_str += "_global"
         else:

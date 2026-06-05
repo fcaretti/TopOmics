@@ -20,7 +20,6 @@ import torch
 
 from topomics.models import MultimodalAmortizedLDA
 
-
 # ============================================================================
 # Fixtures
 # ============================================================================
@@ -105,7 +104,7 @@ def multimodal_mudata_with_bernoulli():
     adata_rna = ad.AnnData(
         X=rna_counts.astype(np.float32),
         obs={"cell_id": [f"cell_{i}" for i in range(N)]},
-        var={"gene_names": [f"gene_{i}" for i in range(G)]}
+        var={"gene_names": [f"gene_{i}" for i in range(G)]},
     )
 
     # ATAC modality - binary data
@@ -113,7 +112,7 @@ def multimodal_mudata_with_bernoulli():
     adata_atac = ad.AnnData(
         X=atac_binary.astype(np.float32),
         obs={"cell_id": [f"cell_{i}" for i in range(N)]},
-        var={"peak_names": [f"peak_{i}" for i in range(P)]}
+        var={"peak_names": [f"peak_{i}" for i in range(P)]},
     )
 
     # Create MuData
@@ -202,8 +201,8 @@ def test_bernoulli_forward_pass(binary_adata):
     )
 
     # Get a batch of data - use make_data_loader from SCVI
-    from scvi.dataloaders import DataSplitter
     from scvi._constants import REGISTRY_KEYS
+    from scvi.dataloaders import DataSplitter
 
     data_splitter = DataSplitter(
         adata_manager=model.adata_manager,
@@ -297,8 +296,8 @@ def test_bernoulli_clamping():
     )
 
     # Forward pass should not raise (clamping prevents p > 1)
-    from scvi.dataloaders import DataSplitter
     from scvi._constants import REGISTRY_KEYS
+    from scvi.dataloaders import DataSplitter
 
     data_splitter = DataSplitter(
         adata_manager=model.adata_manager,
@@ -356,12 +355,12 @@ def test_background_not_applied_to_bernoulli(multimodal_mudata_with_bernoulli):
 
     # Check that background buffers exist only for RNA modality (index 0)
     assert hasattr(model.module.model, "init_bg_mean_0")
-    bg_0 = getattr(model.module.model, "init_bg_mean_0")
+    bg_0 = model.module.model.init_bg_mean_0
     assert bg_0.numel() == G  # Should have background for RNA features
 
     # ATAC modality (index 1) should have placeholder background
     assert hasattr(model.module.model, "init_bg_mean_1")
-    bg_1 = getattr(model.module.model, "init_bg_mean_1")
+    bg_1 = model.module.model.init_bg_mean_1
     assert bg_1.numel() == 1  # Placeholder (single element)
 
 

@@ -36,7 +36,7 @@ def train_scvi(
     max_epochs: int = 100,
     output_dir: str = "paper/models",
     seed: int = 42,
-    batch_correction: bool = True
+    batch_correction: bool = True,
 ) -> scvi.model.SCVI:
     """
     Train scVI model with or without batch correction.
@@ -70,7 +70,7 @@ def train_scvi(
     np.random.seed(seed)
 
     # Use HVGs and raw counts
-    adata_hvg = adata[:, adata.var['highly_variable']].copy()
+    adata_hvg = adata[:, adata.var["highly_variable"]].copy()
     adata_hvg.X = adata_hvg.layers["counts"]
 
     if batch_correction:
@@ -132,49 +132,17 @@ def main():
         "--data_path",
         type=str,
         default="paper/models/retina_preprocessed.h5ad",
-        help="Path to preprocessed retina dataset"
+        help="Path to preprocessed retina dataset",
     )
     parser.add_argument(
-        "--output_dir",
-        type=str,
-        default="/data/topomics_models/retina",
-        help="Directory to save trained model"
+        "--output_dir", type=str, default="/data/topomics_models/retina", help="Directory to save trained model"
     )
-    parser.add_argument(
-        "--n_latent",
-        type=int,
-        default=30,
-        help="Latent dimension"
-    )
-    parser.add_argument(
-        "--n_hidden",
-        type=int,
-        default=128,
-        help="Hidden layer size"
-    )
-    parser.add_argument(
-        "--n_layers",
-        type=int,
-        default=2,
-        help="Number of hidden layers"
-    )
-    parser.add_argument(
-        "--max_epochs",
-        type=int,
-        default=100,
-        help="Maximum training epochs"
-    )
-    parser.add_argument(
-        "--seed",
-        type=int,
-        default=42,
-        help="Random seed"
-    )
-    parser.add_argument(
-        "--no_batch",
-        action="store_true",
-        help="Train without batch correction"
-    )
+    parser.add_argument("--n_latent", type=int, default=30, help="Latent dimension")
+    parser.add_argument("--n_hidden", type=int, default=128, help="Hidden layer size")
+    parser.add_argument("--n_layers", type=int, default=2, help="Number of hidden layers")
+    parser.add_argument("--max_epochs", type=int, default=100, help="Maximum training epochs")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed")
+    parser.add_argument("--no_batch", action="store_true", help="Train without batch correction")
 
     args = parser.parse_args()
 
@@ -184,12 +152,12 @@ def main():
     batch_correction = not args.no_batch
 
     # Train model
-    logger.info("\n" + "="*80)
+    logger.info("\n" + "=" * 80)
     if batch_correction:
         logger.info("Training scVI (with batch correction)")
     else:
         logger.info("Training scVI (no batch correction)")
-    logger.info("="*80 + "\n")
+    logger.info("=" * 80 + "\n")
 
     model = train_scvi(
         adata,
@@ -199,11 +167,12 @@ def main():
         max_epochs=args.max_epochs,
         output_dir=args.output_dir,
         seed=args.seed,
-        batch_correction=batch_correction
+        batch_correction=batch_correction,
     )
 
     # Save final adata with representation to /data (to save space)
     from pathlib import Path as P
+
     data_dir = P(args.data_path).parent
     suffix = "retina_with_scvi.h5ad" if batch_correction else "retina_with_scvi_no_batch.h5ad"
     adata.write(data_dir / suffix)

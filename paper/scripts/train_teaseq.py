@@ -12,20 +12,18 @@ Hyperparameters configurable via command line:
 import argparse
 import os
 import warnings
-from pathlib import Path
 
+import anndata as ad
 import matplotlib.pyplot as plt
 import muon as mu
 import numpy as np
 import pandas as pd
 import scanpy as sc
-import seaborn as sns
-import anndata as ad
 
 from topomics import MultimodalAmortizedLDA
 
-warnings.filterwarnings('ignore', message='.*was not registered in the param store.*')
-warnings.filterwarnings('ignore', message='.*Found plate statements in guide but not model.*')
+warnings.filterwarnings("ignore", message=".*was not registered in the param store.*")
+warnings.filterwarnings("ignore", message=".*Found plate statements in guide but not model.*")
 
 
 def parse_args():
@@ -35,75 +33,48 @@ def parse_args():
         type=str,
         default="logistic_normal",
         choices=["logistic_normal", "horseshoe"],
-        help="Feature prior type (default: logistic_normal)"
+        help="Feature prior type (default: logistic_normal)",
     )
     parser.add_argument(
         "--weight_mode",
         type=str,
         default="cell",
         choices=["equal", "universal", "cell"],
-        help="Aggregation strategy for modalities (default: cell)"
+        help="Aggregation strategy for modalities (default: cell)",
     )
     parser.add_argument(
         "--likelihood_weight_mode",
         type=str,
         default="none",
         choices=["none", "inverse_features", "sqrt_inverse_features"],
-        help="Rescale per-modality likelihoods (default: none)"
+        help="Rescale per-modality likelihoods (default: none)",
     )
     parser.add_argument(
         "--likelihood_weight_ref",
         type=str,
         default="mean",
         choices=["mean", "median", "max"],
-        help="Reference feature count for likelihood rescaling (default: mean)"
+        help="Reference feature count for likelihood rescaling (default: mean)",
     )
     parser.add_argument(
-        "--learnable_dispersion",
-        action="store_true",
-        help="Learn dispersion parameters (default: False)"
+        "--learnable_dispersion", action="store_true", help="Learn dispersion parameters (default: False)"
     )
     parser.add_argument(
-        "--global_dispersion",
-        action="store_true",
-        help="Use global dispersion instead of per-gene (default: False)"
+        "--global_dispersion", action="store_true", help="Use global dispersion instead of per-gene (default: False)"
     )
     parser.add_argument(
         "--aggregation_type",
         type=str,
         default="moe",
         choices=["moe", "attention"],
-        help="Aggregation type for multimodal (default: moe)"
+        help="Aggregation type for multimodal (default: moe)",
     )
+    parser.add_argument("--att_dim", type=int, default=16, help="Attention projection dimension (default: 16)")
+    parser.add_argument("--n_topics", type=int, default=10, help="Number of topics (default: 10)")
+    parser.add_argument("--max_epochs", type=int, default=500, help="Maximum training epochs (default: 1000)")
+    parser.add_argument("--batch_size", type=int, default=128, help="Batch size (default: 128)")
     parser.add_argument(
-        "--att_dim",
-        type=int,
-        default=16,
-        help="Attention projection dimension (default: 16)"
-    )
-    parser.add_argument(
-        "--n_topics",
-        type=int,
-        default=10,
-        help="Number of topics (default: 10)"
-    )
-    parser.add_argument(
-        "--max_epochs",
-        type=int,
-        default=500,
-        help="Maximum training epochs (default: 1000)"
-    )
-    parser.add_argument(
-        "--batch_size",
-        type=int,
-        default=128,
-        help="Batch size (default: 128)"
-    )
-    parser.add_argument(
-        "--output_dir",
-        type=str,
-        default="/data/topomics_models/teaseq",
-        help="Output directory for model and plots"
+        "--output_dir", type=str, default="/data/topomics_models/teaseq", help="Output directory for model and plots"
     )
     return parser.parse_args()
 
@@ -134,14 +105,14 @@ def load_data():
     _ensure_counts_layer(mdata.mod["prot"])
 
     # Binarize ATAC data
-    mdata.mod['atac'].layers['counts'] = (mdata.mod['atac'].layers['counts'] > 0).astype(int)
+    mdata.mod["atac"].layers["counts"] = (mdata.mod["atac"].layers["counts"] > 0).astype(int)
 
     # Filter to highly variable genes
-    sc.pp.highly_variable_genes(mdata.mod['rna'], n_top_genes=2000, flavor='seurat_v3', layer='counts')
-    mdata.mod['rna'] = mdata.mod['rna'][:, mdata.mod['rna'].var['highly_variable']].copy()
+    sc.pp.highly_variable_genes(mdata.mod["rna"], n_top_genes=2000, flavor="seurat_v3", layer="counts")
+    mdata.mod["rna"] = mdata.mod["rna"][:, mdata.mod["rna"].var["highly_variable"]].copy()
 
-    sc.pp.highly_variable_genes(mdata.mod['atac'], n_top_genes=10000, flavor='seurat_v3', layer='counts')
-    mdata.mod['atac'] = mdata.mod['atac'][:, mdata.mod['atac'].var['highly_variable']].copy()
+    sc.pp.highly_variable_genes(mdata.mod["atac"], n_top_genes=10000, flavor="seurat_v3", layer="counts")
+    mdata.mod["atac"] = mdata.mod["atac"][:, mdata.mod["atac"].var["highly_variable"]].copy()
 
     mdata.update()
 
@@ -155,9 +126,9 @@ def create_model(mdata, args):
         modalities=["rna", "atac", "prot"],
         n_topics=args.n_topics,
         likelihoods=["gamma_poisson", "bernoulli", "gamma_poisson"],
-        layers='counts',
+        layers="counts",
         n_hidden=64,
-        cell_topic_prior=1/args.n_topics,
+        cell_topic_prior=1 / args.n_topics,
         weight_mode=args.weight_mode,
         aggregation_type=args.aggregation_type,
         att_dim=args.att_dim,
@@ -212,13 +183,13 @@ def save_results(model, mdata, output_dir):
     n_train = int(mdata.n_obs * 0.8)
     n_val = mdata.n_obs - n_train
     fig, ax = plt.subplots(figsize=(10, 6))
-    ax.plot(model.history['elbo_train'] / n_train, label='Train ELBO (per cell)')
-    ax.plot(model.history['elbo_val'] / n_val, label='Val ELBO (per cell)')
-    ax.set_xlabel('Epoch')
-    ax.set_ylabel('ELBO / cell')
-    ax.set_title('Training Curve')
+    ax.plot(model.history["elbo_train"] / n_train, label="Train ELBO (per cell)")
+    ax.plot(model.history["elbo_val"] / n_val, label="Val ELBO (per cell)")
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("ELBO / cell")
+    ax.set_title("Training Curve")
     ax.legend()
-    plt.savefig(os.path.join(output_dir, "training_curve.png"), dpi=150, bbox_inches='tight')
+    plt.savefig(os.path.join(output_dir, "training_curve.png"), dpi=150, bbox_inches="tight")
     plt.close()
 
     # UMAP colored by topic clusters (prefer true UMAP if available)
@@ -281,26 +252,26 @@ def save_results(model, mdata, output_dir):
     ax.set_ylabel("Topic proportion")
     ax.set_title("Global topic distribution (mean +/- std)")
     plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, "topic_distribution.png"), dpi=150, bbox_inches='tight')
+    plt.savefig(os.path.join(output_dir, "topic_distribution.png"), dpi=150, bbox_inches="tight")
     plt.close()
 
     # Metrics
     metrics = {}
-    metrics['perplexity'] = model.get_perplexity()
-    metrics['entropy'] = model.get_entropy(normalised=True)
-    metrics['diversity'] = model.get_topic_diversity()
+    metrics["perplexity"] = model.get_perplexity()
+    metrics["entropy"] = model.get_entropy(normalised=True)
+    metrics["diversity"] = model.get_topic_diversity()
 
     # Per-modality metrics
     perplexity_per_mod = model.get_perplexity_per_modality()
     for mod_name, ppl in perplexity_per_mod.items():
-        metrics[f'perplexity_{mod_name}'] = ppl
+        metrics[f"perplexity_{mod_name}"] = ppl
 
-    diversity_rna = model.get_topic_diversity(modality='rna')
-    diversity_atac = model.get_topic_diversity(modality='atac')
-    diversity_prot = model.get_topic_diversity(modality='prot')
-    metrics['diversity_rna'] = diversity_rna
-    metrics['diversity_atac'] = diversity_atac
-    metrics['diversity_prot'] = diversity_prot
+    diversity_rna = model.get_topic_diversity(modality="rna")
+    diversity_atac = model.get_topic_diversity(modality="atac")
+    diversity_prot = model.get_topic_diversity(modality="prot")
+    metrics["diversity_rna"] = diversity_rna
+    metrics["diversity_atac"] = diversity_atac
+    metrics["diversity_prot"] = diversity_prot
 
     # Save metrics
     metrics_df = pd.DataFrame([metrics])
@@ -328,7 +299,7 @@ def main():
         if args.likelihood_weight_ref != "mean":
             hyperparam_str += f"_{args.likelihood_weight_ref}"
     if args.learnable_dispersion:
-        hyperparam_str += f"_learnable_disp"
+        hyperparam_str += "_learnable_disp"
         if args.global_dispersion:
             hyperparam_str += "_global"
         else:

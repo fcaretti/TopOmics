@@ -119,9 +119,7 @@ def test_extract_from_mudata_basic(synthetic_mudata):
 def test_extract_from_mudata_with_layers(synthetic_mudata):
     """Test MuData extraction with layer specification."""
     # Test with dict layers
-    adata_concat, metadata = extract_from_mudata(
-        synthetic_mudata, layers={"rna": "counts", "protein": "raw"}
-    )
+    adata_concat, metadata = extract_from_mudata(synthetic_mudata, layers={"rna": "counts", "protein": "raw"})
 
     assert adata_concat.n_obs == 100
     assert adata_concat.n_vars == 70
@@ -158,9 +156,7 @@ def test_extract_from_adata_dict_with_layers(synthetic_adata_rna, synthetic_adat
     """Test extraction from dict with layer specification."""
     data_dict = {"rna": synthetic_adata_rna, "protein": synthetic_adata_protein}
 
-    adata_concat, metadata = extract_from_adata_dict(
-        data_dict, layers={"rna": "counts", "protein": "raw"}
-    )
+    adata_concat, metadata = extract_from_adata_dict(data_dict, layers={"rna": "counts", "protein": "raw"})
 
     assert metadata["layer_dict"] == {"rna": "counts", "protein": "raw"}
 
@@ -177,9 +173,7 @@ def test_extract_from_anndata_basic(synthetic_adata_rna):
 
 def test_extract_from_anndata_with_layer(synthetic_adata_rna):
     """Test extraction from AnnData with layer."""
-    adata_processed, metadata = extract_from_anndata(
-        synthetic_adata_rna, modality_name="rna", layer="counts"
-    )
+    adata_processed, metadata = extract_from_anndata(synthetic_adata_rna, modality_name="rna", layer="counts")
 
     assert adata_processed.n_obs == 100
     assert metadata["modality_names"] == ["rna"]
@@ -218,9 +212,7 @@ def test_from_data_with_mudata(synthetic_mudata):
 
 def test_from_data_with_mudata_string_layer(synthetic_mudata):
     """Test from_data() with string layer specification."""
-    model = MultimodalAmortizedLDA.from_data(
-        synthetic_mudata, layers="counts", n_topics=5, n_hidden=32
-    )
+    model = MultimodalAmortizedLDA.from_data(synthetic_mudata, layers="counts", n_topics=5, n_hidden=32)
 
     assert model is not None
     assert model.n_modalities == 2
@@ -230,9 +222,7 @@ def test_from_data_with_dict(synthetic_adata_rna, synthetic_adata_protein):
     """Test from_data() with dict input."""
     data_dict = {"rna": synthetic_adata_rna, "protein": synthetic_adata_protein}
 
-    model = MultimodalAmortizedLDA.from_data(
-        data_dict, layers={"rna": "counts"}, n_topics=5, n_hidden=32
-    )
+    model = MultimodalAmortizedLDA.from_data(data_dict, layers={"rna": "counts"}, n_topics=5, n_hidden=32)
 
     assert model is not None
     assert model.n_modalities == 2
@@ -255,9 +245,7 @@ def test_from_data_with_anndata(synthetic_adata_rna):
 
 def test_from_data_auto_infer_likelihoods(synthetic_mudata):
     """Test that likelihoods are auto-inferred."""
-    model = MultimodalAmortizedLDA.from_data(
-        synthetic_mudata, n_topics=5, n_hidden=32
-    )
+    model = MultimodalAmortizedLDA.from_data(synthetic_mudata, n_topics=5, n_hidden=32)
 
     # Should auto-infer gamma_poisson for rna, multinomial for protein
     assert model.likelihoods == ["gamma_poisson", "multinomial"]
@@ -288,9 +276,7 @@ def test_from_data_invalid_type():
 
 def test_model_trains(synthetic_mudata):
     """Test that model can train for a few iterations."""
-    model = MultimodalAmortizedLDA.from_data(
-        synthetic_mudata, n_topics=5, n_hidden=32
-    )
+    model = MultimodalAmortizedLDA.from_data(synthetic_mudata, n_topics=5, n_hidden=32)
 
     # Quick training run (just to verify it doesn't crash)
     model.train(max_epochs=2, check_val_every_n_epoch=None)
@@ -305,9 +291,7 @@ def test_model_trains(synthetic_mudata):
 
 def test_model_trains_with_layer_extraction(synthetic_mudata):
     """Test that model trains correctly with layer extraction."""
-    model = MultimodalAmortizedLDA.from_data(
-        synthetic_mudata, layers={"rna": "counts"}, n_topics=5, n_hidden=32
-    )
+    model = MultimodalAmortizedLDA.from_data(synthetic_mudata, layers={"rna": "counts"}, n_topics=5, n_hidden=32)
 
     # Quick training
     model.train(max_epochs=2, check_val_every_n_epoch=None)
@@ -363,11 +347,7 @@ def test_from_mudata_still_works(synthetic_mudata):
 def test_setup_data_with_mudata(synthetic_mudata):
     """Test new scvi-style API: setup_data() + instantiation with MuData."""
     # Step 1: Setup
-    MultimodalAmortizedLDA.setup_data(
-        synthetic_mudata,
-        modalities=["rna", "protein"],
-        layers="counts"
-    )
+    MultimodalAmortizedLDA.setup_data(synthetic_mudata, modalities=["rna", "protein"], layers="counts")
 
     # Step 2: Instantiate
     model = MultimodalAmortizedLDA(
@@ -375,7 +355,7 @@ def test_setup_data_with_mudata(synthetic_mudata):
         n_inputs_modalities=[50, 20],
         likelihoods=["gamma_poisson", "multinomial"],
         n_topics=10,
-        n_hidden=16
+        n_hidden=16,
     )
 
     assert model is not None
@@ -386,19 +366,11 @@ def test_setup_data_with_mudata(synthetic_mudata):
 def test_setup_data_with_anndata(synthetic_adata_rna):
     """Test new scvi-style API: setup_data() + instantiation with AnnData."""
     # Step 1: Setup
-    MultimodalAmortizedLDA.setup_data(
-        synthetic_adata_rna,
-        modalities=["rna"],
-        layers="counts"
-    )
+    MultimodalAmortizedLDA.setup_data(synthetic_adata_rna, modalities=["rna"], layers="counts")
 
     # Step 2: Instantiate
     model = MultimodalAmortizedLDA(
-        synthetic_adata_rna,
-        n_inputs_modalities=[50],
-        likelihoods=["gamma_poisson"],
-        n_topics=10,
-        n_hidden=16
+        synthetic_adata_rna, n_inputs_modalities=[50], likelihoods=["gamma_poisson"], n_topics=10, n_hidden=16
     )
 
     assert model is not None
@@ -411,10 +383,7 @@ def test_setup_data_with_dict(synthetic_adata_rna, synthetic_adata_protein):
     adata_dict = {"rna": synthetic_adata_rna, "protein": synthetic_adata_protein}
 
     # Step 1: Setup (returns processed AnnData for dict case)
-    adata_concat = MultimodalAmortizedLDA.setup_data(
-        adata_dict,
-        layers={"rna": "counts", "protein": "counts"}
-    )
+    adata_concat = MultimodalAmortizedLDA.setup_data(adata_dict, layers={"rna": "counts", "protein": "counts"})
 
     # Step 2: Instantiate with the processed AnnData
     model = MultimodalAmortizedLDA(
@@ -422,7 +391,7 @@ def test_setup_data_with_dict(synthetic_adata_rna, synthetic_adata_protein):
         n_inputs_modalities=[50, 20],
         likelihoods=["gamma_poisson", "multinomial"],
         n_topics=10,
-        n_hidden=16
+        n_hidden=16,
     )
 
     assert model is not None
@@ -436,7 +405,7 @@ def test_setup_mudata_with_new_parameters(synthetic_mudata):
     mdata_setup, modality_names, feat_counts = MultimodalAmortizedLDA.setup_mudata(
         synthetic_mudata,
         modalities=["rna", "protein"],  # New name
-        layers="counts",                 # New name
+        layers="counts",  # New name
     )
 
     assert modality_names == ["rna", "protein"]
@@ -448,7 +417,7 @@ def test_setup_mudata_with_new_parameters(synthetic_mudata):
         n_inputs_modalities=feat_counts,
         likelihoods=["gamma_poisson", "multinomial"],
         n_topics=10,
-        n_hidden=16
+        n_hidden=16,
     )
 
     assert model is not None
@@ -461,11 +430,7 @@ def test_setup_anndata_backward_compatibility(synthetic_adata_rna):
     MultimodalAmortizedLDA.setup_anndata(synthetic_adata_rna, layer="counts")
 
     model = MultimodalAmortizedLDA(
-        synthetic_adata_rna,
-        n_inputs_modalities=[50],
-        likelihoods=["gamma_poisson"],
-        n_topics=10,
-        n_hidden=16
+        synthetic_adata_rna, n_inputs_modalities=[50], likelihoods=["gamma_poisson"], n_topics=10, n_hidden=16
     )
 
     assert model is not None
@@ -474,18 +439,10 @@ def test_setup_anndata_backward_compatibility(synthetic_adata_rna):
 def test_setup_anndata_with_new_api(synthetic_adata_rna):
     """Test setup_anndata() with new parameters (layers, modalities)."""
     # New API with layers parameter
-    MultimodalAmortizedLDA.setup_anndata(
-        synthetic_adata_rna,
-        modalities=["rna"],
-        layers="counts"
-    )
+    MultimodalAmortizedLDA.setup_anndata(synthetic_adata_rna, modalities=["rna"], layers="counts")
 
     model = MultimodalAmortizedLDA(
-        synthetic_adata_rna,
-        n_inputs_modalities=[50],
-        likelihoods=["gamma_poisson"],
-        n_topics=10,
-        n_hidden=16
+        synthetic_adata_rna, n_inputs_modalities=[50], likelihoods=["gamma_poisson"], n_topics=10, n_hidden=16
     )
 
     assert model is not None
@@ -494,11 +451,7 @@ def test_setup_anndata_with_new_api(synthetic_adata_rna):
 def test_from_data_still_works_after_refactoring(synthetic_mudata):
     """Test that from_data() convenience wrapper still works after refactoring."""
     model = MultimodalAmortizedLDA.from_data(
-        synthetic_mudata,
-        modalities=["rna", "protein"],
-        layers="counts",
-        n_topics=10,
-        n_hidden=16
+        synthetic_mudata, modalities=["rna", "protein"], layers="counts", n_topics=10, n_hidden=16
     )
 
     assert model is not None
@@ -508,18 +461,14 @@ def test_from_data_still_works_after_refactoring(synthetic_mudata):
 
 def test_setup_data_with_mudata_trains(synthetic_mudata):
     """Test that models created with setup_data() can train."""
-    MultimodalAmortizedLDA.setup_data(
-        synthetic_mudata,
-        modalities=["rna", "protein"],
-        layers="counts"
-    )
+    MultimodalAmortizedLDA.setup_data(synthetic_mudata, modalities=["rna", "protein"], layers="counts")
 
     model = MultimodalAmortizedLDA(
         synthetic_mudata,
         n_inputs_modalities=[50, 20],
         likelihoods=["gamma_poisson", "multinomial"],
         n_topics=10,
-        n_hidden=16
+        n_hidden=16,
     )
 
     # Train for 1 epoch

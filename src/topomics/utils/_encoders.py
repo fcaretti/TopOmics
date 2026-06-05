@@ -44,20 +44,20 @@ class GCNEncoder(nn.Module):
         n_hidden: int,
         gcn_n_layers: int = 1,
         gcn_hidden_dims: list[int] | None = None,
-        gcn_n_pre_layers: int = 0,     # FC layers before graph convolution (0 = disabled)
+        gcn_n_pre_layers: int = 0,  # FC layers before graph convolution (0 = disabled)
         dropout: float = 0.1,
         add_self_loops: bool = True,
         conv_type: str = "GATv2Conv",  # or 'GATv2Conv'
-        heads: int = 4,              # used only by GAT
-        normalize: bool = True,      # used only by GCN
-        concat: bool = True,         # multi-head strategy for GAT
-        alpha_init: float = 0.7,     # initial weight for self signal
+        heads: int = 4,  # used only by GAT
+        normalize: bool = True,  # used only by GCN
+        concat: bool = True,  # multi-head strategy for GAT
+        alpha_init: float = 0.7,  # initial weight for self signal
         use_learned_alpha: bool = True,  # if False, uses fixed alpha_init
         var_eps: float = 1e-4,
         var_activation=None,
-        sampling: str = "approx",    # "approx" (stochastic neighbor sampling) or "exact" (k_hop_subgraph)
+        sampling: str = "approx",  # "approx" (stochastic neighbor sampling) or "exact" (k_hop_subgraph)
         fan_out: list[int] | None = None,  # per-layer fan-out for neighbor sampling
-        conv_first: bool = False,    # if True, run GCN on raw features then FC on seeds only
+        conv_first: bool = False,  # if True, run GCN on raw features then FC on seeds only
         **kwargs,
     ) -> None:
         super().__init__()
@@ -95,7 +95,7 @@ class GCNEncoder(nn.Module):
             gcn_input_dim = n_hidden  # GCN receives projected features
         else:
             self.pre_gcn_fc = None
-            gcn_input_dim = n_in     # GCN receives raw (normalized) counts
+            gcn_input_dim = n_in  # GCN receives raw (normalized) counts
 
         # Neighbor aggregation (graph convolution)
         self.conv_type = conv_type
@@ -141,7 +141,9 @@ class GCNEncoder(nn.Module):
         # Covariate parameters (already popped from kwargs above)
         self.n_cats_per_cov = n_cats_per_cov_kwarg
         self.n_continuous_cov = n_continuous_cov_kwarg
-        self.use_covariates = (self.n_cats_per_cov is not None and len(self.n_cats_per_cov) > 0) or self.n_continuous_cov > 0
+        self.use_covariates = (
+            self.n_cats_per_cov is not None and len(self.n_cats_per_cov) > 0
+        ) or self.n_continuous_cov > 0
 
         # scvi-style encoder for the self signal (n_layers / dropout_rate already popped)
         self.encoder = FCLayers(
@@ -220,7 +222,9 @@ class GCNEncoder(nn.Module):
         elif value >= 1.0:
             logit_value = torch.tensor(20.0, dtype=self._alpha_logit.dtype, device=self._alpha_logit.device)
         else:
-            logit_value = torch.logit(torch.tensor(value, dtype=self._alpha_logit.dtype, device=self._alpha_logit.device))
+            logit_value = torch.logit(
+                torch.tensor(value, dtype=self._alpha_logit.dtype, device=self._alpha_logit.device)
+            )
         self._alpha_logit.data.copy_(logit_value)
 
     def set_full_graph_data(self, x_full: torch.Tensor, edge_index_full: torch.Tensor):
@@ -251,9 +255,12 @@ class GCNEncoder(nn.Module):
         # Build neighbor sampler if requested
         if self.sampling == "approx":
             from topomics.utils.neighbor_sampler import NeighborSampler as _NS
+
             fan_out = self.fan_out if self.fan_out is not None else [10] * self.num_hops
             self._neighbor_sampler = _NS(
-                self.edge_index_full, self.num_nodes, fan_out=fan_out,
+                self.edge_index_full,
+                self.num_nodes,
+                fan_out=fan_out,
             )
             logger.info(
                 f"GCN graph initialized (CPU): {x_full.shape[0]} cells, "
@@ -312,8 +319,7 @@ class GCNEncoder(nn.Module):
 
         if batch_indices is None:
             raise ValueError(
-                "batch_indices (global cell indices) required. "
-                "This should be provided automatically by the guide."
+                "batch_indices (global cell indices) required. This should be provided automatically by the guide."
             )
 
         device = self.mean_encoder.weight.device  # model's compute device
@@ -321,9 +327,7 @@ class GCNEncoder(nn.Module):
         # ---- STEP 1: extract subgraph on CPU ----
         batch_indices_cpu = batch_indices.detach().cpu().long()
         if self._neighbor_sampler is not None:
-            subset, sub_edge_index, mapping = self._neighbor_sampler.sample(
-                batch_indices_cpu
-            )
+            subset, sub_edge_index, mapping = self._neighbor_sampler.sample(batch_indices_cpu)
         else:
             subset, sub_edge_index, mapping, _ = k_hop_subgraph(
                 batch_indices_cpu,
@@ -353,9 +357,7 @@ class GCNEncoder(nn.Module):
                 if i < len(self.convs) - 1:
                     h_nei = clamp_symmetric(F.relu(h_nei))
                     if self.gcn_dropout > 0:
-                        h_nei = F.dropout(
-                            h_nei, p=self.gcn_dropout, training=self.training
-                        )
+                        h_nei = F.dropout(h_nei, p=self.gcn_dropout, training=self.training)
 
             # Extract seeds BEFORE FC — FC only runs on batch_size nodes
             h_nei_seeds = clamp_symmetric(self.nei_proj(h_nei[mapping]))
@@ -380,9 +382,7 @@ class GCNEncoder(nn.Module):
                 if i < len(self.convs) - 1:
                     h_nei = clamp_symmetric(F.relu(h_nei))
                     if self.gcn_dropout > 0:
-                        h_nei = F.dropout(
-                            h_nei, p=self.gcn_dropout, training=self.training
-                        )
+                        h_nei = F.dropout(h_nei, p=self.gcn_dropout, training=self.training)
 
             # Mix self + neighbors (skip connection)
             h_sub = clamp_symmetric(self._mix_self_and_neighbors(h_self, h_nei))
@@ -483,9 +483,7 @@ class SGCEncoder(nn.Module):
         # STAMP-style: norm_topic BN on mu (always applied, even with 1 batch)
         # With frozen affine weights (weight.requires_grad = False)
         n_bn = max(n_batches, 1)
-        self.norm_topic = nn.ModuleList([
-            nn.BatchNorm1d(n_topics) for _ in range(n_bn)
-        ])
+        self.norm_topic = nn.ModuleList([nn.BatchNorm1d(n_topics) for _ in range(n_bn)])
         for norm in self.norm_topic:
             norm.weight.requires_grad = False
 

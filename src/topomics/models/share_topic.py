@@ -14,7 +14,6 @@ from anndata import AnnData
 from torch import Tensor
 
 from topomics.module._share_topic import (
-    BurninMonitor,
     anndata_to_sparse_coords,
     compute_log_likelihood,
     create_cell_batches,
@@ -132,19 +131,22 @@ class ShareTopic_LDA_Multi(BaseTopicModel):
             else:
                 self.dense_data[m] = _to_dense_float(raw_X, self.device)
 
-        self.feature_dims: dict[str, int] = {
-            m: self.dense_data[m].shape[1] for m in self.modalities
-        }
+        self.feature_dims: dict[str, int] = {m: self.dense_data[m].shape[1] for m in self.modalities}
 
         # ---- Dirichlet prior on theta ----------------------------------
         if np.isscalar(alpha):
             alpha = float(alpha)
             self.alpha = torch.full(
-                (1, self.K), alpha, dtype=torch.float32, device=self.device,
+                (1, self.K),
+                alpha,
+                dtype=torch.float32,
+                device=self.device,
             )
         else:
             self.alpha = torch.tensor(
-                alpha, dtype=torch.float32, device=self.device,
+                alpha,
+                dtype=torch.float32,
+                device=self.device,
             ).reshape(1, -1)
 
         # ---- Modality-specific priors ----------------------------------
@@ -191,7 +193,7 @@ class ShareTopic_LDA_Multi(BaseTopicModel):
                 else:
                     mean = X.mean()
                     var = X.var(unbiased=False).clamp_min(1e-6)
-                    g = mean ** 2 / var
+                    g = mean**2 / var
                     t = mean / var
                 self.priors[m] = {"gamma": g, "tau": t}
             elif m == "chromatin":
@@ -207,7 +209,7 @@ class ShareTopic_LDA_Multi(BaseTopicModel):
                     else:
                         mean = X.mean()
                         var = X.var(unbiased=False).clamp_min(1e-6)
-                        g = mean ** 2 / var
+                        g = mean**2 / var
                         t = mean / var
                     self.priors[m] = {"gamma": g, "tau": t}
                 else:
@@ -269,10 +271,13 @@ class ShareTopic_LDA_Multi(BaseTopicModel):
         # Build ATAC batching structures if needed
         if "chromatin" in self.modalities and self.atac_coords is not None:
             self._cell_batches = create_cell_batches(
-                self.atac_coords, batch_size, self.n_cells,
+                self.atac_coords,
+                batch_size,
+                self.n_cells,
             )
             self._region_batches = create_region_batches(
-                self.atac_coords, self._cell_batches,
+                self.atac_coords,
+                self._cell_batches,
             )
 
         # Initialise parameters
@@ -281,14 +286,25 @@ class ShareTopic_LDA_Multi(BaseTopicModel):
             if mod not in self.modalities:
                 mod = self.modalities[0]
             theta, lambda_dict = smart_initialize(
-                self.dense_data, self.K, self.priors, self.modalities,
-                self.feature_dims, self.protein_likelihood, mod, self.device,
+                self.dense_data,
+                self.K,
+                self.priors,
+                self.modalities,
+                self.feature_dims,
+                self.protein_likelihood,
+                mod,
+                self.device,
             )
             self._smart_init_done = True
         else:
             theta, lambda_dict = initialize_parameters(
-                self.K, self.n_cells, self.priors, self.modalities,
-                self.feature_dims, self.protein_likelihood, self.alpha,
+                self.K,
+                self.n_cells,
+                self.priors,
+                self.modalities,
+                self.feature_dims,
+                self.protein_likelihood,
+                self.alpha,
                 self.device,
             )
 
@@ -359,7 +375,11 @@ class ShareTopic_LDA_Multi(BaseTopicModel):
         theta = self.theta_samples.mean(0).to(self.device)
         lam = {m: self.lambda_samples[m].mean(0).to(self.device) for m in self.modalities}
         ll = compute_log_likelihood(
-            self.dense_data, theta, lam, self.modalities, self.protein_likelihood,
+            self.dense_data,
+            theta,
+            lam,
+            self.modalities,
+            self.protein_likelihood,
         )["total"]
         total_counts = sum(self.dense_data[m].sum().item() for m in self.modalities)
         return float(np.exp(-ll / max(total_counts, 1)))
@@ -369,7 +389,11 @@ class ShareTopic_LDA_Multi(BaseTopicModel):
         theta = self.theta_samples.mean(0).to(self.device)
         lam = {m: self.lambda_samples[m].mean(0).to(self.device) for m in self.modalities}
         ll = compute_log_likelihood(
-            self.dense_data, theta, lam, self.modalities, self.protein_likelihood,
+            self.dense_data,
+            theta,
+            lam,
+            self.modalities,
+            self.protein_likelihood,
         )
         ll.pop("total", None)
         return ll
@@ -379,7 +403,11 @@ class ShareTopic_LDA_Multi(BaseTopicModel):
         theta = self.theta_samples.mean(0).to(self.device)
         lam = {m: self.lambda_samples[m].mean(0).to(self.device) for m in self.modalities}
         ll = compute_log_likelihood(
-            self.dense_data, theta, lam, self.modalities, self.protein_likelihood,
+            self.dense_data,
+            theta,
+            lam,
+            self.modalities,
+            self.protein_likelihood,
         )
         result = {}
         for m in self.modalities:
@@ -390,6 +418,7 @@ class ShareTopic_LDA_Multi(BaseTopicModel):
     def get_modality_weights(self, **kwargs):
         """Not applicable for Gibbs — returns equal weights."""
         import pandas as pd
+
         w = 1.0 / len(self.modalities)
         return pd.DataFrame(
             {m: np.full(self.n_cells, w) for m in self.modalities},
@@ -432,9 +461,15 @@ class ShareTopic_LDA_Multi(BaseTopicModel):
                 # protein multinomial — sample from categorical per cell
                 n_per_cell = torch.poisson(rate.sum(1, keepdim=True))
                 probs = rate / (rate.sum(1, keepdim=True) + 1e-12)
-                counts = torch.distributions.Multinomial(
-                    total_count=1, probs=probs,
-                ).sample().squeeze() * n_per_cell
+                counts = (
+                    torch.distributions.Multinomial(
+                        total_count=1,
+                        probs=probs,
+                    )
+                    .sample()
+                    .squeeze()
+                    * n_per_cell
+                )
 
             adata = ad.AnnData(X=csr_matrix(to_numpy(counts)))
             result[m] = adata
@@ -470,7 +505,7 @@ class ShareTopic_LDA_Multi(BaseTopicModel):
         *,
         modalities: list[str] | None = None,
         device: str | None = None,
-    ) -> "ShareTopic_LDA_Multi":
+    ) -> ShareTopic_LDA_Multi:
         """Load a saved model.
 
         The original data (*mdata*) must be passed again because we do not

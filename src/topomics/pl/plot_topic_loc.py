@@ -1,44 +1,15 @@
-from typing import (
-    List,
-    Optional,
-    Tuple,
-    Union,
-)
-
-import anndata as ad
-import matplotlib as mpl
-import matplotlib.pyplot as plt
-
 # import textwrap
-import numpy as np
 import scanpy as sc
 
 # import seaborn as sns
-from matplotlib import rcParams
-from matplotlib.axes import Axes
 
 # import matplotlib.pyplot as plt
 # import numpy as np
-from matplotlib.colors import ListedColormap
-from matplotlib.gridspec import GridSpec
 
 # import pandas as pd
-from matplotlib.patches import Patch
 
 # from upsetplot import plot, from_contents
 # from itertools import chain
-from scanpy._utils import Empty, _empty
-from scanpy.pl._tools.scatterplots import (
-    _check_crop_coord,
-    _check_img,
-    _check_na_color,
-    _check_scale_factor,
-    _check_spatial_data,
-    _check_spot_size,
-)
-from scanpy.pl._utils import (
-    ColorLike,
-)
 
 
 def spatial(
@@ -71,7 +42,8 @@ def spatial(
         vmax (str, optional): The value representing the upper limit of the color scale. Defaults to "p99".
         show (bool, optional): Show the plot, do not return axis. Defaults to True.
 
-    Returns:
+    Returns
+    -------
         _type_: A plot
     """
     ax = sc.pl.embedding(

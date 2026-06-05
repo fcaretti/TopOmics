@@ -14,30 +14,22 @@ maintainers = [
 authors = [
   { name = "Federico Caretti" },
 ]
-requires-python = ">=3.12, <3.14" #unfortunately numba breaks with 3.14
+requires-python = ">=3.12,<3.14" #unfortunately numba breaks with 3.14
 classifiers = [
   "Programming Language :: Python :: 3 :: Only",
   "Programming Language :: Python :: 3.12",
   "Programming Language :: Python :: 3.13",
 ]
 dependencies = [
-  "anndata>=0.12.0",
+  "anndata>=0.12",
   "muon",
+  "numpy>=1.24,<2.3",
+  "pyro-ppl",
   "scanpy>=1.9.8",
+  "scvi-tools",
   # for debug logging (referenced from the issue template)
   "session-info2",
   "torch",
-  "numpy>=1.24,<2.3",
-  "pyro-ppl",
-  "scvi-tools",
-]
-
-optional-dependencies.spatial = [
-  "spatialdata>=0.6.1",
-  "squidpy>=1.6.6",
-  "spatialdata-plot>=0.2.13",
-  "torch-geometric",
-  "pyg-lib",
 ]
 
 optional-dependencies.dev = [
@@ -61,6 +53,14 @@ optional-dependencies.doc = [
   "sphinxcontrib-bibtex>=1",
   "sphinxext-opengraph",
 ]
+optional-dependencies.spatial = [
+  "pyg-lib",
+  "spatialdata>=0.6.1",
+  "spatialdata-plot>=0.2.13",
+  "squidpy>=1.6.6",
+  "torch-geometric",
+]
+
 optional-dependencies.test = [
   "coverage",
   "pytest",
@@ -166,4 +166,4 @@ skip = [
 ]
 
 [tool.uv]
-find-links = ["https://data.pyg.org/whl/torch-2.7.0+cu126.html"]
+find-links = [ "https://data.pyg.org/whl/torch-2.7.0+cu126.html" ]

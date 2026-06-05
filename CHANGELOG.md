@@ -13,4 +13,4 @@ and this project adheres to [Semantic Versioning][].
 ### Added
 
 - Basic tool, preprocessing and plotting functions
-- Class MultimodalAmortizedLDA, with support for 
+- Class MultimodalAmortizedLDA, with support for

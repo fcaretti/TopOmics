@@ -7,20 +7,21 @@ saving each image as a separate file.
 Output directory: /data/topomics_models/figures/retina/
 """
 
+from pathlib import Path
+
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import scanpy as sc
-import matplotlib.pyplot as plt
 import seaborn as sns
-from pathlib import Path
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.model_selection import cross_val_score, train_test_split
 from sklearn.metrics import (
     accuracy_score,
     balanced_accuracy_score,
     f1_score,
     silhouette_score,
 )
+from sklearn.model_selection import cross_val_score, train_test_split
 
 # ---------------------------------------------------------------------------
 # Config
@@ -57,11 +58,7 @@ def fname_safe(name: str) -> str:
 def is_topic_representation(name, rep, tol=1e-3):
     x = np.asarray(rep)
     name_flag = any(k in name.lower() for k in ["topic", "lda", "etm"])
-    simplex_flag = (
-        x.ndim == 2
-        and np.nanmin(x) >= -1e-8
-        and np.allclose(x.sum(axis=1), 1.0, atol=tol)
-    )
+    simplex_flag = x.ndim == 2 and np.nanmin(x) >= -1e-8 and np.allclose(x.sum(axis=1), 1.0, atol=tol)
     return name_flag or simplex_flag
 
 
@@ -135,8 +132,12 @@ for name in representations:
     # -- cell type --
     fig, ax = plt.subplots(figsize=(8, 6))
     sc.pl.umap(
-        tmp, color="labels", ax=ax, show=False,
-        title=f"{display} — Cell Type", legend_loc="right margin",
+        tmp,
+        color="labels",
+        ax=ax,
+        show=False,
+        title=f"{display} — Cell Type",
+        legend_loc="right margin",
     )
     fig.savefig(FIG_DIR / f"umap_{safe}_celltype.png", **SAVE_KW)
     plt.close(fig)
@@ -163,7 +164,8 @@ for name, rep in representations.items():
         print(f"  Silhouette error for {name}: {e}")
 
     try:
-        from scib.metrics import ilisi_graph, clisi_graph
+        from scib.metrics import clisi_graph, ilisi_graph
+
         metrics["iLISI"] = ilisi_graph(tmp, batch_key="batch", type_="embed", use_rep="X_latent")
         metrics["cLISI"] = clisi_graph(tmp, label_key="labels", type_="embed", use_rep="X_latent")
     except Exception:
@@ -185,7 +187,11 @@ for name, rep in representations.items():
 
     # Cell-type classification
     X_tr, X_te, y_tr, y_te = train_test_split(
-        X, y_cell, test_size=0.3, random_state=42, stratify=y_cell,
+        X,
+        y_cell,
+        test_size=0.3,
+        random_state=42,
+        stratify=y_cell,
     )
     clf = RandomForestClassifier(n_estimators=100, random_state=42, n_jobs=-1)
     clf.fit(X_tr, y_tr)
@@ -194,25 +200,31 @@ for name, rep in representations.items():
 
     # Batch classification
     X_tr_b, X_te_b, y_tr_b, y_te_b = train_test_split(
-        X, y_batch, test_size=0.3, random_state=42, stratify=y_batch,
+        X,
+        y_batch,
+        test_size=0.3,
+        random_state=42,
+        stratify=y_batch,
     )
     clf_b = RandomForestClassifier(n_estimators=100, random_state=42, n_jobs=-1)
     clf_b.fit(X_tr_b, y_tr_b)
     y_pred_b = clf_b.predict(X_te_b)
     cv_b = cross_val_score(clf_b, X, y_batch, cv=5, n_jobs=-1)
 
-    classification_metrics.append({
-        "method": name,
-        "accuracy": accuracy_score(y_te, y_pred),
-        "f1_macro": f1_score(y_te, y_pred, average="macro"),
-        "f1_weighted": f1_score(y_te, y_pred, average="weighted"),
-        "cv_accuracy_mean": cv.mean(),
-        "cv_accuracy_std": cv.std(),
-        "batch_accuracy": accuracy_score(y_te_b, y_pred_b),
-        "batch_balanced_accuracy": balanced_accuracy_score(y_te_b, y_pred_b),
-        "batch_cv_accuracy_mean": cv_b.mean(),
-        "batch_cv_accuracy_std": cv_b.std(),
-    })
+    classification_metrics.append(
+        {
+            "method": name,
+            "accuracy": accuracy_score(y_te, y_pred),
+            "f1_macro": f1_score(y_te, y_pred, average="macro"),
+            "f1_weighted": f1_score(y_te, y_pred, average="weighted"),
+            "cv_accuracy_mean": cv.mean(),
+            "cv_accuracy_std": cv.std(),
+            "batch_accuracy": accuracy_score(y_te_b, y_pred_b),
+            "batch_balanced_accuracy": balanced_accuracy_score(y_te_b, y_pred_b),
+            "batch_cv_accuracy_mean": cv_b.mean(),
+            "batch_cv_accuracy_std": cv_b.std(),
+        }
+    )
 
 classification_df = pd.DataFrame(classification_metrics)
 summary_df = batch_metrics_df.merge(classification_df, on="method")
@@ -244,7 +256,8 @@ for metric, title, higher_better in metrics_to_plot:
 
     data = summary_df.sort_values(metric, ascending=not higher_better)
     colors = sns.color_palette(
-        "RdYlGn" if higher_better else "RdYlGn_r", n_colors=len(data),
+        "RdYlGn" if higher_better else "RdYlGn_r",
+        n_colors=len(data),
     )
     labels = [DISPLAY_NAMES.get(m, m) for m in data["method"]]
 
@@ -279,9 +292,13 @@ for name in representations:
     for bval in batch_vals:
         mask = batch_col == bval
         ax.scatter(
-            umap_coords[mask, 0], umap_coords[mask, 1],
-            c=palette.get(str(bval), None), s=1, alpha=0.4,
-            rasterized=True, label=f"Batch {bval}",
+            umap_coords[mask, 0],
+            umap_coords[mask, 1],
+            c=palette.get(str(bval), None),
+            s=1,
+            alpha=0.4,
+            rasterized=True,
+            label=f"Batch {bval}",
         )
     ax.set_title(f"{display} — Batch Mixing")
     ax.set_xlabel("UMAP1")

@@ -20,7 +20,6 @@ import warnings
 
 import numpy as np
 import pandas as pd
-import scanpy as sc
 import squidpy as sq
 
 # NumPy 2.0 compatibility fix for sctm package
@@ -36,9 +35,7 @@ if SCRATCH_SITE_PACKAGES not in sys.path:
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Train baseline models on Visium H&E dataset"
-    )
+    parser = argparse.ArgumentParser(description="Train baseline models on Visium H&E dataset")
     parser.add_argument(
         "--n_latent",
         type=int,
@@ -286,6 +283,7 @@ def main():
         except Exception as e:
             print(f"scVI training failed: {e}")
             import traceback
+
             traceback.print_exc()
 
     # Train STAMP
@@ -296,6 +294,7 @@ def main():
         except Exception as e:
             print(f"STAMP training failed: {e}")
             import traceback
+
             traceback.print_exc()
 
     # Train AmortizedLDA
@@ -306,6 +305,7 @@ def main():
         except Exception as e:
             print(f"AmortizedLDA training failed: {e}")
             import traceback
+
             traceback.print_exc()
 
     # Summary
@@ -323,9 +323,7 @@ def main():
             "n_latent": [r.shape[1] for r in results.values()],
             "n_cells": [r.shape[0] for r in results.values()],
         }
-        pd.DataFrame(summary).to_csv(
-            os.path.join(args.output_dir, "training_summary.csv"), index=False
-        )
+        pd.DataFrame(summary).to_csv(os.path.join(args.output_dir, "training_summary.csv"), index=False)
 
 
 if __name__ == "__main__":

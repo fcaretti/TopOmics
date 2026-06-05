@@ -200,7 +200,6 @@ class BaseTopicModel:
         P  : shape (n_feat_a, n_feat_b) – interaction score between every
             feature of `mod_a` and every feature of `mod_b`
         """
-
         if self.n_modalities == 1:
             raise ValueError("This function is available only with more than one modality")
         # ------------------------------------------------------------------
@@ -222,9 +221,7 @@ class BaseTopicModel:
                     names = phi.columns.tolist()
                     phi = phi.values
                 else:
-                    raise ValueError(
-                        f"Unexpected feature-topic shape {phi.shape}; expected topics on one axis."
-                    )
+                    raise ValueError(f"Unexpected feature-topic shape {phi.shape}; expected topics on one axis.")
             else:
                 phi = np.asarray(phi, dtype=float)
             return phi, names
@@ -485,9 +482,7 @@ class BaseTopicModel:
 
             if return_scores:
                 # Return list of (feature_name, score) tuples
-                result[f"topic_{k}"] = [
-                    (feature_names[i], float(phi_array[k, i])) for i in top_indices
-                ]
+                result[f"topic_{k}"] = [(feature_names[i], float(phi_array[k, i])) for i in top_indices]
             else:
                 # Return list of feature names only
                 result[f"topic_{k}"] = [feature_names[i] for i in top_indices]

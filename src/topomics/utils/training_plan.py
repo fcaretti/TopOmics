@@ -45,6 +45,7 @@ class MultimodalLDAPyroTrainingPlan(PyroTrainingPlan):
         # Default to AdamW optimizer (better weight decay handling than Adam)
         if "optim" not in kwargs:
             import pyro.optim
+
             optim_kwargs = kwargs.pop("optim_kwargs", None) or {}
             if "lr" not in optim_kwargs:
                 optim_kwargs["lr"] = 1e-3
@@ -57,7 +58,7 @@ class MultimodalLDAPyroTrainingPlan(PyroTrainingPlan):
         # KL annealing parameters
         self.kl_warmup_fraction = kl_warmup_fraction  # Fraction of epochs for warmup
         self.kl_warmup_min = kl_warmup_min  # Starting KL weight (typically 0)
-        self._kl_weight_final = getattr(self.module, 'kl_weight', 1.0)  # Store target
+        self._kl_weight_final = getattr(self.module, "kl_weight", 1.0)  # Store target
 
     # ------------------------------------------------------------------ #
     # Helpers
@@ -133,7 +134,7 @@ class MultimodalLDAPyroTrainingPlan(PyroTrainingPlan):
         if self.kl_warmup_fraction > 0:
             kl_weight = self._get_kl_weight(0, self.trainer.max_epochs)
             self.module.kl_weight = kl_weight
-            logger.info(f"KL annealing enabled: warmup over {self.kl_warmup_fraction*100:.0f}% of epochs")
+            logger.info(f"KL annealing enabled: warmup over {self.kl_warmup_fraction * 100:.0f}% of epochs")
 
     def on_train_epoch_start(self):
         """Update KL weight at start of each epoch for annealing."""
@@ -158,7 +159,7 @@ class MultimodalLDAPyroTrainingPlan(PyroTrainingPlan):
             output["elbo_val"] = elbo
 
         # Log entropy term if available
-        if hasattr(self.module, 'guide') and hasattr(self.module.guide, '_last_entropy'):
+        if hasattr(self.module, "guide") and hasattr(self.module.guide, "_last_entropy"):
             entropy = self.module.guide._last_entropy
             if entropy is not None and self.module.entropy_weight > 0:
                 self.log(
@@ -172,7 +173,7 @@ class MultimodalLDAPyroTrainingPlan(PyroTrainingPlan):
                 output["entropy_mean_val"] = float(entropy)
 
         # Log topic variance term if available
-        if hasattr(self.module, 'guide') and hasattr(self.module.guide, '_last_topic_variance'):
+        if hasattr(self.module, "guide") and hasattr(self.module.guide, "_last_topic_variance"):
             variance = self.module.guide._last_topic_variance
             if variance is not None and self.module.topic_variance_weight > 0:
                 self.log(
@@ -205,7 +206,9 @@ class MultimodalLDAPyroTrainingPlan(PyroTrainingPlan):
             self.log("entropy_mean_val", mean_entropy, on_epoch=True, prog_bar=False, logger=True, batch_size=1)
 
         # Aggregate topic variance if present
-        variances = [x["topic_variance_mean_val"] for x in self.validation_step_outputs if "topic_variance_mean_val" in x]
+        variances = [
+            x["topic_variance_mean_val"] for x in self.validation_step_outputs if "topic_variance_mean_val" in x
+        ]
         if variances:
             mean_variance = sum(variances) / len(variances)
             self.log("topic_variance_mean_val", mean_variance, on_epoch=True, prog_bar=False, logger=True, batch_size=1)
