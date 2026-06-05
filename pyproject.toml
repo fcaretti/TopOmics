@@ -103,7 +103,7 @@ matrix.deps.env-vars = [
 [tool.ruff]
 line-length = 120
 src = [ "src" ]
-extend-exclude = ["*.ipynb"]
+extend-exclude = [ "*.ipynb" ]
 
 format.docstring-code-format = true
 
