@@ -4,6 +4,7 @@ Scaling benchmark: multimodal cell-count sweep on synthetic RNA+ATAC.
 Generates synthetic data from a SHARE-Topic model fitted on lymphoma B-cells,
 then benchmarks MultiVI, TopOmics, and MOFA+ for increasing cell counts.
 """
+
 import json
 import os
 import time
@@ -23,6 +24,7 @@ SHARE_TOPIC_N_SAMPLES = 200
 
 def fit_share_topic(rna_path, atac_path, model_path, n_topics):
     import anndata as ad
+
     from topomics.models.share_topic import ShareTopic_LDA_Multi
 
     print("Fitting SHARE-Topic on lymphoma data...")
@@ -43,6 +45,7 @@ def fit_share_topic(rna_path, atac_path, model_path, n_topics):
 def generate_synthetic(model_path, rna_orig_path, atac_orig_path, out_dir, n_cells, seed):
     import anndata as ad
     import torch
+
     from topomics.models.share_topic import ShareTopic_LDA_Multi
 
     rna_path = os.path.join(out_dir, f"synth_rna_{n_cells}.h5ad")
@@ -54,7 +57,9 @@ def generate_synthetic(model_path, rna_orig_path, atac_orig_path, out_dir, n_cel
     rna_orig = ad.read_h5ad(rna_orig_path)
     atac_orig = ad.read_h5ad(atac_orig_path)
     model = ShareTopic_LDA_Multi.load(
-        model_path, {"rna": rna_orig, "chromatin": atac_orig}, device="cpu",
+        model_path,
+        {"rna": rna_orig, "chromatin": atac_orig},
+        device="cpu",
     )
 
     torch.manual_seed(seed)
@@ -71,7 +76,7 @@ def _select_top_variable(adata, n_top):
     if sp.issparse(X):
         mean = np.asarray(X.mean(axis=0)).ravel()
         mean_sq = np.asarray(X.multiply(X).mean(axis=0)).ravel()
-        var = mean_sq - mean ** 2
+        var = mean_sq - mean**2
     else:
         var = np.var(X, axis=0)
     n_top = min(n_top, len(var))
@@ -89,8 +94,7 @@ def load_synthetic_mudata(rna_path, atac_path):
     sc.pp.filter_genes(rna, min_cells=1)
     sc.pp.filter_genes(atac, min_cells=1)
 
-    sc.pp.highly_variable_genes(rna, n_top_genes=min(N_HVG, rna.n_vars),
-                                flavor="seurat_v3", subset=True)
+    sc.pp.highly_variable_genes(rna, n_top_genes=min(N_HVG, rna.n_vars), flavor="seurat_v3", subset=True)
     atac = _select_top_variable(atac, N_PEAKS)
 
     return mu.MuData({"rna": rna, "atac": atac})
@@ -98,8 +102,11 @@ def load_synthetic_mudata(rna_path, atac_path):
 
 def train_multivi(mdata, n_topics, max_epochs, batch_size):
     import scvi
+
     scvi.model.MULTIVI.setup_mudata(
-        mdata, rna_layer=None, atac_layer=None,
+        mdata,
+        rna_layer=None,
+        atac_layer=None,
         modalities={"rna_layer": "rna", "atac_layer": "atac"},
     )
     model = scvi.model.MULTIVI(mdata, n_latent=n_topics)
@@ -111,17 +118,23 @@ def train_multivi(mdata, n_topics, max_epochs, batch_size):
     return {"time": elapsed, "epochs": n_epochs, "elbo": elbo}
 
 
-def train_topomics(mdata, n_topics, max_epochs, batch_size):
+def train_omics_topic(mdata, n_topics, max_epochs, batch_size):
     from topomics.models import MultimodalAmortizedLDA
+
     model = MultimodalAmortizedLDA.from_mudata(
-        mdata, layer_dict={"rna": None, "atac": None},
-        n_topics=n_topics, likelihoods=["gamma_poisson", "bernoulli"],
+        mdata,
+        layer_dict={"rna": None, "atac": None},
+        n_topics=n_topics,
+        likelihoods=["gamma_poisson", "bernoulli"],
     )
     t0 = time.perf_counter()
     model.train(
-        max_epochs=max_epochs, batch_size=batch_size,
-        early_stopping=True, early_stopping_monitor="elbo_val",
-        early_stopping_patience=50, early_stopping_min_delta=0.0,
+        max_epochs=max_epochs,
+        batch_size=batch_size,
+        early_stopping=True,
+        early_stopping_monitor="elbo_val",
+        early_stopping_patience=50,
+        early_stopping_min_delta=0.0,
     )
     elapsed = time.perf_counter() - t0
     n_epochs = len(model.history["elbo_train"])
@@ -140,8 +153,7 @@ def train_mofa(mdata, n_topics, seed):
         sc.pp.scale(mdata_mofa.mod[mod_name])
 
     t0 = time.perf_counter()
-    mu.tl.mofa(mdata_mofa, n_factors=n_topics, convergence_mode="fast",
-               seed=seed, use_obs="intersection")
+    mu.tl.mofa(mdata_mofa, n_factors=n_topics, convergence_mode="fast", seed=seed, use_obs="intersection")
     elapsed = time.perf_counter() - t0
     n_factors = mdata_mofa.obsm["X_mofa"].shape[1]
     return {"time": elapsed, "epochs": n_factors, "elbo": None}
@@ -183,9 +195,14 @@ def main(snakemake):
 
     # Step 3: Benchmark
     results = {
-        "n_cells": [], "run": [],
-        "multivi": [], "topomics": [], "mofa": [],
-        "n_topics": n_topics, "max_epochs": max_epochs, "n_runs": n_runs,
+        "n_cells": [],
+        "run": [],
+        "multivi": [],
+        "topomics": [],
+        "mofa": [],
+        "n_topics": n_topics,
+        "max_epochs": max_epochs,
+        "n_runs": n_runs,
     }
 
     for run_idx in range(n_runs):
@@ -197,9 +214,9 @@ def main(snakemake):
             if not os.path.exists(rna_path):
                 continue
 
-            print(f"\n{'='*60}")
-            print(f"  N={n_cells:,}  Run {run_idx+1}/{n_runs}  seed={run_seed}")
-            print(f"{'='*60}")
+            print(f"\n{'=' * 60}")
+            print(f"  N={n_cells:,}  Run {run_idx + 1}/{n_runs}  seed={run_seed}")
+            print(f"{'=' * 60}")
 
             results["n_cells"].append(n_cells)
             results["run"].append(run_idx)

@@ -5,7 +5,7 @@ In an analogy with standard topic models, cells/spots are documents, genes/prote
 
 The main content of the models is going to go in src/topomics/models, with some stuff that can go in src/topomics/module, especially NN architectures for the amortized models.
 
-So basically every model is going to inherit the class BaseTopicModel, that contains functions for the standard evaluation of topic models. 
+So basically every model is going to inherit the class BaseTopicModel, that contains functions for the standard evaluation of topic models.
 
 # Next To-Do:
 - [X] Copy the AmortizedLDA implementation in SCVI
@@ -72,7 +72,7 @@ So basically every model is going to inherit the class BaseTopicModel, that cont
 
   - [X] **Add feature background term (bg) - STAMP style**
 
-      
+
 - [X] **Add Bernoulli likelihood for binary data (ATAC-seq, methylation)**
   - [X] Rescaling parameter due to library size
 

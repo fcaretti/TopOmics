@@ -1,7 +1,12 @@
 """Train scVI baseline. Handles both regular datasets and retina (batch/no-batch)."""
-import json, os, sys, warnings
+
+import json
+import os
+import sys
+import warnings
+
 import numpy as np
-import scanpy as sc
+
 warnings.filterwarnings("ignore")
 
 sys.path.insert(0, os.path.dirname(__file__))
@@ -58,12 +63,12 @@ def main(snakemake):
         setup_kwargs["categorical_covariate_keys"] = ["batch"]
 
     scvi_pkg.model.SCVI.setup_anndata(adata, **setup_kwargs)
-    model = scvi_pkg.model.SCVI(
-        adata, n_latent=n_latent, n_hidden=n_hidden, n_layers=n_layers, gene_likelihood="nb"
-    )
+    model = scvi_pkg.model.SCVI(adata, n_latent=n_latent, n_hidden=n_hidden, n_layers=n_layers, gene_likelihood="nb")
     model.train(
-        max_epochs=max_epochs, batch_size=128,
-        early_stopping=True, early_stopping_patience=10,
+        max_epochs=max_epochs,
+        batch_size=128,
+        early_stopping=True,
+        early_stopping_patience=10,
     )
 
     latent = model.get_latent_representation()

@@ -1,7 +1,12 @@
 """Train LinearSCVI baseline for retina dataset."""
-import json, os, sys, warnings
+
+import json
+import os
+import sys
+import warnings
+
 import numpy as np
-import scanpy as sc
+
 warnings.filterwarnings("ignore")
 
 sys.path.insert(0, os.path.dirname(__file__))
@@ -31,8 +36,10 @@ def main(snakemake):
 
     model = scvi_pkg.model.LinearSCVI(adata_hvg, n_latent=30)
     model.train(
-        max_epochs=100, batch_size=128,
-        early_stopping=True, early_stopping_patience=10,
+        max_epochs=100,
+        batch_size=128,
+        early_stopping=True,
+        early_stopping_patience=10,
     )
 
     latent = model.get_latent_representation()

@@ -16,10 +16,10 @@ import pandas as pd
 import scanpy as sc
 import scipy.sparse as sp
 
-
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
+
 
 def load_dataset(dataset_name, data_dir, datasets_config):
     """Load and preprocess a dataset by name.
@@ -40,8 +40,10 @@ def load_dataset(dataset_name, data_dir, datasets_config):
 # Per-dataset loaders
 # ---------------------------------------------------------------------------
 
+
 def _load_teaseq(data_dir, ds_cfg):
     import muon as mu
+
     path = os.path.join(data_dir, ds_cfg["data_path"])
     mdata = mu.read_h5mu(path)
 
@@ -50,9 +52,7 @@ def _load_teaseq(data_dir, ds_cfg):
     _ensure_counts(mdata.mod["prot"])
 
     # Binarize ATAC
-    mdata.mod["atac"].layers["counts"] = (
-        mdata.mod["atac"].layers["counts"] > 0
-    ).astype(int)
+    mdata.mod["atac"].layers["counts"] = (mdata.mod["atac"].layers["counts"] > 0).astype(int)
 
     # HVG filtering
     prep = ds_cfg.get("preprocessing", {})
@@ -64,6 +64,7 @@ def _load_teaseq(data_dir, ds_cfg):
 
 def _load_atac_rna(data_dir, ds_cfg):
     import muon as mu
+
     path = os.path.join(data_dir, ds_cfg["data_path"])
     mdata = mu.read_h5mu(path)
 
@@ -71,9 +72,7 @@ def _load_atac_rna(data_dir, ds_cfg):
     _ensure_counts(mdata.mod["atac"])
 
     # Binarize ATAC
-    mdata.mod["atac"].layers["counts"] = (
-        mdata.mod["atac"].layers["counts"] > 0
-    ).astype(int)
+    mdata.mod["atac"].layers["counts"] = (mdata.mod["atac"].layers["counts"] > 0).astype(int)
 
     prep = ds_cfg.get("preprocessing", {})
     _filter_hvg(mdata.mod["rna"], prep.get("rna_hvgs", 2000))
@@ -84,6 +83,7 @@ def _load_atac_rna(data_dir, ds_cfg):
 
 def _load_visium(data_dir, ds_cfg):
     import squidpy as sq
+
     adata = sq.datasets.visium_hne_adata()
     adata.X = adata.raw.X
     if "spatial_connectivities" not in adata.obsp:
@@ -166,6 +166,7 @@ def _load_thymus(data_dir, ds_cfg):
 
 def _load_dbit_seq(data_dir, ds_cfg):
     import h5py
+
     path = os.path.join(data_dir, ds_cfg["data_path"])
     with h5py.File(path, "r") as f:
         X_gene = f["X_gene"][:].astype(np.float32)
@@ -175,15 +176,11 @@ def _load_dbit_seq(data_dir, ds_cfg):
         proteins = [p.decode() for p in f["protein"][:]]
         pos = f["pos"][:].astype(np.float32)
 
-    adata_rna = ad.AnnData(
-        X=sp.csr_matrix(X_gene), obs=pd.DataFrame(index=cells), var=pd.DataFrame(index=genes)
-    )
+    adata_rna = ad.AnnData(X=sp.csr_matrix(X_gene), obs=pd.DataFrame(index=cells), var=pd.DataFrame(index=genes))
     adata_rna.layers["counts"] = adata_rna.X.copy()
     adata_rna.obsm["spatial"] = pos
 
-    adata_prot = ad.AnnData(
-        X=sp.csr_matrix(X_protein), obs=pd.DataFrame(index=cells), var=pd.DataFrame(index=proteins)
-    )
+    adata_prot = ad.AnnData(X=sp.csr_matrix(X_protein), obs=pd.DataFrame(index=cells), var=pd.DataFrame(index=proteins))
     adata_prot.layers["counts"] = adata_prot.X.copy()
     adata_prot.obsm["spatial"] = pos
 
@@ -198,6 +195,7 @@ def _load_dbit_seq(data_dir, ds_cfg):
 
 def _load_gastrulation(data_dir, ds_cfg):
     import scvelo as scv
+
     adata = scv.datasets.gastrulation_erythroid()
 
     spliced = adata.layers["spliced"]
@@ -229,15 +227,14 @@ def _load_retina(data_dir, ds_cfg):
     sc.pp.log1p(adata)
     adata.raw = adata
 
-    sc.pp.highly_variable_genes(
-        adata, n_top_genes=2000, batch_key="batch", flavor="seurat_v3"
-    )
+    sc.pp.highly_variable_genes(adata, n_top_genes=2000, batch_key="batch", flavor="seurat_v3")
     return adata
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _ensure_counts(adata):
     if "counts" not in adata.layers:
@@ -269,9 +266,7 @@ def _filter_hvg(adata, n_top_genes, layer=None):
     if layer is None:
         layer = "counts" if "counts" in adata.layers else None
     try:
-        sc.pp.highly_variable_genes(
-            adata, n_top_genes=n_top_genes, flavor="seurat_v3", layer=layer
-        )
+        sc.pp.highly_variable_genes(adata, n_top_genes=n_top_genes, flavor="seurat_v3", layer=layer)
     except ValueError as e:
         if "near singularities" not in str(e):
             raise

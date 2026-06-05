@@ -1,14 +1,19 @@
 """Train STAMP baseline (RNA only, spatial)."""
-import json, os, sys, warnings
+
+import json
+import os
+import sys
+import warnings
+
 import numpy as np
+
 if not hasattr(np, "Inf"):
     np.Inf = np.inf
 warnings.filterwarnings("ignore")
 
 sys.path.insert(0, os.path.dirname(__file__))
-from preprocess_data import load_dataset
-
 import torch
+from preprocess_data import load_dataset
 
 
 def main(snakemake):

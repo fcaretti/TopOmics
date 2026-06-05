@@ -58,20 +58,14 @@ def extract_from_mudata(
 
     >>> # Extract specific modalities with layer selection
     >>> adata, meta = extract_from_mudata(
-    ...     mdata,
-    ...     modalities=["rna", "protein"],
-    ...     layers={"rna": "counts", "protein": None}
+    ...     mdata, modalities=["rna", "protein"], layers={"rna": "counts", "protein": None}
     ... )
 
     >>> # Same layer for all modalities
     >>> adata, meta = extract_from_mudata(mdata, layers="counts")
 
     >>> # With spatial graphs
-    >>> adata, meta = extract_from_mudata(
-    ...     mdata,
-    ...     layers="counts",
-    ...     spatial_keys="spatial_connectivities"
-    ... )
+    >>> adata, meta = extract_from_mudata(mdata, layers="counts", spatial_keys="spatial_connectivities")
     """
     # Normalize modalities
     if modalities is None:
@@ -79,15 +73,15 @@ def extract_from_mudata(
 
     # Normalize layers to dict
     if isinstance(layers, str):
-        layer_dict = {mod: layers for mod in modalities}
+        layer_dict = dict.fromkeys(modalities, layers)
     elif layers is None:
-        layer_dict = {mod: None for mod in modalities}
+        layer_dict = dict.fromkeys(modalities)
     else:
         layer_dict = layers
 
     # Normalize spatial_keys to dict
     if isinstance(spatial_keys, str):
-        spatial_dict = {mod: spatial_keys for mod in modalities}
+        spatial_dict = dict.fromkeys(modalities, spatial_keys)
     elif spatial_keys is None:
         spatial_dict = {}
     else:
@@ -101,9 +95,7 @@ def extract_from_mudata(
 
     for mod in modalities:
         if mod not in mdata.mod:
-            raise ValueError(
-                f"Modality '{mod}' not found in MuData. " f"Available: {list(mdata.mod.keys())}"
-            )
+            raise ValueError(f"Modality '{mod}' not found in MuData. Available: {list(mdata.mod.keys())}")
 
         adata_mod = mdata.mod[mod]
 
@@ -193,10 +185,7 @@ def extract_from_adata_dict(
     Examples
     --------
     >>> adata_dict = {"rna": adata_rna, "protein": adata_protein}
-    >>> adata, meta = extract_from_adata_dict(
-    ...     adata_dict,
-    ...     layers={"rna": "counts"}
-    ... )
+    >>> adata, meta = extract_from_adata_dict(adata_dict, layers={"rna": "counts"})
     """
     # Create MuData from dict
     mdata = MuData(adata_dict)
@@ -238,24 +227,19 @@ def extract_from_anndata(
     Examples
     --------
     >>> adata, meta = extract_from_anndata(
-    ...     adata,
-    ...     modality_name="rna",
-    ...     layer="counts",
-    ...     spatial_key="spatial_connectivities"
+    ...     adata, modality_name="rna", layer="counts", spatial_key="spatial_connectivities"
     ... )
     """
     # Extract from layer if specified
     if layer is not None:
         if layer not in adata.layers:
-            raise KeyError(
-                f"Layer '{layer}' not found. " f"Available layers: {list(adata.layers.keys())}"
-            )
+            raise KeyError(f"Layer '{layer}' not found. Available layers: {list(adata.layers.keys())}")
         # Reuse the same AnnData object but move the selected layer into .X
         adata.X = adata.layers[layer]
     adata_processed = adata
 
     # Extract spatial graph if specified
-    from topomics.models.amortizedLDA import _resolve_spatial_graph_from_adata
+    from topomics.utils.amortized_utils import _resolve_spatial_graph_from_adata
 
     spatial_info = _resolve_spatial_graph_from_adata(adata_processed, spatial_key)
 
@@ -301,19 +285,11 @@ def extract_from_spatialdata(
 
     Examples
     --------
-    >>> adata, meta = extract_from_spatialdata(
-    ...     sdata,
-    ...     table_key="table",
-    ...     layers="counts",
-    ...     spatial_key="spatial"
-    ... )
+    >>> adata, meta = extract_from_spatialdata(sdata, table_key="table", layers="counts", spatial_key="spatial")
     """
     # Extract table from SpatialData
     if table_key not in sdata.tables:
-        raise KeyError(
-            f"Table '{table_key}' not found in SpatialData. "
-            f"Available tables: {list(sdata.tables.keys())}"
-        )
+        raise KeyError(f"Table '{table_key}' not found in SpatialData. Available tables: {list(sdata.tables.keys())}")
 
     table = sdata.tables[table_key]
 
@@ -331,9 +307,7 @@ def extract_from_spatialdata(
         layer = layers if isinstance(layers, str) else None
         return extract_from_anndata(table, modality_name, layer, spatial_key)
     else:
-        raise TypeError(
-            f"Table '{table_key}' is type {type(table)}, " "expected AnnData or MuData"
-        )
+        raise TypeError(f"Table '{table_key}' is type {type(table)}, expected AnnData or MuData")
 
 
 def _extract_spatial_graphs(
@@ -363,7 +337,7 @@ def _extract_spatial_graphs(
         - key: str - the obsp key used
     """
     # Import here to avoid circular dependency
-    from topomics.models.amortizedLDA import _resolve_spatial_graph_from_adata
+    from topomics.utils.amortized_utils import _resolve_spatial_graph_from_adata
 
     if not spatial_dict:
         return None

@@ -27,69 +27,63 @@ from sklearn.metrics import adjusted_rand_score, normalized_mutual_info_score
 
 from topomics.models.amortizedLDA import MultimodalAmortizedLDA
 
-warnings.filterwarnings('ignore', message='.*was not registered in the param store.*')
-warnings.filterwarnings('ignore', message='.*Found plate statements in guide but not model.*')
+warnings.filterwarnings("ignore", message=".*was not registered in the param store.*")
+warnings.filterwarnings("ignore", message=".*Found plate statements in guide but not model.*")
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Train GaussianLDA on Mouse Brain COSMOS benchmark"
+    parser = argparse.ArgumentParser(description="Train GaussianLDA on Mouse Brain COSMOS benchmark")
+    parser.add_argument(
+        "--feature_prior_type", type=str, default="logistic_normal", choices=["logistic_normal", "horseshoe"]
     )
-    parser.add_argument("--feature_prior_type", type=str, default="logistic_normal",
-                        choices=["logistic_normal", "horseshoe"])
-    parser.add_argument("--weight_mode", type=str, default="universal",
-                        choices=["equal", "universal", "cell"])
+    parser.add_argument("--weight_mode", type=str, default="universal", choices=["equal", "universal", "cell"])
     parser.add_argument("--n_topics", type=int, default=10)
     parser.add_argument("--max_epochs", type=int, default=100)
     parser.add_argument("--batch_size", type=int, default=256)
     parser.add_argument("--gcn_n_layers", type=int, default=1)
-    parser.add_argument("--gcn_layers_type", type=str, default="GATv2Conv",
-                        choices=["GATv2Conv", "GCNConv"])
+    parser.add_argument("--gcn_layers_type", type=str, default="GATv2Conv", choices=["GATv2Conv", "GCNConv"])
     parser.add_argument("--gcn_alpha", type=float, default=0.2)
     parser.add_argument("--fixed_alpha", action="store_true")
-    parser.add_argument("--meanfield", action="store_true",
-                        help="Use TraceMeanField_ELBO instead of Trace_ELBO")
-    parser.add_argument("--no_spatial", action="store_true",
-                        help="Disable spatial graph (ablation: non-spatial baseline)")
-    parser.add_argument("--data_path", type=str,
-                        default="/tmp/mouse_brain_data/ATAC_RNA_Seq_MouseBrain_RNA_ATAC.h5")
-    parser.add_argument("--output_dir", type=str,
-                        default="/data/topomics_models/mouse_brain_gaussian")
+    parser.add_argument("--meanfield", action="store_true", help="Use TraceMeanField_ELBO instead of Trace_ELBO")
+    parser.add_argument(
+        "--no_spatial", action="store_true", help="Disable spatial graph (ablation: non-spatial baseline)"
+    )
+    parser.add_argument("--data_path", type=str, default="/tmp/mouse_brain_data/ATAC_RNA_Seq_MouseBrain_RNA_ATAC.h5")
+    parser.add_argument("--output_dir", type=str, default="/data/topomics_models/mouse_brain_gaussian")
     return parser.parse_args()
 
 
 def load_data(data_path, use_spatial=True):
     """Load COSMOS benchmark h5 into MuData with spatial graph and ground truth."""
-    with h5py.File(data_path, 'r') as f:
-        cells = [c.decode() if isinstance(c, bytes) else c for c in f['Cell'][:]]
-        genes = [g.decode() if isinstance(g, bytes) else g for g in f['Gene'][:]]
-        layers = [l.decode() if isinstance(l, bytes) else l for l in f['LayerName'][:]]
-        x_rna = f['X_RNA'][:]
-        x_atac = f['X_ATAC'][:]
-        pos = f['Pos'][:]
+    with h5py.File(data_path, "r") as f:
+        cells = [c.decode() if isinstance(c, bytes) else c for c in f["Cell"][:]]
+        genes = [g.decode() if isinstance(g, bytes) else g for g in f["Gene"][:]]
+        layers = [l.decode() if isinstance(l, bytes) else l for l in f["LayerName"][:]]
+        x_rna = f["X_RNA"][:]
+        x_atac = f["X_ATAC"][:]
+        pos = f["Pos"][:]
 
-    obs = pd.DataFrame({'spatial_area': layers}, index=cells)
+    obs = pd.DataFrame({"spatial_area": layers}, index=cells)
 
     adata_rna = ad.AnnData(
         X=x_rna.astype(np.float32),
         obs=obs.copy(),
         var=pd.DataFrame(index=genes),
     )
-    adata_rna.obsm['spatial'] = pos
+    adata_rna.obsm["spatial"] = pos
 
-    atac_features = [f'LSI_{i+1}' for i in range(x_atac.shape[1])]
+    atac_features = [f"LSI_{i + 1}" for i in range(x_atac.shape[1])]
     adata_atac = ad.AnnData(
         X=x_atac.astype(np.float32),
         obs=obs.copy(),
         var=pd.DataFrame(index=atac_features),
     )
-    adata_atac.obsm['spatial'] = pos
+    adata_atac.obsm["spatial"] = pos
 
     mdata = md.MuData({"rna": adata_rna, "atac": adata_atac})
 
     if use_spatial:
-        sc.pp.neighbors(adata_rna, use_rep='spatial', n_neighbors=5,
-                        metric='euclidean', key_added='spatial')
+        sc.pp.neighbors(adata_rna, use_rep="spatial", n_neighbors=5, metric="euclidean", key_added="spatial")
         mdata.obsp["spatial_connectivities"] = adata_rna.obsp["spatial_connectivities"]
         mdata.mod["atac"].obsp["spatial_connectivities"] = adata_rna.obsp["spatial_connectivities"]
         mdata.mod["atac"].obsp["spatial_distances"] = adata_rna.obsp["spatial_distances"]
@@ -136,9 +130,11 @@ def train_model(model, args):
     plan_kwargs = {"optim_kwargs": {"lr": 1e-2}}
     if args.meanfield:
         from pyro.infer import TraceMeanField_ELBO
+
         plan_kwargs["loss_fn"] = TraceMeanField_ELBO()
     else:
         from pyro.infer import Trace_ELBO
+
         plan_kwargs["loss_fn"] = Trace_ELBO()
 
     model.train(
@@ -154,13 +150,13 @@ def train_model(model, args):
 def evaluate_clustering(theta, labels, resolutions=(0.1, 0.2, 0.3, 0.5, 0.7, 1.0, 1.5, 2.0)):
     """Best ARI/NMI over Leiden resolutions."""
     adata_tmp = ad.AnnData(X=theta)
-    sc.pp.neighbors(adata_tmp, use_rep='X', metric='cosine')
+    sc.pp.neighbors(adata_tmp, use_rep="X", metric="cosine")
 
     best_ari, best_nmi, best_res = -1, -1, -1
     for res in resolutions:
-        sc.tl.leiden(adata_tmp, resolution=res, key_added='leiden')
-        ari = adjusted_rand_score(labels, adata_tmp.obs['leiden'])
-        nmi = normalized_mutual_info_score(labels, adata_tmp.obs['leiden'])
+        sc.tl.leiden(adata_tmp, resolution=res, key_added="leiden")
+        ari = adjusted_rand_score(labels, adata_tmp.obs["leiden"])
+        nmi = normalized_mutual_info_score(labels, adata_tmp.obs["leiden"])
         if ari > best_ari:
             best_ari, best_nmi, best_res = ari, nmi, res
 
@@ -173,7 +169,7 @@ def print_diagnostics(model):
     print("MODEL DIAGNOSTICS")
     print("=" * 70)
 
-    gcn_encoders = getattr(model.module.guide, 'gcn_encoders', None)
+    gcn_encoders = getattr(model.module.guide, "gcn_encoders", None)
     if gcn_encoders is not None:
         for i, enc in enumerate(gcn_encoders):
             print(f"  GCN encoder {i} skip connection alpha: {enc.alpha:.4f}")
@@ -198,32 +194,32 @@ def save_results(model, mdata, output_dir):
 
     mdata.obsm["X_topic"] = theta.values - 1
     mdata.obs["top_topic"] = theta.idxmax(axis=1)
-    mdata['rna'].obsm['X_topic'] = theta.values - 1
+    mdata["rna"].obsm["X_topic"] = theta.values - 1
 
     # Evaluate against ground truth
-    labels = mdata['rna'].obs['spatial_area'].values
+    labels = mdata["rna"].obs["spatial_area"].values
     ari, nmi, best_res = evaluate_clustering(theta.values, labels)
 
     # Leiden clustering
-    sc.pp.neighbors(mdata['rna'], metric='cosine', use_rep='X_topic', key_added='topic_neighbors')
-    sc.tl.umap(mdata['rna'], neighbors_key='topic_neighbors', key_added='topic_umap')
-    sc.tl.leiden(mdata['rna'], neighbors_key='topic_neighbors', resolution=best_res)
-    mdata.obs['leiden'] = mdata['rna'].obs['leiden']
+    sc.pp.neighbors(mdata["rna"], metric="cosine", use_rep="X_topic", key_added="topic_neighbors")
+    sc.tl.umap(mdata["rna"], neighbors_key="topic_neighbors", key_added="topic_umap")
+    sc.tl.leiden(mdata["rna"], neighbors_key="topic_neighbors", resolution=best_res)
+    mdata.obs["leiden"] = mdata["rna"].obs["leiden"]
 
     # Metrics
     metrics = {
-        'ARI': ari,
-        'NMI': nmi,
-        'best_leiden_resolution': best_res,
-        'perplexity': model.get_perplexity(),
-        'entropy': model.get_entropy(normalised=True),
-        'diversity': model.get_topic_diversity(),
+        "ARI": ari,
+        "NMI": nmi,
+        "best_leiden_resolution": best_res,
+        "perplexity": model.get_perplexity(),
+        "entropy": model.get_entropy(normalised=True),
+        "diversity": model.get_topic_diversity(),
     }
     for mod_name, ppl in model.get_perplexity_per_modality().items():
-        metrics[f'perplexity_{mod_name}'] = ppl
+        metrics[f"perplexity_{mod_name}"] = ppl
     weights = model.get_modality_weights()
-    metrics['mean_rna_weight'] = weights['rna'].mean()
-    metrics['mean_atac_weight'] = weights['atac'].mean()
+    metrics["mean_rna_weight"] = weights["rna"].mean()
+    metrics["mean_atac_weight"] = weights["atac"].mean()
 
     pd.DataFrame([metrics]).to_csv(os.path.join(output_dir, "metrics.csv"), index=False)
 
@@ -233,29 +229,31 @@ def save_results(model, mdata, output_dir):
     n_train = int(mdata.n_obs * 0.8)
     n_val = mdata.n_obs - n_train
     fig, ax = plt.subplots(figsize=(10, 6))
-    ax.plot(model.history['elbo_train'] / n_train, label='Train ELBO (per cell)')
-    ax.plot(model.history['elbo_val'] / n_val, label='Val ELBO (per cell)')
-    ax.set_xlabel('Epoch'); ax.set_ylabel('ELBO / cell'); ax.set_title('Training Curve')
+    ax.plot(model.history["elbo_train"] / n_train, label="Train ELBO (per cell)")
+    ax.plot(model.history["elbo_val"] / n_val, label="Val ELBO (per cell)")
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("ELBO / cell")
+    ax.set_title("Training Curve")
     ax.legend()
-    plt.savefig(os.path.join(output_dir, "training_curve.png"), dpi=150, bbox_inches='tight')
+    plt.savefig(os.path.join(output_dir, "training_curve.png"), dpi=150, bbox_inches="tight")
     plt.close()
 
     # Topic UMAP: ground truth vs Leiden
     fig, axes = plt.subplots(1, 2, figsize=(20, 8))
-    mu.pl.embedding(mdata, basis='rna:topic_umap', color='rna:spatial_area', ax=axes[0], show=False)
-    axes[0].set_title('Topic UMAP - Ground truth areas')
-    mu.pl.embedding(mdata, basis='rna:topic_umap', color='leiden', ax=axes[1], show=False)
-    axes[1].set_title(f'Topic UMAP - Leiden (ARI={ari:.3f}, NMI={nmi:.3f})')
-    plt.savefig(os.path.join(output_dir, "umap_comparison.png"), dpi=150, bbox_inches='tight')
+    mu.pl.embedding(mdata, basis="rna:topic_umap", color="rna:spatial_area", ax=axes[0], show=False)
+    axes[0].set_title("Topic UMAP - Ground truth areas")
+    mu.pl.embedding(mdata, basis="rna:topic_umap", color="leiden", ax=axes[1], show=False)
+    axes[1].set_title(f"Topic UMAP - Leiden (ARI={ari:.3f}, NMI={nmi:.3f})")
+    plt.savefig(os.path.join(output_dir, "umap_comparison.png"), dpi=150, bbox_inches="tight")
     plt.close()
 
     # Spatial: ground truth vs Leiden
     fig, axes = plt.subplots(1, 2, figsize=(20, 10))
-    mu.pl.embedding(mdata, basis='rna:spatial', color='rna:spatial_area', ax=axes[0], show=False)
-    axes[0].set_title('Spatial - Ground truth areas')
-    mu.pl.embedding(mdata, basis='rna:spatial', color='leiden', ax=axes[1], show=False)
-    axes[1].set_title(f'Spatial - Leiden (ARI={ari:.3f})')
-    plt.savefig(os.path.join(output_dir, "spatial_comparison.png"), dpi=150, bbox_inches='tight')
+    mu.pl.embedding(mdata, basis="rna:spatial", color="rna:spatial_area", ax=axes[0], show=False)
+    axes[0].set_title("Spatial - Ground truth areas")
+    mu.pl.embedding(mdata, basis="rna:spatial", color="leiden", ax=axes[1], show=False)
+    axes[1].set_title(f"Spatial - Leiden (ARI={ari:.3f})")
+    plt.savefig(os.path.join(output_dir, "spatial_comparison.png"), dpi=150, bbox_inches="tight")
     plt.close()
 
     # Topic distribution
@@ -268,7 +266,7 @@ def save_results(model, mdata, output_dir):
     ax.set_ylabel("Topic proportion")
     ax.set_title("Global topic distribution (mean +/- std)")
     plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, "topic_distribution.png"), dpi=150, bbox_inches='tight')
+    plt.savefig(os.path.join(output_dir, "topic_distribution.png"), dpi=150, bbox_inches="tight")
     plt.close()
 
     # Print summary

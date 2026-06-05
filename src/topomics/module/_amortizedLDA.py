@@ -4,7 +4,7 @@ The file declares three public objects
 -------------------------------------
 * `MultimodalLDAPyroModel`   – generative process with modality plate & mixed likelihoods.
 * `MultimodalLDAPyroGuide`   – per-modality encoders + combined θₙ posterior + per-modality ϕₖ,ₘ posterior.
-* `MultimodalAmortizedLDAPyroModule` – thin wrapper pairing the two above and exposing
+* `MultimodalAmortizedLDAPyroModule` – wrapper pairing the two above and exposing
   helper utilities (`topic_by_feature`, `get_topic_distribution`, `get_elbo`).
 
 A higher-level `ModelClass` wrapper (*MultimodalAmortizedLDA*) is provided at the bottom so that
@@ -17,808 +17,36 @@ import logging
 import math
 from collections.abc import Sequence
 
-import numpy as np
 import pyro
 import pyro.distributions as dist
 import scipy.sparse as sp
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 from pyro import poutine
 from pyro.infer import Trace_ELBO
 from pyro.nn import PyroModule
 from scvi._constants import REGISTRY_KEYS
 from scvi.module.base import PyroBaseModuleClass, auto_move_data
-from scvi.nn import Encoder, FCLayers
-from torch_geometric.nn import GCNConv, GATv2Conv
-from torch_geometric.utils import k_hop_subgraph
-
-logger = logging.getLogger(__name__)
-CLAMP_EPS = 10e-6
-CLAMP_MAX = 1.0 / CLAMP_EPS
-
-
-def clamp_symmetric(t: torch.Tensor) -> torch.Tensor:
-    return torch.nan_to_num(
-        t, nan=0.0, posinf=CLAMP_MAX, neginf=-CLAMP_MAX
-    ).clamp(min=-CLAMP_MAX, max=CLAMP_MAX)
-
-
-def clamp_positive(t: torch.Tensor) -> torch.Tensor:
-    return torch.nan_to_num(
-        t, nan=CLAMP_EPS, posinf=CLAMP_MAX, neginf=CLAMP_EPS
-    ).clamp(min=CLAMP_EPS, max=CLAMP_MAX)
-
-# --------------------------------------------------------------------------------------------------
-# Helper utils
-# --------------------------------------------------------------------------------------------------
-
-
-def logistic_normal_approximation(alpha: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """Laplace approximation parameters (μ, σ) of Logistic-Normal ≈ Dirichlet(α)."""
-    K = alpha.shape[-1]
-    mu = torch.log(alpha) - torch.log(alpha).sum() / K
-    sigma = torch.sqrt((1 - 2 / K) / alpha + torch.sum(1 / alpha) / K**2)
-    return mu, sigma
-
-
-def horseshoe_shrinkage(
-    caux: torch.Tensor,     # scalar
-    tau: torch.Tensor,      # (K, 1)
-    delta: torch.Tensor,    # (F,)
-    lambda_: torch.Tensor,  # (K, F)
-) -> torch.Tensor:
-    """
-    Compute regularized horseshoe shrinkage multiplier.
-
-    Based on Carvalho et al. (2010) and Piironen & Vehtari (2017).
-    This implements the Finnish horseshoe prior which adds a regularization
-    component (caux) to prevent over-shrinkage.
-
-    Parameters
-    ----------
-    caux : scalar
-        Global auxiliary variable for regularization (prevents over-shrinkage)
-    tau : (K, 1)
-        Per-topic local shrinkage parameter
-    delta : (F,)
-        Per-feature local shrinkage parameter
-    lambda_ : (K, F)
-        Per-topic-feature interaction shrinkage parameter
-
-    Returns
-    -------
-    lambda_tilde : (K, F)
-        Effective shrinkage multipliers in [0, 1]
-
-    Notes
-    -----
-    The formula combines hierarchical shrinkage with regularization:
-    λ̃² = (c² * τ² * δ² * λ²) / (c² + τ² * δ² * λ²)
-
-    When τ²δ²λ² >> c²: λ̃ → 1 (no shrinkage, signal preserved)
-    When τ²δ²λ² << c²: λ̃ → 0 (strong shrinkage, noise removed)
-    """
-    caux_sq = caux ** 2
-    tau_sq = tau ** 2              # (K, 1)
-    delta_sq = delta.unsqueeze(0) ** 2   # (1, F)
-    lambda_sq = lambda_ ** 2       # (K, F)
-
-    numerator = caux_sq * tau_sq * delta_sq * lambda_sq
-    denominator = caux_sq + tau_sq * delta_sq * lambda_sq
-
-    # Add epsilon for numerical stability
-    lambda_tilde = torch.sqrt(numerator / (denominator + 1e-8))
-    return lambda_tilde  # (K, F)
-
-
-def masked_softmax(weights: torch.Tensor, mask: torch.Tensor, dim: int = 0):
-    """Softmax **ignoring** masked entries (mask == 0)."""
-    weights = clamp_symmetric(weights)
-    weights = weights.masked_fill(~mask.bool(), -CLAMP_MAX)
-    return torch.softmax(weights, dim=dim)
-
-
-class AttentionAggregator(nn.Module):
-    """
-    SpatialGlue-style single-head attention for mixing M modality encoder outputs.
-
-    Computes per-cell, input-dependent mixing weights alpha (B, M) from the
-    encoder means, then applies them as weights in the Gaussian mixture. This
-    is more expressive than MoE because the weight of each modality depends on
-    what each encoder actually produced for that cell.
-
-    Parameters
-    ----------
-    n_topics
-        Dimensionality of each modality embedding (= n_topics in latent space).
-    att_dim
-        Projection dimension for the attention key/value (default: 32).
-
-    Notes
-    -----
-    Missing modalities are handled by masking attention logits to -inf before
-    softmax, the same strategy used by masked_softmax in the MoE path. However,
-    if all modalities are missing for a cell the result is undefined (shouldn't
-    happen in practice). Unlike MoE, this method requires all attending modalities
-    to share the same latent dimensionality (n_topics), which is already the case.
-
-    References
-    ----------
-    Tang et al. (2023), "SpatialGlue: Deciphering multi-modal spatial omics
-    integration" – between-modality attention mechanism.
-    """
-
-    def __init__(self, n_topics: int, att_dim: int = 32) -> None:
-        super().__init__()
-        self.w_omega = nn.Parameter(torch.empty(n_topics, att_dim))
-        self.u_omega = nn.Parameter(torch.empty(att_dim, 1))
-        nn.init.xavier_uniform_(self.w_omega.unsqueeze(0))
-        nn.init.xavier_uniform_(self.u_omega.unsqueeze(0))
-
-    def forward(self, mus: torch.Tensor, masks: torch.Tensor) -> torch.Tensor:
-        """
-        Compute attention mixing weights.
-
-        Parameters
-        ----------
-        mus : (M, B, K)
-            Per-modality encoder means.
-        masks : (M, B)
-            1 if modality present for that cell, 0 if absent.
-
-        Returns
-        -------
-        w : (M, B, 1)
-            Per-cell mixing weights summing to 1 over M (absent modalities = 0).
-        """
-        emb = mus.permute(1, 0, 2)              # (B, M, K)
-        v = torch.tanh(emb @ self.w_omega)       # (B, M, att_dim)
-        vu = (v @ self.u_omega).squeeze(-1)      # (B, M)
-
-        # Mask absent modalities before softmax
-        masks_BM = masks.T                       # (B, M)
-        vu = vu.masked_fill(~masks_BM.bool(), -CLAMP_MAX)
-        alpha = torch.softmax(vu, dim=1)         # (B, M)
-
-        return alpha.T.unsqueeze(-1)             # (M, B, 1)
-
-
-def adjacency_to_edge_index(adj: torch.Tensor) -> torch.Tensor:
-    """
-    Convert adjacency matrix to PyG edge_index format.
-    
-    Parameters
-    ----------
-    adj : torch.Tensor
-        Adjacency matrix (dense or sparse)
-    
-    Returns
-    -------
-    edge_index : torch.Tensor
-        Edge indices in COO format (2, num_edges)
-    """
-    if adj.is_sparse:
-        adj = adj.coalesce()
-        return adj.indices()
-    else:
-        return adj.nonzero().t().contiguous()
-
-
-
-import logging
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import pyro.distributions as dist
-from torch_geometric.nn import GCNConv, GATv2Conv
+from scvi.nn import Encoder
 
 logger = logging.getLogger(__name__)
 
-
-class GCNEncoder(nn.Module):
-    """
-    GCN/GAT encoder for spatial data with optional multi-layer graph
-    convolution and an explicit skip-connection that preserves node identity.
-
-    The skip path uses the scvi Encoder structure (FCLayers -> mean/var). When
-    the skip weight is exactly 1, the graph branch is ignored and the encoder
-    reduces to the scvi implementation.
-
-        h = alpha * FCLayers(x) + (1 - alpha) * GNN(x, A)
-
-    where alpha is a learnable scalar initialized so that alpha≈0.7.
-    """
-
-    def __init__(
-        self,
-        n_in: int,
-        n_topics: int,
-        n_hidden: int,
-        gcn_n_layers: int = 1,
-        gcn_hidden_dims: list[int] | None = None,
-        gcn_n_pre_layers: int = 0,     # FC layers before graph convolution (0 = disabled)
-        dropout: float = 0.1,
-        add_self_loops: bool = True,
-        conv_type: str = "GATv2Conv",  # or 'GATv2Conv'
-        heads: int = 4,              # used only by GAT
-        normalize: bool = True,      # used only by GCN
-        concat: bool = True,         # multi-head strategy for GAT
-        alpha_init: float = 0.7,     # initial weight for self signal
-        use_learned_alpha: bool = True,  # if False, uses fixed alpha_init
-        var_eps: float = 1e-4,
-        var_activation=None,
-        sampling: str = "approx",    # "approx" (stochastic neighbor sampling) or "exact" (k_hop_subgraph)
-        fan_out: list[int] | None = None,  # per-layer fan-out for neighbor sampling
-        conv_first: bool = False,    # if True, run GCN on raw features then FC on seeds only
-        **kwargs,
-    ) -> None:
-        super().__init__()
-
-        self.n_in = n_in
-        self.n_topics = n_topics
-        self.n_hidden = n_hidden
-        self.var_eps = var_eps
-        self.gcn_n_layers = gcn_n_layers
-        self.gcn_hidden_dims = gcn_hidden_dims
-        self.gcn_dropout = dropout
-        # Use softplus instead of exp for variance - bounded gradients prevent explosion
-        self.var_activation = F.softplus if var_activation is None else var_activation
-
-        if gcn_n_layers < 1:
-            raise ValueError("gcn_n_layers must be >= 1.")
-
-        # Optional FC projection applied to x_full BEFORE graph convolution.
-        # When gcn_n_pre_layers > 0 the GCN operates in learned feature space
-        # rather than raw count space — beneficial for high-dimensional inputs.
-        # Note: these share the same n_hidden width as the self-path encoder.
-        fc_n_layers_kwarg = kwargs.pop("n_layers", 1)
-        fc_dropout_rate = kwargs.pop("dropout_rate", dropout)
-        n_cats_per_cov_kwarg = kwargs.pop("n_cats_per_cov", None)
-        n_continuous_cov_kwarg = kwargs.pop("n_continuous_cov", 0)
-
-        if gcn_n_pre_layers > 0:
-            self.pre_gcn_fc = FCLayers(
-                n_in=n_in,
-                n_out=n_hidden,
-                n_layers=gcn_n_pre_layers,
-                n_hidden=n_hidden,
-                dropout_rate=fc_dropout_rate,
-            )
-            gcn_input_dim = n_hidden  # GCN receives projected features
-        else:
-            self.pre_gcn_fc = None
-            gcn_input_dim = n_in     # GCN receives raw (normalized) counts
-
-        # Neighbor aggregation (graph convolution)
-        self.conv_type = conv_type
-        if gcn_hidden_dims is None:
-            gcn_hidden_dims = [n_hidden] * gcn_n_layers
-        elif len(gcn_hidden_dims) != gcn_n_layers:
-            raise ValueError("gcn_hidden_dims must have length gcn_n_layers.")
-
-        def _make_conv(in_dim: int, out_dim: int):
-            if conv_type == "GATv2Conv":
-                out_channels = out_dim if not concat else max(1, out_dim // heads)
-                conv = GATv2Conv(
-                    in_channels=in_dim,
-                    out_channels=out_channels,
-                    heads=heads,
-                    add_self_loops=add_self_loops,
-                    dropout=dropout,
-                    concat=concat,
-                )
-                conv_out_dim = (heads * out_channels) if concat else out_dim
-            else:
-                conv = GCNConv(
-                    in_dim,
-                    out_dim,
-                    add_self_loops=add_self_loops,
-                    normalize=normalize,
-                )
-                conv_out_dim = out_dim
-            return conv, conv_out_dim
-
-        self.convs = nn.ModuleList()
-        self.conv_bns = nn.ModuleList()
-        self.conv_out_dims = []
-
-        prev_dim = gcn_input_dim  # may be n_in or n_hidden depending on pre_gcn_fc
-        for hidden_dim in gcn_hidden_dims:
-            conv, conv_out_dim = _make_conv(prev_dim, hidden_dim)
-            self.convs.append(conv)
-            self.conv_bns.append(nn.BatchNorm1d(conv_out_dim))
-            self.conv_out_dims.append(conv_out_dim)
-            prev_dim = conv_out_dim
-
-        # Covariate parameters (already popped from kwargs above)
-        self.n_cats_per_cov = n_cats_per_cov_kwarg
-        self.n_continuous_cov = n_continuous_cov_kwarg
-        self.use_covariates = (self.n_cats_per_cov is not None and len(self.n_cats_per_cov) > 0) or self.n_continuous_cov > 0
-
-        # scvi-style encoder for the self signal (n_layers / dropout_rate already popped)
-        self.encoder = FCLayers(
-            n_in=n_in + self.n_continuous_cov,
-            n_out=n_hidden,
-            n_cat_list=self.n_cats_per_cov,
-            n_layers=fc_n_layers_kwarg,
-            n_hidden=n_hidden,
-            dropout_rate=fc_dropout_rate,
-            **kwargs,
-        )
-        self.mean_encoder = nn.Linear(n_hidden, n_topics)
-        self.var_encoder = nn.Linear(n_hidden, n_topics)
-
-        # If GAT concat produced a different hidden size, align it
-        final_conv_dim = self.conv_out_dims[-1]
-        if final_conv_dim != n_hidden:
-            self.nei_proj = nn.Linear(final_conv_dim, n_hidden, bias=False)
-        else:
-            self.nei_proj = nn.Identity()
-
-        # Alpha mixing in [0, 1]
-        # Use sigmoid transformation for proper gradient flow (avoids gradient=0 at boundaries)
-        self.use_learned_alpha = use_learned_alpha
-        alpha_init = float(alpha_init)
-        if not 0.0 <= alpha_init <= 1.0:
-            raise ValueError("alpha_init must be in [0, 1].")
-        # Store alpha in logit space, apply sigmoid during forward pass
-        # Use large finite values for boundary cases (sigmoid(±20) ≈ 0/1)
-        if alpha_init == 0.0:
-            alpha_logit = torch.tensor(-20.0, dtype=torch.float32)
-        elif alpha_init == 1.0:
-            alpha_logit = torch.tensor(20.0, dtype=torch.float32)
-        else:
-            alpha_logit = torch.logit(torch.tensor(alpha_init, dtype=torch.float32))
-        if use_learned_alpha:
-            self._alpha_logit = nn.Parameter(alpha_logit.clone().detach())
-        else:
-            self.register_buffer("_alpha_logit", alpha_logit.clone().detach())
-
-        # Full-graph data stored on CPU (NOT as buffers) to avoid GPU OOM
-        # on large graphs (e.g. VisiumHD).  Subgraph extraction via
-        # k_hop_subgraph moves only the needed neighbourhood to GPU each step.
-        self.x_full: torch.Tensor | None = None
-        self.edge_index_full: torch.Tensor | None = None
-        self.num_nodes: int = 0
-        self.num_hops: int = gcn_n_layers
-        self._graph_initialized = False
-
-        # Neighbor sampling mode
-        self.sampling = sampling
-        self.fan_out = fan_out
-        self._neighbor_sampler = None  # built lazily in set_full_graph_data
-
-        # Conv-first mode: run GCN on raw features, then FC only on seeds
-        self.conv_first = conv_first
-
-    @property
-    def alpha(self) -> float:
-        """Get the current alpha value (skip connection weight for self features)."""
-        return torch.sigmoid(self._alpha_logit).item()
-
-    @alpha.setter
-    def alpha(self, value: float):
-        """
-        Set the alpha value (skip connection weight for self features).
-
-        Parameters
-        ----------
-        value : float
-            Alpha value in [0, 1].
-        """
-        value = float(value)
-        if value <= 0.0:
-            logit_value = torch.tensor(-20.0, dtype=self._alpha_logit.dtype, device=self._alpha_logit.device)
-        elif value >= 1.0:
-            logit_value = torch.tensor(20.0, dtype=self._alpha_logit.dtype, device=self._alpha_logit.device)
-        else:
-            logit_value = torch.logit(torch.tensor(value, dtype=self._alpha_logit.dtype, device=self._alpha_logit.device))
-        self._alpha_logit.data.copy_(logit_value)
-
-    def set_full_graph_data(self, x_full: torch.Tensor, edge_index_full: torch.Tensor):
-        """
-        Initialize full graph data for minibatch-subgraph training.
-
-        Both tensors are kept on **CPU**; only the k-hop neighbourhood of
-        each minibatch is moved to the model device during ``forward()``.
-
-        Parameters
-        ----------
-        x_full : torch.Tensor
-            Full feature matrix [n_obs, n_in]
-        edge_index_full : torch.Tensor
-            COO edge index [2, n_edges]
-        """
-        if x_full.dim() != 2 or x_full.size(1) != self.n_in:
-            raise ValueError(f"x_full must have shape [n_obs, {self.n_in}], got {tuple(x_full.shape)}")
-        if edge_index_full.dim() != 2 or edge_index_full.size(0) != 2:
-            raise ValueError(f"edge_index_full must have shape [2, n_edges], got {tuple(edge_index_full.shape)}")
-
-        # Store on CPU to avoid GPU memory pressure on large graphs
-        self.x_full = x_full.detach().cpu()
-        self.edge_index_full = edge_index_full.detach().cpu().contiguous()
-        self.num_nodes = x_full.shape[0]
-        self._graph_initialized = True
-
-        # Build neighbor sampler if requested
-        if self.sampling == "approx":
-            from topomics.utils.neighbor_sampler import NeighborSampler as _NS
-            fan_out = self.fan_out if self.fan_out is not None else [10] * self.num_hops
-            self._neighbor_sampler = _NS(
-                self.edge_index_full, self.num_nodes, fan_out=fan_out,
-            )
-            logger.info(
-                f"GCN graph initialized (CPU): {x_full.shape[0]} cells, "
-                f"{edge_index_full.shape[1]} edges, neighbor sampling fan_out={fan_out}"
-            )
-        else:
-            logger.info(
-                f"GCN graph initialized (CPU): {x_full.shape[0]} cells, "
-                f"{edge_index_full.shape[1]} edges, {self.num_hops}-hop exact subgraph sampling"
-            )
-
-    def _mix_self_and_neighbors(self, h_self: torch.Tensor, h_nei: torch.Tensor) -> torch.Tensor:
-        """
-        Mix identity/self and neighbor-aggregated features.
-        """
-        h_nei = self.nei_proj(h_nei)
-
-        alpha = torch.sigmoid(self._alpha_logit)  # scalar in (0,1)
-        return alpha * h_self + (1.0 - alpha) * h_nei
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        edge_index: torch.Tensor,
-        batch_indices: torch.Tensor | None = None,
-        cat_list: list[torch.Tensor] | None = None,
-    ):
-        """
-        Forward pass using k-hop subgraph sampling.
-
-        Instead of computing on the full graph and subsetting, we extract the
-        k-hop neighbourhood around ``batch_indices`` (global cell ids), move
-        only that subgraph to the model device, run the GCN, and return the
-        seed-node representations.
-
-        Parameters
-        ----------
-        x : torch.Tensor
-            Ignored (features come from stored ``x_full``).
-        edge_index : torch.Tensor
-            Ignored (edges come from stored ``edge_index_full``).
-        batch_indices : torch.Tensor
-            **Global** cell indices for the current minibatch.
-        cat_list : list[torch.Tensor], optional
-            Categorical covariate tensors (not used in current graph path).
-
-        Returns
-        -------
-        pyro.distributions.Normal
-            q(z_topic_logits | x, A) as a Normal over logits
-        None
-            Placeholder for compatibility
-        """
-        if not self._graph_initialized:
-            raise ValueError("Graph should be precomputed: call set_full_graph_data(...) before training.")
-
-        if batch_indices is None:
-            raise ValueError(
-                "batch_indices (global cell indices) required. "
-                "This should be provided automatically by the guide."
-            )
-
-        device = self.mean_encoder.weight.device  # model's compute device
-
-        # ---- STEP 1: extract subgraph on CPU ----
-        batch_indices_cpu = batch_indices.detach().cpu().long()
-        if self._neighbor_sampler is not None:
-            subset, sub_edge_index, mapping = self._neighbor_sampler.sample(
-                batch_indices_cpu
-            )
-        else:
-            subset, sub_edge_index, mapping, _ = k_hop_subgraph(
-                batch_indices_cpu,
-                num_hops=self.num_hops,
-                edge_index=self.edge_index_full,
-                relabel_nodes=True,
-                num_nodes=self.num_nodes,
-            )
-
-        # Move only the subgraph to the compute device
-        x_sub = clamp_symmetric(self.x_full[subset].to(device))
-        sub_edge_index = sub_edge_index.to(device)
-        mapping = mapping.to(device)
-
-        # ---- STEP 2: compute on subgraph ----
-        if self.conv_first:
-            # Conv-first: GCN on raw features (all subgraph nodes), then FC on seeds only.
-            # This is much faster because FC runs on batch_size nodes instead of
-            # the full subgraph (~30x savings on large graphs).
-            if self.pre_gcn_fc is not None:
-                h_nei = clamp_symmetric(self.pre_gcn_fc(x_sub))
-            else:
-                h_nei = x_sub
-            for i, (conv, bn) in enumerate(zip(self.convs, self.conv_bns, strict=False)):
-                h_nei = conv(h_nei, sub_edge_index)
-                h_nei = clamp_symmetric(bn(h_nei))
-                if i < len(self.convs) - 1:
-                    h_nei = clamp_symmetric(F.relu(h_nei))
-                    if self.gcn_dropout > 0:
-                        h_nei = F.dropout(
-                            h_nei, p=self.gcn_dropout, training=self.training
-                        )
-
-            # Extract seeds BEFORE FC — FC only runs on batch_size nodes
-            h_nei_seeds = clamp_symmetric(self.nei_proj(h_nei[mapping]))
-            x_seeds = x_sub[mapping]
-            h_self_seeds = clamp_symmetric(self.encoder(x_seeds))
-
-            alpha = torch.sigmoid(self._alpha_logit)
-            h = clamp_symmetric(alpha * h_self_seeds + (1.0 - alpha) * h_nei_seeds)
-        else:
-            # Default: FC and GCN both run on full subgraph, then extract seeds.
-            # Self path (scvi-style FCLayers)
-            h_self = clamp_symmetric(self.encoder(x_sub))
-
-            # Neighbor aggregation path (stacked graph convs with BatchNorm)
-            if self.pre_gcn_fc is not None:
-                h_nei = clamp_symmetric(self.pre_gcn_fc(x_sub))
-            else:
-                h_nei = x_sub
-            for i, (conv, bn) in enumerate(zip(self.convs, self.conv_bns, strict=False)):
-                h_nei = conv(h_nei, sub_edge_index)
-                h_nei = clamp_symmetric(bn(h_nei))
-                if i < len(self.convs) - 1:
-                    h_nei = clamp_symmetric(F.relu(h_nei))
-                    if self.gcn_dropout > 0:
-                        h_nei = F.dropout(
-                            h_nei, p=self.gcn_dropout, training=self.training
-                        )
-
-            # Mix self + neighbors (skip connection)
-            h_sub = clamp_symmetric(self._mix_self_and_neighbors(h_self, h_nei))
-
-            # Extract seed-node representations
-            h = clamp_symmetric(h_sub[mapping])  # [batch_size, n_hidden]
-
-        # scvi-style mean/variance heads
-        q_m = clamp_symmetric(self.mean_encoder(h))
-        raw_q_v = clamp_positive(self.var_activation(self.var_encoder(h)))
-        q_v = clamp_positive(raw_q_v + self.var_eps)
-
-        # NaN detection warning
-        if torch.isnan(q_m).any() or torch.isnan(q_v).any():
-            nan_info = []
-            if torch.isnan(h_self).any():
-                nan_info.append("h_self")
-            if torch.isnan(h_nei).any():
-                nan_info.append("h_nei")
-            if torch.isnan(h_sub).any():
-                nan_info.append("h_sub")
-            if torch.isnan(q_m).any():
-                nan_info.append("q_m (mean)")
-            if torch.isnan(q_v).any():
-                nan_info.append("q_v (var)")
-            logger.warning(
-                f"NaN detected in GCNEncoder forward pass! "
-                f"Affected tensors: {', '.join(nan_info)}. "
-                f"This usually indicates gradient explosion. Try reducing learning rate."
-            )
-
-        return dist.Normal(q_m, q_v.sqrt()), None
-
-
-# --------------------------------------------------------------------------------------------------
-# SGC (Simplified Graph Convolution) preprocessing and encoder — STAMP-style spatial handling
-# --------------------------------------------------------------------------------------------------
-
-
-def precompute_sgc(
-    x: torch.Tensor,
-    adj: sp.spmatrix,
-    n_layers: int = 1,
-    mode: str = "sign",
-) -> torch.Tensor:
-    """
-    Precompute Simplified Graph Convolution features (STAMP-style).
-
-    Applies fixed, parameter-free neighborhood averaging to produce spatially
-    smoothed features that are concatenated with the original.
-
-    Parameters
-    ----------
-    x : torch.Tensor
-        Raw count matrix (n_obs, n_features).
-    adj : scipy sparse matrix
-        Spatial adjacency matrix (n_obs, n_obs).
-    n_layers : int
-        Number of SGC hops (default: 1).
-    mode : str
-        ``"sign"`` — concatenate [X, ÃX, Ã²X, ...] (default).
-        ``"sgc"``  — use only the final smoothed version Ã^L X.
-
-    Returns
-    -------
-    sgc_x : torch.Tensor
-        SGC-preprocessed features: (n_obs, n_features * (n_layers + 1)) for "sign" mode.
-    """
-    # Symmetric normalisation matching STAMP exactly:
-    # deg = original_degree + 2, adj = adj + I
-    adj_coo = adj.tocoo().astype(np.float64)
-    deg = np.asarray(adj_coo.sum(axis=1)).flatten()
-    deg = deg + 2  # STAMP adds 2 to degree (not 1)
-    adj_with_self = adj_coo + sp.eye(adj_coo.shape[0], format="coo")
-    deg_inv_sqrt = np.power(deg, -0.5)
-    deg_inv_sqrt[np.isinf(deg_inv_sqrt)] = 0.0
-    D_inv_sqrt = sp.diags(deg_inv_sqrt)
-    adj_norm = D_inv_sqrt @ adj_with_self @ D_inv_sqrt
-
-    # Convert to torch sparse
-    adj_norm_coo = adj_norm.astype(np.float32).tocoo()
-    indices = torch.tensor(np.vstack([adj_norm_coo.row, adj_norm_coo.col]), dtype=torch.long)
-    values = torch.tensor(adj_norm_coo.data, dtype=torch.float32)
-    adj_t = torch.sparse_coo_tensor(indices, values, torch.Size(adj_norm_coo.shape))
-
-    # Library-size normalisation to median depth
-    ls = x.sum(dim=1, keepdim=True)
-    ms = torch.median(x.sum(dim=1))
-    xs = x / ls * ms
-
-    # Iterative smoothing
-    sgc = [xs]
-    for _ in range(n_layers):
-        xs = torch.sparse.mm(adj_t, sgc[-1])
-        sgc.append(xs)
-
-    if mode == "sgc":
-        sgc = [sgc[-1]]
-
-    sgc_x = torch.cat(sgc, dim=1)
-    sgc_x = torch.log(sgc_x + 1)
-    return sgc_x
-
-
-class SGCEncoder(nn.Module):
-    """
-    STAMP-style encoder: MLP on precomputed SGC features with optional
-    per-batch BatchNorm.
-
-    The SGC features are precomputed once before training (fixed, parameter-free).
-    The encoder is a simple MLP that maps [X, ÃX, ...] → (μ, σ) for topic logits.
-
-    Parameters
-    ----------
-    n_genes : int
-        Number of features per modality.
-    n_sgc_layers : int
-        Number of SGC hops (determines input width: n_genes * (n_sgc_layers + 1) for "sign" mode).
-    n_hidden : int
-        Hidden layer size.
-    n_topics : int
-        Output dimension (number of topics).
-    dropout : float
-        Dropout rate.
-    n_batches : int
-        Number of batch categories for per-batch BatchNorm. If <= 1, uses standard BatchNorm.
-    var_eps : float
-        Minimum variance.
-    """
-
-    def __init__(
-        self,
-        n_genes: int,
-        n_sgc_layers: int,
-        n_hidden: int,
-        n_topics: int,
-        dropout: float = 0.0,
-        n_batches: int = 0,
-        var_eps: float = 1e-4,
-    ) -> None:
-        super().__init__()
-        self.n_genes = n_genes
-        self.n_topics = n_topics
-        self.var_eps = var_eps
-        self.n_batches = n_batches
-
-        sgc_input_dim = n_genes * (n_sgc_layers + 1)
-
-        # Base network — exact replica of STAMP's MLPEncoderMVN:
-        # Dropout → Linear → BN → ReLU → Dropout
-        self.base = nn.Sequential(
-            nn.Dropout(dropout),
-            nn.Linear(sgc_input_dim, n_hidden),
-            nn.BatchNorm1d(n_hidden),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-        )
-
-        # Output heads
-        self.mu_head = nn.Linear(n_hidden, n_topics)
-        self.var_head = nn.Linear(n_hidden, n_topics)
-
-        # STAMP-style: norm_topic BN on mu (always applied, even with 1 batch)
-        # With frozen affine weights (weight.requires_grad = False)
-        n_bn = max(n_batches, 1)
-        self.norm_topic = nn.ModuleList([
-            nn.BatchNorm1d(n_topics) for _ in range(n_bn)
-        ])
-        for norm in self.norm_topic:
-            norm.weight.requires_grad = False
-
-        # Xavier initialization (STAMP-style)
-        nn.init.xavier_normal_(self.base[1].weight)
-        nn.init.xavier_normal_(self.mu_head.weight)
-        nn.init.xavier_normal_(self.var_head.weight)
-        nn.init.zeros_(self.mu_head.bias)
-        nn.init.zeros_(self.var_head.bias)
-
-        # Buffer for precomputed SGC features (full dataset)
-        self.register_buffer("sgc_x_full", torch.empty(0, sgc_input_dim))
-        self._sgc_initialized = False
-
-    def set_sgc_data(self, sgc_x: torch.Tensor):
-        """Store precomputed SGC features for the full dataset."""
-        self.sgc_x_full = sgc_x
-        self._sgc_initialized = True
-        logger.info(f"SGCEncoder initialized: {sgc_x.shape[0]} cells, {sgc_x.shape[1]} features")
-
-    def forward(
-        self,
-        x: torch.Tensor,  # ignored — we use sgc_x_full
-        edge_index: torch.Tensor,  # ignored — spatial info is in SGC features
-        batch_indices: torch.Tensor | None = None,
-        cat_list: list[torch.Tensor] | None = None,
-    ):
-        """
-        Forward pass using precomputed SGC features.
-
-        Parameters
-        ----------
-        x : ignored (kept for API compatibility with GCNEncoder)
-        edge_index : ignored
-        batch_indices : indices into sgc_x_full for the current minibatch
-        cat_list : categorical covariates (used for per-batch BatchNorm)
-
-        Returns
-        -------
-        dist.Normal, None
-        """
-        if not self._sgc_initialized:
-            raise ValueError("SGC features not initialized. Call set_sgc_data() first.")
-        if batch_indices is None:
-            raise ValueError("batch_indices required for SGCEncoder.")
-
-        # Subset precomputed SGC features to minibatch
-        h = self.sgc_x_full[batch_indices]  # (B, sgc_input_dim)
-
-        # Base network
-        h = self.base(h)
-
-        # Output heads
-        mu = self.mu_head(h)
-        raw_var = self.var_head(h)
-
-        # STAMP-style: norm_topic BN on mu (always applied)
-        if self.n_batches > 1 and cat_list is not None and len(cat_list) > 0:
-            batch_codes = cat_list[0].squeeze(-1).long()
-            mu_out = torch.zeros_like(mu)
-            for b in range(self.n_batches):
-                mask = batch_codes == b
-                if mask.sum() > 1:
-                    mu_out[mask] = self.norm_topic[b](mu[mask])
-                elif mask.sum() == 1:
-                    mu_out[mask] = mu[mask]
-            mu = mu_out
-        else:
-            # Single batch: still apply BN (STAMP always does this)
-            if mu.shape[0] > 1:
-                mu = self.norm_topic[0](mu)
-
-        var = F.softplus(raw_var) + self.var_eps
-
-        return dist.Normal(mu, var.sqrt()), None
+from topomics.utils._amortized_utils import (  # noqa: F401  (AttentionAggregator re-exported for backwards compatibility)
+    CLAMP_EPS,
+    CLAMP_MAX,
+    AttentionAggregator,
+    adjacency_to_edge_index,
+    clamp_positive,
+    clamp_symmetric,
+    horseshoe_shrinkage,
+    logistic_normal_approximation,
+    masked_softmax,
+    precompute_sgc,
+)
+from topomics.utils._encoders import (
+    GCNEncoder,
+    SGCEncoder,
+)
 
 
 class CategoricalBoW(dist.Multinomial):
@@ -857,7 +85,7 @@ class MultimodalLDAPyroModel(PyroModule):
         n_topics: int,
         cell_topic_prior: torch.Tensor,
         topic_feature_priors: list[torch.Tensor],  # one tensor per modality (len = M)
-        dispersion_rna: float = 1.,  # global NB dispersion for Gamma-Poisson modalities
+        dispersion_rna: float = 1.0,  # global NB dispersion for Gamma-Poisson modalities
         learnable_dispersion: bool = False,  # whether to learn dispersion (STAMP-like)
         global_dispersion: bool = True,  # if learnable: one global vs per-gene dispersion
         topic_feature_prior_type: str = "logistic_normal",
@@ -889,16 +117,12 @@ class MultimodalLDAPyroModel(PyroModule):
         valid_weight_modes = {"none", "inverse_features", "sqrt_inverse_features"}
         if likelihood_weight_mode not in valid_weight_modes:
             raise ValueError(
-                f"likelihood_weight_mode must be one of {valid_weight_modes}, "
-                f"got '{likelihood_weight_mode}'"
+                f"likelihood_weight_mode must be one of {valid_weight_modes}, got '{likelihood_weight_mode}'"
             )
 
         valid_weight_refs = {"mean", "median", "max"}
         if likelihood_weight_ref not in valid_weight_refs:
-            raise ValueError(
-                f"likelihood_weight_ref must be one of {valid_weight_refs}, "
-                f"got '{likelihood_weight_ref}'"
-            )
+            raise ValueError(f"likelihood_weight_ref must be one of {valid_weight_refs}, got '{likelihood_weight_ref}'")
 
         feature_counts = torch.as_tensor(n_inputs_modalities, dtype=torch.float32)
         if likelihood_weight_mode == "none":
@@ -973,7 +197,7 @@ class MultimodalLDAPyroModel(PyroModule):
         else:
             raise ValueError(f"Unknown topic_feature_prior_type: {topic_feature_prior_type}")
 
-        # Feature background initialization (scTM-style)
+        # Feature background initialization (like in STAMP)
         # Register as buffers (not trainable, just for initialization)
         if use_feature_background and init_bg_mean is not None:
             for m, bg_mean_m in enumerate(init_bg_mean):
@@ -1018,9 +242,7 @@ class MultimodalLDAPyroModel(PyroModule):
         topic_feature_dists = []  # will store φₖ,ₘ tensors
 
         if self.topic_feature_prior_type == "logistic_normal":
-            # EXISTING: Logistic-Normal prior
             # First, sample backgrounds outside of topics plate (per-feature, not per-topic)
-            # Note: Background terms only apply to count-based likelihoods (gamma_poisson, nb).
             # Bernoulli and multinomial likelihoods do not use feature backgrounds.
             bg_samples = []
             for m in range(self.n_modalities):
@@ -1031,7 +253,7 @@ class MultimodalLDAPyroModel(PyroModule):
                             with poutine.scale(scale=kl_weight):
                                 bg_m = pyro.sample(
                                     f"bg_{m}",
-                                    dist.Normal(torch.zeros_like(init_bg), torch.ones_like(init_bg)).to_event(1)
+                                    dist.Normal(torch.zeros_like(init_bg), torch.ones_like(init_bg)).to_event(1),
                                 )
                             bg_m = bg_m + init_bg  # Add empirical baseline
                         else:
@@ -1058,7 +280,7 @@ class MultimodalLDAPyroModel(PyroModule):
                     topic_feature_dists.append(log_phi)  # (K, Fₘ) -- log-space, softmax applied later
 
         elif self.topic_feature_prior_type == "horseshoe":
-            # NEW: Horseshoe prior (following scTM)
+            # Horseshoe prior (again introduced in STAMP)
             for m in range(self.n_modalities):
                 F_m = self.n_inputs_modalities[m]
 
@@ -1068,26 +290,20 @@ class MultimodalLDAPyroModel(PyroModule):
                         f"caux_{m}",
                         dist.InverseGamma(
                             torch.ones(1, device=self._dummy.device) * 0.5,
-                            torch.ones(1, device=self._dummy.device) * 0.5
-                        )
+                            torch.ones(1, device=self._dummy.device) * 0.5,
+                        ),
                     )
 
                 # 2. Per-topic local shrinkage
                 with pyro.plate(f"topics_tau_{m}", self.n_topics):
                     with poutine.scale(scale=kl_weight):
-                        tau_m = pyro.sample(
-                            f"tau_{m}",
-                            dist.HalfCauchy(torch.ones(1, device=self._dummy.device))
-                        )
+                        tau_m = pyro.sample(f"tau_{m}", dist.HalfCauchy(torch.ones(1, device=self._dummy.device)))
                 tau_m = tau_m.unsqueeze(-1)  # (K, 1)
 
                 # 3. Per-feature local shrinkage
                 with pyro.plate(f"features_delta_{m}", F_m):
                     with poutine.scale(scale=kl_weight):
-                        delta_m = pyro.sample(
-                            f"delta_{m}",
-                            dist.HalfCauchy(torch.ones(1, device=self._dummy.device))
-                        )
+                        delta_m = pyro.sample(f"delta_{m}", dist.HalfCauchy(torch.ones(1, device=self._dummy.device)))
                 # delta_m is (F_m,)
 
                 # 4. Per-topic-feature interaction shrinkage
@@ -1096,8 +312,7 @@ class MultimodalLDAPyroModel(PyroModule):
                     with pyro.plate(f"topics_lambda_{m}", self.n_topics):
                         with poutine.scale(scale=kl_weight):
                             lambda_m = pyro.sample(
-                                f"lambda_{m}",
-                                dist.HalfCauchy(torch.ones(1, device=self._dummy.device))
+                                f"lambda_{m}", dist.HalfCauchy(torch.ones(1, device=self._dummy.device))
                             )
                 # lambda_m is now (K, F_m) after plate ordering
 
@@ -1110,8 +325,9 @@ class MultimodalLDAPyroModel(PyroModule):
                         with poutine.scale(scale=kl_weight):
                             beta_m = pyro.sample(
                                 f"beta_{m}",
-                                dist.Normal(torch.zeros(1, device=self._dummy.device),
-                                           torch.ones(1, device=self._dummy.device))
+                                dist.Normal(
+                                    torch.zeros(1, device=self._dummy.device), torch.ones(1, device=self._dummy.device)
+                                ),
                             )
                 # beta_m is now (K, F_m) after plate ordering
 
@@ -1126,7 +342,7 @@ class MultimodalLDAPyroModel(PyroModule):
                             with poutine.scale(scale=kl_weight):
                                 bg_m = pyro.sample(
                                     f"bg_{m}",
-                                    dist.Normal(torch.zeros_like(init_bg), torch.ones_like(init_bg)).to_event(1)
+                                    dist.Normal(torch.zeros_like(init_bg), torch.ones_like(init_bg)).to_event(1),
                                 )
                             bg_m = bg_m + init_bg  # Add empirical baseline
                         else:
@@ -1148,18 +364,14 @@ class MultimodalLDAPyroModel(PyroModule):
                     if self.global_dispersion:
                         # Single global dispersion for this modality
                         with poutine.scale(scale=kl_weight):
-                            disp = pyro.sample(
-                                f"disp_{m}",
-                                dist.HalfCauchy(torch.ones(1, device=self._dummy.device))
-                            )
+                            disp = pyro.sample(f"disp_{m}", dist.HalfCauchy(torch.ones(1, device=self._dummy.device)))
                         dispersion_samples[m] = disp
                     else:
                         # Per-gene dispersion (STAMP-like)
                         with pyro.plate(f"genes_disp_{m}", F_m):
                             with poutine.scale(scale=kl_weight):
                                 disp = pyro.sample(
-                                    f"disp_{m}",
-                                    dist.HalfCauchy(torch.ones(1, device=self._dummy.device))
+                                    f"disp_{m}", dist.HalfCauchy(torch.ones(1, device=self._dummy.device))
                                 )
                         dispersion_samples[m] = disp  # shape: (F_m,)
 
@@ -1205,8 +417,7 @@ class MultimodalLDAPyroModel(PyroModule):
             if L_m == "gaussian":
                 with poutine.scale(scale=kl_weight):
                     gaussian_sigma_samples[m] = pyro.sample(
-                        f"gaussian_sigma_{m}",
-                        dist.HalfCauchy(torch.ones(F_m, device=self._dummy.device)).to_event(1)
+                        f"gaussian_sigma_{m}", dist.HalfCauchy(torch.ones(F_m, device=self._dummy.device)).to_event(1)
                     )
 
         # ----- cells plate -----
@@ -1239,7 +450,7 @@ class MultimodalLDAPyroModel(PyroModule):
                         batch_idx = cat_covs[:, 0].long()
                         mean_m = torch.zeros_like(x_m)
                         for b in range(self.n_batches):
-                            mask_b = (batch_idx == b)
+                            mask_b = batch_idx == b
                             if mask_b.any():
                                 offset = batch_tau_m * batch_delta_m[b]
                                 mu_b = log_phi_m + offset  # additive offset, no softmax
@@ -1272,7 +483,7 @@ class MultimodalLDAPyroModel(PyroModule):
                         batch_idx = cat_covs[:, 0].long()  # (B,)
                         rate_m = torch.zeros_like(x_m)
                         for b in range(self.n_batches):
-                            mask_b = (batch_idx == b)
+                            mask_b = batch_idx == b
                             if mask_b.any():
                                 offset = batch_tau_m * batch_delta_m[b]  # (K, 1) * (F_m,) -> (K, F_m)
                                 phi_b = F.softmax(log_phi_m + offset, dim=-1)  # (K, F_m)
@@ -1298,14 +509,11 @@ class MultimodalLDAPyroModel(PyroModule):
                             if self.learnable_dispersion and m in dispersion_samples:
                                 # Use sampled dispersion (STAMP-like parameterization)
                                 disp = dispersion_samples[m]
-                                inv_disp = 1.0 / (disp ** 2 + 1e-8)
+                                inv_disp = 1.0 / (disp**2 + 1e-8)
                                 # GammaPoisson(concentration, rate) where mean = concentration/rate
                                 pyro.sample(
                                     f"feature_counts_{m}",
-                                    dist.GammaPoisson(
-                                        concentration=inv_disp,
-                                        rate=inv_disp / mu
-                                    ).to_event(1),
+                                    dist.GammaPoisson(concentration=inv_disp, rate=inv_disp / mu).to_event(1),
                                     obs=x_m_obs,
                                 )
                             else:
@@ -1347,7 +555,7 @@ class MultimodalLDAPyroGuide(PyroModule):
         gcn_n_layers: int = 1,
         gcn_hidden_dims: list[int] | None = None,
         gcn_n_pre_layers: int = 0,
-        gcn_conv_type: str='GATv2Conv',
+        gcn_conv_type: str = "GATv2Conv",
         gcn_alpha_init: float = 0.7,
         gcn_use_learned_alpha: bool = True,
         weight_mode: str = "equal",
@@ -1373,7 +581,7 @@ class MultimodalLDAPyroGuide(PyroModule):
         n_extra_encoder_features: int = 0,
         # Aggregation mode
         aggregation_type: str = "moe",  # "moe" or "attention"
-        att_dim: int = 32,              # attention projection dim (used when aggregation_type="attention")
+        att_dim: int = 32,  # attention projection dim (used when aggregation_type="attention")
         # Spatial mode: "gcn" (default, trainable GCN/GAT) or "sgc" (STAMP-style precomputed)
         spatial_mode: str = "gcn",
         sgc_n_layers: int = 1,  # number of SGC hops (only used when spatial_mode="sgc")
@@ -1443,7 +651,7 @@ class MultimodalLDAPyroGuide(PyroModule):
                 for n_in in n_inputs_modalities
             ]
         )
-        
+
         # Spatial encoders (if spatial)
         if self.use_gcn:
             if adjacency is None:
@@ -1571,7 +779,7 @@ class MultimodalLDAPyroGuide(PyroModule):
         if use_feature_background:
             self.bg_loc = torch.nn.ParameterList()
             self.bg_scale = torch.nn.ParameterList()
-            for m, (F_m, likelihood) in enumerate(zip(n_inputs_modalities, self.likelihoods)):
+            for m, (F_m, likelihood) in enumerate(zip(n_inputs_modalities, self.likelihoods, strict=False)):
                 if likelihood == "gamma_poisson":
                     # Create background parameters for gamma_poisson modalities
                     # STAMP: bg_scale init = 0.1, so raw param = softplus_inv(0.1)
@@ -1592,7 +800,7 @@ class MultimodalLDAPyroGuide(PyroModule):
         if has_gaussian:
             self.gaussian_sigma_loc = torch.nn.ParameterList()
             self.gaussian_sigma_scale = torch.nn.ParameterList()
-            for m, (F_m, likelihood) in enumerate(zip(n_inputs_modalities, self.likelihoods)):
+            for m, (F_m, likelihood) in enumerate(zip(n_inputs_modalities, self.likelihoods, strict=False)):
                 if likelihood == "gaussian":
                     _sp_inv_01 = float(torch.log(torch.exp(torch.tensor(0.1)) - 1))
                     self.gaussian_sigma_loc.append(torch.nn.Parameter(torch.zeros(F_m)))
@@ -1609,7 +817,7 @@ class MultimodalLDAPyroGuide(PyroModule):
         if learnable_dispersion:
             self.disp_loc = torch.nn.ParameterList()
             self.disp_scale = torch.nn.ParameterList()
-            for m, (F_m, likelihood) in enumerate(zip(n_inputs_modalities, self.likelihoods)):
+            for m, (F_m, likelihood) in enumerate(zip(n_inputs_modalities, self.likelihoods, strict=False)):
                 if likelihood in {"gamma_poisson", "nb"}:
                     _sp_inv_01 = float(torch.log(torch.exp(torch.tensor(0.1)) - 1))
                     if global_dispersion:
@@ -1692,7 +900,7 @@ class MultimodalLDAPyroGuide(PyroModule):
         # E[Var[X|M]] - expected variance within each encoder
         expected_var = (w * vars_).sum(0)
         # Var[E[X|M]] - variance of means across encoders
-        var_of_means = (w * (mus - mu.unsqueeze(0))**2).sum(0)
+        var_of_means = (w * (mus - mu.unsqueeze(0)) ** 2).sum(0)
         var = expected_var + var_of_means
         var = clamp_positive(var)
         return mu, var
@@ -1701,7 +909,7 @@ class MultimodalLDAPyroGuide(PyroModule):
         """Get edge_index for a specific modality."""
         if not self.use_gcn:
             raise RuntimeError("Cannot get edge_index when spatial=False")
-        
+
         if self.multiple_adjacencies:
             return getattr(self, f"edge_index_{modality_idx}")
         else:
@@ -1757,7 +965,7 @@ class MultimodalLDAPyroGuide(PyroModule):
             if adjacency_scipy is None:
                 raise ValueError("adjacency_scipy is required for SGC mode.")
 
-            for idx, (sgc_enc, x_full_m) in enumerate(zip(self.gcn_encoders, x_full_list)):
+            for idx, (sgc_enc, x_full_m) in enumerate(zip(self.gcn_encoders, x_full_list, strict=False)):
                 sgc_x = precompute_sgc(x_full_m, adjacency_scipy, n_layers=self.sgc_n_layers)
                 sgc_enc.set_sgc_data(sgc_x)
 
@@ -1770,7 +978,7 @@ class MultimodalLDAPyroGuide(PyroModule):
             if self.normalize_encoder_inputs:
                 libs = [x_full_m.sum(dim=1, keepdim=True) for x_full_m in x_full_list]
                 x_full_normalized = []
-                for m, (x_full_m, lib_m) in enumerate(zip(x_full_list, libs)):
+                for m, (x_full_m, lib_m) in enumerate(zip(x_full_list, libs, strict=False)):
                     if self.likelihoods[m] == "gaussian":
                         x_full_normalized.append(x_full_m)
                     else:
@@ -1781,13 +989,12 @@ class MultimodalLDAPyroGuide(PyroModule):
                 x_full_list = x_full_normalized
                 logger.info("Applied library-size and log-normalization to full graph BEFORE spatial convolution")
 
-            for idx, (gcn_enc, x_full_m) in enumerate(zip(self.gcn_encoders, x_full_list)):
+            for idx, (gcn_enc, x_full_m) in enumerate(zip(self.gcn_encoders, x_full_list, strict=False)):
                 edge_index = self._get_edge_index(idx)
                 gcn_enc.set_full_graph_data(x_full_m, edge_index)
 
             logger.info(
-                f"GCN encoders initialized with full graph "
-                f"(normalize_encoder_inputs={self.normalize_encoder_inputs})"
+                f"GCN encoders initialized with full graph (normalize_encoder_inputs={self.normalize_encoder_inputs})"
             )
 
     # ---------- forward ----------
@@ -1819,17 +1026,20 @@ class MultimodalLDAPyroGuide(PyroModule):
                         pyro.sample(
                             f"log_topic_feature_dist_{m}",
                             dist.Normal(
-                                self.topic_feature_posterior_mu[m],
-                                self.topic_feature_posterior_sigma[m]
+                                self.topic_feature_posterior_mu[m], self.topic_feature_posterior_sigma[m]
                             ).to_event(1),
                         )
 
                 # Feature background variational posterior (scTM-style)
-                if self.learnable_bg and self.use_feature_background and self.bg_loc is not None and self.bg_loc[m] is not None:
+                if (
+                    self.learnable_bg
+                    and self.use_feature_background
+                    and self.bg_loc is not None
+                    and self.bg_loc[m] is not None
+                ):
                     with poutine.scale(scale=kl_weight):
                         pyro.sample(
-                            f"bg_{m}",
-                            dist.Normal(self.bg_loc[m], self._softplus(self.bg_scale[m])).to_event(1)
+                            f"bg_{m}", dist.Normal(self.bg_loc[m], self._softplus(self.bg_scale[m])).to_event(1)
                         )
 
         elif self.topic_feature_prior_type == "horseshoe":
@@ -1839,25 +1049,18 @@ class MultimodalLDAPyroGuide(PyroModule):
 
                 # 1. caux variational posterior
                 with poutine.scale(scale=kl_weight):
-                    pyro.sample(
-                        f"caux_{m}",
-                        dist.LogNormal(self.caux_loc[m], self._softplus(self.caux_scale[m]))
-                    )
+                    pyro.sample(f"caux_{m}", dist.LogNormal(self.caux_loc[m], self._softplus(self.caux_scale[m])))
 
                 # 2. tau variational posterior
                 with pyro.plate(f"topics_tau_{m}", self.n_topics):
                     with poutine.scale(scale=kl_weight):
-                        pyro.sample(
-                            f"tau_{m}",
-                            dist.LogNormal(self.tau_loc[m], self._softplus(self.tau_scale[m]))
-                        )
+                        pyro.sample(f"tau_{m}", dist.LogNormal(self.tau_loc[m], self._softplus(self.tau_scale[m])))
 
                 # 3. delta variational posterior
                 with pyro.plate(f"features_delta_{m}", F_m):
                     with poutine.scale(scale=kl_weight):
                         pyro.sample(
-                            f"delta_{m}",
-                            dist.LogNormal(self.delta_loc[m], self._softplus(self.delta_scale[m]))
+                            f"delta_{m}", dist.LogNormal(self.delta_loc[m], self._softplus(self.delta_scale[m]))
                         )
 
                 # 4. lambda variational posterior
@@ -1865,31 +1068,25 @@ class MultimodalLDAPyroGuide(PyroModule):
                     with pyro.plate(f"topics_lambda_{m}", self.n_topics):
                         with poutine.scale(scale=kl_weight):
                             pyro.sample(
-                                f"lambda_{m}",
-                                dist.LogNormal(
-                                    self.lambda_loc[m],
-                                    self._softplus(self.lambda_scale[m])
-                                )
+                                f"lambda_{m}", dist.LogNormal(self.lambda_loc[m], self._softplus(self.lambda_scale[m]))
                             )
 
                 # 5. beta variational posterior
                 with pyro.plate(f"features_beta_{m}", F_m):
                     with pyro.plate(f"topics_beta_{m}", self.n_topics):
                         with poutine.scale(scale=kl_weight):
-                            pyro.sample(
-                                f"beta_{m}",
-                                dist.Normal(
-                                    self.beta_loc[m],
-                                    self._softplus(self.beta_scale[m])
-                                )
-                            )
+                            pyro.sample(f"beta_{m}", dist.Normal(self.beta_loc[m], self._softplus(self.beta_scale[m])))
 
                 # Feature background variational posterior (scTM-style)
-                if self.learnable_bg and self.use_feature_background and self.bg_loc is not None and self.bg_loc[m] is not None:
+                if (
+                    self.learnable_bg
+                    and self.use_feature_background
+                    and self.bg_loc is not None
+                    and self.bg_loc[m] is not None
+                ):
                     with poutine.scale(scale=kl_weight):
                         pyro.sample(
-                            f"bg_{m}",
-                            dist.Normal(self.bg_loc[m], self._softplus(self.bg_scale[m])).to_event(1)
+                            f"bg_{m}", dist.Normal(self.bg_loc[m], self._softplus(self.bg_scale[m])).to_event(1)
                         )
 
         # STAMP-style batch effect variational posteriors
@@ -1933,22 +1130,14 @@ class MultimodalLDAPyroGuide(PyroModule):
                         # Single dispersion per modality
                         with poutine.scale(scale=kl_weight):
                             pyro.sample(
-                                f"disp_{m}",
-                                dist.LogNormal(
-                                    self.disp_loc[m],
-                                    self._softplus(self.disp_scale[m])
-                                )
+                                f"disp_{m}", dist.LogNormal(self.disp_loc[m], self._softplus(self.disp_scale[m]))
                             )
                     else:
                         # Per-gene dispersion
                         with pyro.plate(f"genes_disp_{m}", F_m):
                             with poutine.scale(scale=kl_weight):
                                 pyro.sample(
-                                    f"disp_{m}",
-                                    dist.LogNormal(
-                                        self.disp_loc[m],
-                                        self._softplus(self.disp_scale[m])
-                                    )
+                                    f"disp_{m}", dist.LogNormal(self.disp_loc[m], self._softplus(self.disp_scale[m]))
                                 )
 
         # Gaussian sigma variational posterior (for Gaussian likelihood modalities)
@@ -1960,9 +1149,8 @@ class MultimodalLDAPyroGuide(PyroModule):
                         pyro.sample(
                             f"gaussian_sigma_{m}",
                             dist.LogNormal(
-                                self.gaussian_sigma_loc[m],
-                                self._softplus(self.gaussian_sigma_scale[m])
-                            ).to_event(1)
+                                self.gaussian_sigma_loc[m], self._softplus(self.gaussian_sigma_scale[m])
+                            ).to_event(1),
                         )
 
         # θₙ variational
@@ -1974,7 +1162,7 @@ class MultimodalLDAPyroGuide(PyroModule):
             libs = [x_m.sum(dim=1, keepdim=True) for x_m in xs]  # List of (B, 1)
             # Normalize to median depth per modality
             xs_normalized = []
-            for m, (x_m, lib_m) in enumerate(zip(xs, libs)):
+            for m, (x_m, lib_m) in enumerate(zip(xs, libs, strict=False)):
                 if self.likelihoods[m] == "gaussian":
                     # Gaussian modalities: pass through (data is already continuous)
                     xs_normalized.append(x_m)
@@ -2003,7 +1191,9 @@ class MultimodalLDAPyroGuide(PyroModule):
                 # Encoder expects categorical covariates but none were provided
                 # Create dummy zeros as placeholders
                 device = x.device
-                cat_list = [torch.zeros((B, 1), dtype=torch.long, device=device) for _ in range(len(self.n_cats_per_cov))]
+                cat_list = [
+                    torch.zeros((B, 1), dtype=torch.long, device=device) for _ in range(len(self.n_cats_per_cov))
+                ]
 
         # Handle continuous covariates - if encoder expects them but they're not provided, create dummies
         if cont_covs is None and self.n_continuous_cov > 0:
@@ -2024,14 +1214,18 @@ class MultimodalLDAPyroGuide(PyroModule):
                 if self.spatial_mode == "sgc":
                     # SGC encoder uses precomputed features; pass cat_list for per-batch BN
                     q_m, _ = self.gcn_encoders[idx](
-                        x_m_with_cov, None, batch_indices=batch_indices,
+                        x_m_with_cov,
+                        None,
+                        batch_indices=batch_indices,
                         cat_list=cat_list,
                     )
                 else:
                     edge_index = self._get_edge_index(idx)
                     q_m, _ = self.gcn_encoders[idx](
-                        x_m_with_cov, edge_index, batch_indices=batch_indices,
-                        cat_list=None  # Not supported in full-graph mode
+                        x_m_with_cov,
+                        edge_index,
+                        batch_indices=batch_indices,
+                        cat_list=None,  # Not supported in full-graph mode
                     )
             else:
                 # scvi Encoder: forward(x, *cat_list)
@@ -2087,7 +1281,7 @@ class MultimodalLDAPyroGuide(PyroModule):
 
 
 # --------------------------------------------------------------------------------------------------
-# Wrapper module pairing model & guide with TRANSDUCTIVE LEARNING support
+# Wrapper module pairing model & guide
 # --------------------------------------------------------------------------------------------------
 
 
@@ -2110,7 +1304,7 @@ class MultimodalAmortizedLDAPyroModule(PyroBaseModuleClass):
         adjacency: torch.Tensor | Sequence[torch.Tensor] | None = None,
         gcn_n_layers: int = 1,
         gcn_n_pre_layers: int = 0,
-        gcn_conv_type: str = 'GATv2Conv',
+        gcn_conv_type: str = "GATv2Conv",
         gcn_hidden_dims: list[int] | None = None,
         gcn_alpha_init: float = 0.7,
         gcn_use_learned_alpha: bool = True,
@@ -2200,7 +1394,7 @@ class MultimodalAmortizedLDAPyroModule(PyroBaseModuleClass):
             n_continuous_cov=n_continuous_cov,
         )
         # Compute batch effect parameters for guide (decoder-side, independent of encode_covariates)
-        use_batch_covariates = (n_cats_per_cov is not None and len(n_cats_per_cov) > 0)
+        use_batch_covariates = n_cats_per_cov is not None and len(n_cats_per_cov) > 0
         _n_batches = n_cats_per_cov[0] if use_batch_covariates else 0
 
         self._guide = MultimodalLDAPyroGuide(
@@ -2281,10 +1475,7 @@ class MultimodalAmortizedLDAPyroModule(PyroBaseModuleClass):
 
     def load_state_dict(self, state_dict, strict: bool = True):
         incompatible = super().load_state_dict(state_dict, strict=False)
-        missing = [
-            key for key in incompatible.missing_keys
-            if key != "_model.likelihood_weights"
-        ]
+        missing = [key for key in incompatible.missing_keys if key != "_model.likelihood_weights"]
         unexpected = list(incompatible.unexpected_keys)
         if strict and (missing or unexpected):
             raise RuntimeError(
@@ -2293,7 +1484,6 @@ class MultimodalAmortizedLDAPyroModule(PyroBaseModuleClass):
                 f"Missing keys: {missing}, Unexpected keys: {unexpected}"
             )
         return incompatible
-
 
     def set_full_graph_data(self, x_full: torch.Tensor, adjacency_scipy=None):
         """
@@ -2332,9 +1522,7 @@ class MultimodalAmortizedLDAPyroModule(PyroBaseModuleClass):
 
         if self.guide.topic_feature_prior_type == "logistic_normal":
             for m, (mu, sig) in enumerate(
-                zip(self.guide.topic_feature_posterior_mu,
-                    self.guide.topic_feature_posterior_sigma,
-                    strict=False)
+                zip(self.guide.topic_feature_posterior_mu, self.guide.topic_feature_posterior_sigma, strict=False)
             ):
                 samples = dist.Normal(mu.detach().cpu(), sig.detach().cpu()).sample((n_samples,))
                 if self.guide.likelihoods[m] == "gaussian":
@@ -2392,7 +1580,9 @@ class MultimodalAmortizedLDAPyroModule(PyroBaseModuleClass):
         return out
 
     def get_topic_distribution(
-        self, x: torch.Tensor, n_samples: int = 5_000,
+        self,
+        x: torch.Tensor,
+        n_samples: int = 5_000,
         encoder_extra: torch.Tensor | None = None,
         batch_indices: torch.Tensor | None = None,
     ) -> torch.Tensor:
@@ -2408,7 +1598,7 @@ class MultimodalAmortizedLDAPyroModule(PyroBaseModuleClass):
         if self.guide.normalize_encoder_inputs:
             libs = [x_m.sum(dim=1, keepdim=True) for x_m in xs]
             xs_normalized = []
-            for m, (x_m, lib_m) in enumerate(zip(xs, libs)):
+            for m, (x_m, lib_m) in enumerate(zip(xs, libs, strict=False)):
                 if self.guide.likelihoods[m] == "gaussian":
                     xs_normalized.append(x_m)
                 else:
@@ -2429,7 +1619,9 @@ class MultimodalAmortizedLDAPyroModule(PyroBaseModuleClass):
         cat_list = []
         if self.guide.n_cats_per_cov is not None and len(self.guide.n_cats_per_cov) > 0:
             # Create dummy zeros since we don't have actual covariate values during inference
-            cat_list = [torch.zeros((B, 1), dtype=torch.long, device=device) for _ in range(len(self.guide.n_cats_per_cov))]
+            cat_list = [
+                torch.zeros((B, 1), dtype=torch.long, device=device) for _ in range(len(self.guide.n_cats_per_cov))
+            ]
 
         # Prepare dummy continuous covariates if encoder expects them
         if self.guide.n_continuous_cov > 0:
@@ -2451,7 +1643,9 @@ class MultimodalAmortizedLDAPyroModule(PyroBaseModuleClass):
             if self.guide.use_gcn:
                 if self.guide.spatial_mode == "sgc":
                     q_m, _ = self.guide.gcn_encoders[idx](
-                        x_m_with_cov, None, batch_indices=batch_indices,
+                        x_m_with_cov,
+                        None,
+                        batch_indices=batch_indices,
                         cat_list=cat_list,
                     )
                 else:
@@ -2521,7 +1715,7 @@ class MultimodalAmortizedLDAPyroModule(PyroBaseModuleClass):
         float | None
             Mean entropy from the last forward pass, or None if not available
         """
-        if hasattr(self.guide, '_last_entropy') and self.guide._last_entropy is not None:
+        if hasattr(self.guide, "_last_entropy") and self.guide._last_entropy is not None:
             return float(self.guide._last_entropy)
         return None
 
@@ -2534,7 +1728,7 @@ class MultimodalAmortizedLDAPyroModule(PyroBaseModuleClass):
         float | None
             Mean topic variance from the last forward pass, or None if not available
         """
-        if hasattr(self.guide, '_last_topic_variance') and self.guide._last_topic_variance is not None:
+        if hasattr(self.guide, "_last_topic_variance") and self.guide._last_topic_variance is not None:
             return float(self.guide._last_topic_variance)
         return None
 

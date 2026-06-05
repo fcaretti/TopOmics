@@ -8,11 +8,11 @@ from typing import TYPE_CHECKING
 import numpy as np
 import pandas as pd
 import pyro
-from pyro.infer import Trace_ELBO
 import scipy.sparse as sp
 import torch
 from anndata import AnnData
 from mudata import MuData
+from pyro.infer import Trace_ELBO
 from scvi._constants import REGISTRY_KEYS
 from scvi.data import AnnDataManager
 from scvi.data.fields import (
@@ -26,6 +26,11 @@ from scvi.model.base import BaseModelClass, PyroSviTrainMixin
 from scvi.utils import setup_anndata_dsp
 
 from topomics.module._amortizedLDA import MultimodalAmortizedLDAPyroModule
+from topomics.utils.amortized_utils import (
+    _prepare_adjacency_tensors,
+    _resolve_spatial_graph_from_adata,
+    mudata_to_concat_adata,  # noqa: F401  (re-exported for backwards compatibility)
+)
 from topomics.utils.training_plan import MultimodalLDAPyroTrainingPlan
 
 from .base_model import BaseTopicModel
@@ -34,71 +39,6 @@ if TYPE_CHECKING:
     from collections.abc import Sequence as _Seq
 
 logger = logging.getLogger(__name__)
-
-
-def _resolve_spatial_graph_from_adata(adata: AnnData, spatial_key: str | None):
-    """
-    Fetch a precomputed spatial graph from ``adata.obsp`` when provided.
-
-    Assumes Scanpy already built the graph; we only check basic shape alignment.
-    """
-    if spatial_key is None:
-        return None
-    if spatial_key not in adata.obsp:
-        raise KeyError(f"spatial_key '{spatial_key}' not found in adata.obsp")
-
-    graph = adata.obsp[spatial_key]
-    if graph.shape != (adata.n_obs, adata.n_obs):
-        raise ValueError(
-            f"Spatial graph at obsp['{spatial_key}'] has shape {graph.shape}, expected ({adata.n_obs}, {adata.n_obs})"
-        )
-    return {"adjacency": graph, "key": spatial_key}
-
-
-def _normalize_to_torch_sparse(adj) -> torch.Tensor:
-    """Convert (and normalise) a CSR/COO adjacency to torch sparse with self-loops."""
-    if sp.issparse(adj):
-        coo = adj.tocoo()
-    else:
-        coo = sp.coo_matrix(adj)
-
-    # add self-loops
-    coo = (coo + sp.eye(coo.shape[0], format="coo")).tocoo()
-    row, col, data = coo.row, coo.col, coo.data
-    deg = np.asarray(coo.sum(axis=1)).flatten()
-    deg[deg == 0] = 1.0
-    norm = 1.0 / np.sqrt(deg)
-    norm_data = data * norm[row] * norm[col]
-
-    indices = torch.tensor(np.vstack([row, col]), dtype=torch.long)
-    values = torch.tensor(norm_data, dtype=torch.float32)
-    return torch.sparse_coo_tensor(indices, values, size=coo.shape).coalesce()
-
-
-def _prepare_adjacency_tensors(spatial_uns, modality_names: list[str] | None = None):
-    """Build torch sparse adjacency tensor(s) from stored spatial graph metadata."""
-    if spatial_uns is None:
-        return None
-
-    def convert(entry):
-        adj = entry.get("adjacency")
-        if adj is None:
-            raise ValueError("Spatial graph entry missing 'adjacency'.")
-        return _normalize_to_torch_sparse(adj)
-
-    if isinstance(spatial_uns, dict) and "adjacency" in spatial_uns:
-        return convert(spatial_uns)
-
-    if not isinstance(spatial_uns, dict):
-        raise ValueError("Expected spatial graph metadata as dict or mapping.")
-
-    order = modality_names or list(spatial_uns.keys())
-    tensors = []
-    for mod in order:
-        if mod not in spatial_uns:
-            continue
-        tensors.append(convert(spatial_uns[mod]))
-    return tensors if tensors else None
 
 
 class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
@@ -136,9 +76,7 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
     -----
     The Mixture-of-Experts architecture processes each modality through a
     separate encoder network, then combines their latent representations
-    using learned or fixed weights. This allows the model to handle
-    heterogeneous data types and missing modalities.
-    ```
+    using learned or fixed weights.
     """
 
     _module_cls = MultimodalAmortizedLDAPyroModule  # type: ignore
@@ -167,7 +105,7 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
         likelihood_weight_ref: str = "mean",
         gcn_n_layers: int = 1,
         gcn_n_pre_layers: int = 0,
-        gcn_conv_type: str = 'GATv2Conv',
+        gcn_conv_type: str = "GATv2Conv",
         gcn_hidden_dims: list[int] | None = None,
         gcn_alpha_init: float = 0.7,
         gcn_use_learned_alpha: bool = True,
@@ -200,7 +138,7 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
         likelihoods
             List of likelihood models, one per modality.
             Options:
-                - "multinomial": For discrete count data (RNA-seq)
+                - "multinomial": For discrete count data (RNA-seq), standard in topic modeling
                 - "gamma_poisson" or "nb": For overdispersed count data (scRNA-seq, protein)
                 - "bernoulli": For binary presence/absence data (ATAC-seq peaks, methylation)
                 - "gaussian": For continuous real-valued data (Harmony/scVI embeddings, CLR-normalized protein)
@@ -233,7 +171,7 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
         learnable_dispersion
             Whether to learn dispersion parameters (True) or use fixed dispersion (False).
             When True, dispersion is sampled with a HalfCauchy prior in the model and
-            LogNormal variational posterior in the guide (STAMP-like behavior).
+            LogNormal variational posterior in the guide (like in STAMP).
             Default: False (backward compatible).
         global_dispersion
             When ``learnable_dispersion=True``:
@@ -268,40 +206,28 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
             Each modality is normalized to its own median sequencing depth:
             ``log(counts / library_size * median_depth + 1)``
             This is standard preprocessing in scRNA-seq analysis. Default: ``True``.
-        encoder_scale_factor
-            Deprecated. Scale factor is now computed dynamically as the median depth
-            per modality. This parameter is kept for backward compatibility but is ignored.
         entropy_weight
             Weight for entropy regularization term (default: 0.0).
             When > 0, adds an entropy bonus to the ELBO objective to encourage diverse
             topic usage and prevent topic collapse:
             ``Objective = ELBO + entropy_weight * Σ_n H(θ_n)``
             where H(θ_n) = -Σ_k θ_n,k * log(θ_n,k) is the entropy of cell-topic distribution.
-            Typical values: 0.001-0.1. Higher values → more uniform topic distributions.
-            Trade-off: too high can hurt reconstruction quality.
         topic_variance_weight
             Weight for topic variance regularization (default: 0.0).
             When > 0, encourages different cells to use different topics, preventing
             cell collapse where all cells have identical topic distributions.
-            ``Objective = ELBO + topic_variance_weight * Σ_k Var(θ_:,k)``
-            where Var(θ_:,k) is the variance of topic k usage across cells in the batch.
-            Typical values: 1.0-10.0 (higher than entropy_weight because variance is smaller).
-            This regularization is complementary to entropy_weight: entropy encourages
-            each cell to use many topics uniformly, while topic variance encourages
-            different cells to specialize in different topics.
+            ``Objective = ELBO + topic_variance_weight * Σ_k Var(θ[:, k])``
+            where Var(θ[:, k]) is the variance of topic k usage across cells in the batch.
         kl_weight
             Weight applied to KL terms in the ELBO (default: 1.0).
             This scales KL contributions in both the model and guide.
         encode_covariates
-            Whether to concatenate covariates to encoder input (default: True).
+            Whether to concatenate covariates to encoder input (default: True). Like in scVI:
             If True, covariates are used in both encoder and decoder (batch-corrected latent space).
-            If False, covariates are only used in decoder (scVI-style decoder-only correction).
+            If False, covariates are only used in decoder.
         bg_offset
             Offset added to mean expression before log-transform for feature background:
             ``init_bg_mean = log(mean_expr + bg_offset)``
-            Default: 1.0. STAMP uses 1e-15 which preserves the full dynamic range of
-            log-expression. Higher values compress the range, requiring the model to
-            learn larger deviations from the background.
 
         Notes
         -----
@@ -310,7 +236,7 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
         the shared cell-topic distribution θₙ.
         """
         # If MuData provided, extract flattened AnnData
-        if hasattr(adata, 'mod'):  # MuData check
+        if hasattr(adata, "mod"):  # MuData check
             if "_flattened_ann_data" in adata.uns:
                 adata = adata.uns["_flattened_ann_data"]
             else:
@@ -333,9 +259,9 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
         modality_names = modality_names if modality_names is not None else []
         adjacency = None
 
+        # Check length of likelihood array
         if len(n_inputs_modalities) != len(likelihoods):
             raise ValueError("`n_inputs_modalities` and `likelihoods` must be same length")
-
         if sum(n_inputs_modalities) != self.summary_stats.n_vars:
             raise ValueError(
                 "Sum(n_inputs_modalities) must equal adata.n_vars "
@@ -350,23 +276,21 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
         valid_likelihood_modes = {"none", "inverse_features", "sqrt_inverse_features"}
         if likelihood_weight_mode not in valid_likelihood_modes:
             raise ValueError(
-                f"likelihood_weight_mode must be one of {valid_likelihood_modes}, "
-                f"got '{likelihood_weight_mode}'"
+                f"likelihood_weight_mode must be one of {valid_likelihood_modes}, got '{likelihood_weight_mode}'"
             )
 
+        # Validate encoder rescaling
         valid_likelihood_refs = {"mean", "median", "max"}
         if likelihood_weight_ref not in valid_likelihood_refs:
             raise ValueError(
-                f"likelihood_weight_ref must be one of {valid_likelihood_refs}, "
-                f"got '{likelihood_weight_ref}'"
+                f"likelihood_weight_ref must be one of {valid_likelihood_refs}, got '{likelihood_weight_ref}'"
             )
 
         # Validate topic_feature_prior_type
         valid_prior_types = {"logistic_normal", "horseshoe"}
         if topic_feature_prior_type not in valid_prior_types:
             raise ValueError(
-                f"topic_feature_prior_type must be one of {valid_prior_types}, "
-                f"got '{topic_feature_prior_type}'"
+                f"topic_feature_prior_type must be one of {valid_prior_types}, got '{topic_feature_prior_type}'"
             )
 
         # Validate that Bernoulli modalities contain only binary values {0, 1}
@@ -377,8 +301,8 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
                 n_features = n_inputs_modalities[m]
 
                 # Check if data is binary
-                x_modality = adata.X[:, cursor:cursor + n_features]
-                if hasattr(x_modality, 'toarray'):
+                x_modality = adata.X[:, cursor : cursor + n_features]
+                if hasattr(x_modality, "toarray"):
                     x_modality = x_modality.toarray()
 
                 unique_vals = np.unique(x_modality)
@@ -429,8 +353,7 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
 
         if n_continuous_cov > 0:
             raise ValueError(
-                "Continuous covariates are not supported. "
-                "Please use categorical covariates only."
+                "Continuous covariates are not supported. (For now) Please use categorical covariates only."
             )
 
         # Log covariate info if present
@@ -451,7 +374,7 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
         self.likelihood_weight_mode = likelihood_weight_mode
         self.likelihood_weight_ref = likelihood_weight_ref
         self.gcn_n_layers = gcn_n_layers
-        self.gcn_conv_type = gcn_conv_type,
+        self.gcn_conv_type = (gcn_conv_type,)
         self.gcn_hidden_dims = gcn_hidden_dims
         self.gcn_alpha_init = gcn_alpha_init
         self.gcn_use_learned_alpha = gcn_use_learned_alpha
@@ -499,7 +422,7 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
 
             # Extract per-modality data and compute background
             start_idx = 0
-            for m, (n_features, likelihood) in enumerate(zip(n_inputs_modalities, likelihoods)):
+            for m, (n_features, likelihood) in enumerate(zip(n_inputs_modalities, likelihoods, strict=False)):
                 end_idx = start_idx + n_features
 
                 if likelihood == "gamma_poisson":
@@ -672,13 +595,17 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
 
             # Normalize parameters
             modality_name = modalities[0] if modalities else "rna"
-            layer_to_extract = layers if isinstance(layers, str) else (layers.get(modality_name) if isinstance(layers, dict) else None)
-            spatial_key_to_use = spatial_keys if isinstance(spatial_keys, str) else (spatial_keys.get(modality_name) if isinstance(spatial_keys, dict) else None)
+            layer_to_extract = (
+                layers if isinstance(layers, str) else (layers.get(modality_name) if isinstance(layers, dict) else None)
+            )
+            spatial_key_to_use = (
+                spatial_keys
+                if isinstance(spatial_keys, str)
+                else (spatial_keys.get(modality_name) if isinstance(spatial_keys, dict) else None)
+            )
 
             # Extract data using utilities
-            adata_processed, metadata = extract_from_anndata(
-                adata, modality_name, layer_to_extract, spatial_key_to_use
-            )
+            adata_processed, metadata = extract_from_anndata(adata, modality_name, layer_to_extract, spatial_key_to_use)
 
             # Store spatial info if present
             if metadata["spatial_info"] is not None:
@@ -769,27 +696,17 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
         --------
         >>> # With MuData
         >>> MultimodalAmortizedLDA.setup_data(
-        ...     mdata,
-        ...     modalities=["rna", "protein"],
-        ...     layers="counts",
-        ...     spatial_keys="connectivities"
+        ...     mdata, modalities=["rna", "protein"], layers="counts", spatial_keys="connectivities"
         ... )
         >>> model = MultimodalAmortizedLDA(mdata, n_topics=20)
 
         >>> # With AnnData
-        >>> MultimodalAmortizedLDA.setup_data(
-        ...     adata,
-        ...     modalities=["rna"],
-        ...     layers="counts"
-        ... )
+        >>> MultimodalAmortizedLDA.setup_data(adata, modalities=["rna"], layers="counts")
         >>> model = MultimodalAmortizedLDA(adata, n_topics=20)
 
         >>> # With dict[str, AnnData]
         >>> adata_dict = {"rna": adata_rna, "protein": adata_protein}
-        >>> MultimodalAmortizedLDA.setup_data(
-        ...     adata_dict,
-        ...     layers={"rna": "counts", "protein": "raw"}
-        ... )
+        >>> MultimodalAmortizedLDA.setup_data(adata_dict, layers={"rna": "counts", "protein": "raw"})
         >>> # For dict, get the processed AnnData from the return value
         >>> adata_concat = MultimodalAmortizedLDA.setup_data(adata_dict, layers="counts")
         >>> model = MultimodalAmortizedLDA(adata_concat, n_topics=20)
@@ -803,27 +720,43 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
         # Route to type-specific setup method
         if data_type == "anndata":
             return cls.setup_anndata(
-                data, modalities=modalities, layers=layers, spatial_keys=spatial_keys,
+                data,
+                modalities=modalities,
+                layers=layers,
+                spatial_keys=spatial_keys,
                 categorical_covariate_keys=categorical_covariate_keys,
-                continuous_covariate_keys=continuous_covariate_keys, **kwargs
+                continuous_covariate_keys=continuous_covariate_keys,
+                **kwargs,
             )
         elif data_type == "mudata":
             return cls.setup_mudata(
-                data, modalities=modalities, layers=layers, spatial_keys=spatial_keys,
+                data,
+                modalities=modalities,
+                layers=layers,
+                spatial_keys=spatial_keys,
                 categorical_covariate_keys=categorical_covariate_keys,
-                continuous_covariate_keys=continuous_covariate_keys, **kwargs
+                continuous_covariate_keys=continuous_covariate_keys,
+                **kwargs,
             )
         elif data_type == "spatialdata":
             return cls.setup_spatialdata(
-                data, table_key=table_key, modalities=modalities, layers=layers, spatial_keys=spatial_keys,
+                data,
+                table_key=table_key,
+                modalities=modalities,
+                layers=layers,
+                spatial_keys=spatial_keys,
                 categorical_covariate_keys=categorical_covariate_keys,
-                continuous_covariate_keys=continuous_covariate_keys, **kwargs
+                continuous_covariate_keys=continuous_covariate_keys,
+                **kwargs,
             )
         elif data_type == "dict":
             return cls.setup_adata_dict(
-                data, layers=layers, spatial_keys=spatial_keys,
+                data,
+                layers=layers,
+                spatial_keys=spatial_keys,
                 categorical_covariate_keys=categorical_covariate_keys,
-                continuous_covariate_keys=continuous_covariate_keys, **kwargs
+                continuous_covariate_keys=continuous_covariate_keys,
+                **kwargs,
             )
         else:
             raise TypeError(f"Unsupported data type: {type(data)}")
@@ -933,14 +866,21 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
                 )
             else:
                 # Single spatial graph
-                spatial_graph = metadata["spatial_info"] if not isinstance(metadata["spatial_info"], dict) else list(metadata["spatial_info"].values())[0]
+                spatial_graph = (
+                    metadata["spatial_info"]
+                    if not isinstance(metadata["spatial_info"], dict)
+                    else list(metadata["spatial_info"].values())[0]
+                )
                 adata_concat.uns["_spatial_graph"] = spatial_graph
 
         # Register with scvi using this class (data already in .X after extraction)
         cls.setup_anndata(
-            adata_concat, layer=None, spatial_key=None,
+            adata_concat,
+            layer=None,
+            spatial_key=None,
             categorical_covariate_keys=categorical_covariate_keys,
-            continuous_covariate_keys=continuous_covariate_keys, **kwargs
+            continuous_covariate_keys=continuous_covariate_keys,
+            **kwargs,
         )
 
         return mdata, metadata["modality_names"], metadata["feature_counts"]
@@ -984,9 +924,7 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
         from topomics.data import extract_from_spatialdata
 
         # Extract data from SpatialData
-        adata_concat, metadata = extract_from_spatialdata(
-            sdata, table_key, modalities, layers, spatial_keys
-        )
+        adata_concat, metadata = extract_from_spatialdata(sdata, table_key, modalities, layers, spatial_keys)
 
         # Store spatial info
         if metadata["spatial_info"] is not None:
@@ -1009,9 +947,12 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
 
         # Register with scvi using this class (data already in .X)
         cls.setup_anndata(
-            adata_concat, layer=None, spatial_key=None,
+            adata_concat,
+            layer=None,
+            spatial_key=None,
             categorical_covariate_keys=categorical_covariate_keys,
-            continuous_covariate_keys=continuous_covariate_keys, **kwargs
+            continuous_covariate_keys=continuous_covariate_keys,
+            **kwargs,
         )
 
         return adata_concat
@@ -1049,9 +990,7 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
         from topomics.data import extract_from_adata_dict
 
         # Extract data
-        adata_concat, metadata = extract_from_adata_dict(
-            adata_dict, layers, spatial_keys
-        )
+        adata_concat, metadata = extract_from_adata_dict(adata_dict, layers, spatial_keys)
 
         # Store spatial info
         if metadata["spatial_info"] is not None:
@@ -1073,9 +1012,12 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
 
         # Register with scvi using this class (data already in .X)
         cls.setup_anndata(
-            adata_concat, layer=None, spatial_key=None,
+            adata_concat,
+            layer=None,
+            spatial_key=None,
             categorical_covariate_keys=categorical_covariate_keys,
-            continuous_covariate_keys=continuous_covariate_keys, **kwargs
+            continuous_covariate_keys=continuous_covariate_keys,
+            **kwargs,
         )
 
         return adata_concat
@@ -1141,12 +1083,7 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
         # Get the flattened AnnData for scvi compatibility
         adata_flat = mdata.uns["_flattened_ann_data"]
 
-        return cls(
-            adata_flat,
-            n_inputs_modalities=feat_counts,
-            modality_names=modality_names,
-            **model_kwargs
-        )
+        return cls(adata_flat, n_inputs_modalities=feat_counts, modality_names=modality_names, **model_kwargs)
 
     # -- universal constructor with type detection -------------
     @classmethod
@@ -1211,35 +1148,21 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
         --------
         >>> # From MuData with layer selection
         >>> model = MultimodalAmortizedLDA.from_data(
-        ...     mdata,
-        ...     modalities=["rna", "protein"],
-        ...     layers={"rna": "counts"},
-        ...     n_topics=20
+        ...     mdata, modalities=["rna", "protein"], layers={"rna": "counts"}, n_topics=20
         ... )
 
         >>> # From SpatialData
         >>> model = MultimodalAmortizedLDA.from_data(
-        ...     sdata,
-        ...     table_key="table",
-        ...     layers="counts",
-        ...     spatial_keys="spatial_connectivities",
-        ...     n_topics=20
+        ...     sdata, table_key="table", layers="counts", spatial_keys="spatial_connectivities", n_topics=20
         ... )
 
         >>> # From dict of AnnData
         >>> model = MultimodalAmortizedLDA.from_data(
-        ...     {"rna": adata_rna, "protein": adata_protein},
-        ...     layers={"rna": "counts"},
-        ...     n_topics=20
+        ...     {"rna": adata_rna, "protein": adata_protein}, layers={"rna": "counts"}, n_topics=20
         ... )
 
         >>> # From single AnnData
-        >>> model = MultimodalAmortizedLDA.from_data(
-        ...     adata,
-        ...     modalities=["rna"],
-        ...     layers="counts",
-        ...     n_topics=20
-        ... )
+        >>> model = MultimodalAmortizedLDA.from_data(adata, modalities=["rna"], layers="counts", n_topics=20)
         """
         from topomics.data import detect_data_type
 
@@ -1281,9 +1204,7 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
 
         # Auto-infer likelihoods if not provided
         if "likelihoods" not in model_kwargs:
-            likelihoods = [
-                "gamma_poisson" if mod == "rna" else "multinomial" for mod in modality_names
-            ]
+            likelihoods = ["gamma_poisson" if mod == "rna" else "multinomial" for mod in modality_names]
             model_kwargs["likelihoods"] = likelihoods
 
         # Instantiate model
@@ -1391,19 +1312,35 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
         return result
 
     # ------------------------------------------------------------------ #
-    def get_latent_representation(
+    def get_cell_topic_dist(
         self,
         adata: AnnData | None = None,
         indices: _Seq[int] | None = None,
         batch_size: int | None = None,
         n_samples: int = 5_000,
-    ) -> pd.DataFrame:
+        return_dataframe: bool = False,
+    ) -> np.ndarray | pd.DataFrame:
         """
-        Infer θₙ for all cells (or subset).
+        Get the cell-topic matrix Θ (C × K).
+
+        Parameters
+        ----------
+        adata
+            AnnData object to use (default: self.adata).
+        indices
+            Subset of cells to use.
+        batch_size
+            Batch size for inference.
+        n_samples
+            Number of samples for Monte Carlo estimation.
+        return_dataframe
+            If ``True``, return a ``pd.DataFrame`` (cells × topics) indexed by
+            ``adata.obs_names`` with ``topic_k`` columns instead of a raw array.
 
         Returns
         -------
-        DataFrame (cells × topics) with softmax-normalized expectations.
+        Θ : np.ndarray | pd.DataFrame
+            Cell-topic matrix, where C is the number of cells and K is the number of topics.
         """
         self._check_if_trained(warn=False)
         adata = self._validate_anndata(adata)
@@ -1419,55 +1356,47 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
             cell_idx = tensors.get(REGISTRY_KEYS.INDICES_KEY, None)
             if cell_idx is not None and cell_idx.dim() > 1:
                 cell_idx = cell_idx.view(-1)
-            thetas.append(self.module.get_topic_distribution(
-                x, n_samples, encoder_extra=enc_extra, batch_indices=cell_idx,
-            ))
+            thetas.append(
+                self.module.get_topic_distribution(
+                    x,
+                    n_samples,
+                    encoder_extra=enc_extra,
+                    batch_indices=cell_idx,
+                )
+            )
         theta = torch.cat(thetas).cpu().numpy()
 
-        return pd.DataFrame(theta, index=adata.obs_names, columns=[f"topic_{k}" for k in range(theta.shape[1])])
+        if return_dataframe:
+            obs_names = adata.obs_names if indices is None else adata.obs_names[indices]
+            return pd.DataFrame(
+                theta,
+                index=obs_names,
+                columns=[f"topic_{k}" for k in range(theta.shape[1])],
+            )
+        return theta
 
-    def get_cell_topic_dist(
+    def get_latent_representation(
         self,
         adata: AnnData | None = None,
         indices: _Seq[int] | None = None,
         batch_size: int | None = None,
         n_samples: int = 5_000,
-    ) -> np.ndarray:
+        return_dataframe: bool = False,
+    ) -> np.ndarray | pd.DataFrame:
         """
-        Get the cell-topic matrix Θ (C × K).
+        Infer θₙ for all cells (or subset).
 
-        Parameters
-        ----------
-        adata
-            AnnData object to use (default: self.adata).
-        indices
-            Subset of cells to use.
-        batch_size
-            Batch size for inference.
-        n_samples
-            Number of samples for Monte Carlo estimation.
-
-        Returns
-        -------
-        Θ : np.ndarray
-            Cell-topic matrix, where C is the number of cells and K is the number of topics.
+        Alias for :meth:`get_cell_topic_dist`. Returns the cell-topic matrix Θ
+        (C × K) of softmax-normalized expectations as a ``np.ndarray`` by
+        default, or a ``pd.DataFrame`` if ``return_dataframe=True``.
         """
-        self._check_if_trained(warn=False)
-        adata = self._validate_anndata(adata)
-        self.module.eval()
-        dl = self._make_data_loader(adata=adata, indices=indices, batch_size=batch_size)
-
-        thetas = []
-        for tensors in dl:
-            x = tensors[REGISTRY_KEYS.X_KEY]
-            enc_extra = tensors.get("encoder_extra", None)
-            cell_idx = tensors.get(REGISTRY_KEYS.INDICES_KEY, None)
-            if cell_idx is not None and cell_idx.dim() > 1:
-                cell_idx = cell_idx.view(-1)
-            thetas.append(self.module.get_topic_distribution(
-                x, n_samples, encoder_extra=enc_extra, batch_indices=cell_idx,
-            ))
-        return torch.cat(thetas).cpu().numpy()
+        return self.get_cell_topic_dist(
+            adata=adata,
+            indices=indices,
+            batch_size=batch_size,
+            n_samples=n_samples,
+            return_dataframe=return_dataframe,
+        )
 
     # ------------------------------------------------------------------ #
     def _batch_library_tensor(self, x: torch.Tensor) -> torch.Tensor:
@@ -1507,7 +1436,7 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
             args, kwargs = self.module._get_fn_args_from_batch(tensors)
             kwargs["n_obs"] = n_obs
             losses.append(Trace_ELBO().loss(self.module.model, self.module.guide, *args, **kwargs))
-        # Trace_ELBO.loss() returns -ELBO, so negate to get ELBO
+        # Trace_ELBO.loss() returns -ELBO
         return float(-np.mean(losses))
 
     # ------------------------------------------------------------------ #
@@ -1522,6 +1451,7 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
         Uses the observation log-likelihood (via poutine.trace) rather than
         the full ELBO, so KL terms and regularization bonuses do not inflate
         the result.
+        Notice that this explodes very easily
         """
         self._check_if_trained(warn=False)
         adata = self._validate_anndata(adata)
@@ -1631,7 +1561,7 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
         dl = self._make_data_loader(adata=adata, indices=indices, batch_size=batch_size)
 
         # Accumulate per-modality log-probs across batches
-        per_mod_logprob_total = {m: 0.0 for m in range(self.n_modalities)}
+        per_mod_logprob_total = dict.fromkeys(range(self.n_modalities), 0.0)
 
         for tensors in dl:
             x = tensors[REGISTRY_KEYS.X_KEY]
@@ -1642,10 +1572,7 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
                 per_mod_logprob_total[m] += logprob
 
         # Convert modality indices to names
-        result = {
-            self.modality_names[m]: logprob
-            for m, logprob in per_mod_logprob_total.items()
-        }
+        result = {self.modality_names[m]: logprob for m, logprob in per_mod_logprob_total.items()}
 
         # Cache result
         if hasattr(self, "_cached_metrics"):
@@ -1690,12 +1617,12 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
         adata = self._validate_anndata(adata)
         dl = self._make_data_loader(adata=adata, indices=indices, batch_size=batch_size)
 
-        per_mod_counts = {m: 0 for m in range(self.n_modalities)}
+        per_mod_counts = dict.fromkeys(range(self.n_modalities), 0)
         for tensors in dl:
             x = tensors[REGISTRY_KEYS.X_KEY]
             cursor = 0
             for m, F_m in enumerate(self.n_inputs_modalities):
-                per_mod_counts[m] += x[:, cursor:cursor + F_m].sum().item()
+                per_mod_counts[m] += x[:, cursor : cursor + F_m].sum().item()
                 cursor += F_m
 
         # Compute perplexities
@@ -1726,6 +1653,8 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
 
         Returns weights in range [0, 1] that sum to 1 per cell (or globally for "universal" mode).
         Higher weight = model relies more on that modality for inferring topics.
+
+        Returns a distribution if the weight_mode is 'cell', numbers otherwise
 
         Parameters
         ----------
@@ -1803,7 +1732,8 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
                 raw_w = self.module.guide.mod_w[batch_indices, :].T  # (M, B)
 
                 # Apply masked softmax
-                from topomics.module._amortizedLDA import masked_softmax
+                from topomics.utils._amortized_utils import masked_softmax
+
                 masks = masks.to(raw_w.device, non_blocking=True)
                 weights_batch = masked_softmax(raw_w, masks, dim=0)  # (M, B)
 
@@ -1823,10 +1753,7 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
                 columns=self.modality_names,
             )
         else:  # dict format
-            result = {
-                mod_name: weights_array[:, i]
-                for i, mod_name in enumerate(self.modality_names)
-            }
+            result = {mod_name: weights_array[:, i] for i, mod_name in enumerate(self.modality_names)}
 
         # Cache result (store DataFrame for consistency)
         if hasattr(self, "_cached_metrics"):
@@ -1967,7 +1894,7 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
         -------
         np.ndarray
             Per-topic variance values, shape (n_topics,)
-            Var(θ_:,k) = variance of topic k usage across all cells
+            Var(θ[:, k]) = variance of topic k usage across all cells
         """
         adata = self._validate_anndata(adata)
 
@@ -2031,7 +1958,7 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
 
         # All modalities
         result = {}
-        for m, (mod_name, likelihood) in enumerate(zip(self.modality_names, self.likelihoods)):
+        for m, (mod_name, likelihood) in enumerate(zip(self.modality_names, self.likelihoods, strict=False)):
             if likelihood in {"gamma_poisson", "nb"}:
                 disp = self.module.get_learned_dispersion(m, n_samples)
                 result[mod_name] = disp.cpu().numpy()
@@ -2074,62 +2001,3 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
             if validation_size is None or validation_size > 0:
                 kwargs["check_val_every_n_epoch"] = 1
         return super().train(*args, validation_size=validation_size, **kwargs)
-
-
-def mudata_to_concat_adata(
-    mdata: MuData,
-    modality_order: list[str] | None = None,
-) -> tuple[AnnData, list[int]]:
-    """Flatten a `MuData` into a single `AnnData`.
-
-    The resulting `.X` has shape ``(n_cells, Σ features_of_each_modality)``.
-
-    Returns
-    -------
-    adata_flat
-        The concatenated `AnnData`.
-    feat_counts
-        One integer per modality (same order) giving its feature count.
-    """
-    if modality_order is None:
-        modality_order = list(mdata.mod.keys())
-
-    matrices = []
-    feat_counts = []
-    var_names = []
-
-    n_cells_ref = mdata.n_obs
-
-    for mod in modality_order:
-        X = mdata.mod[mod].X
-
-        # convert sparse → csr, dense stays dense
-        if sp.issparse(X):
-            X = X.tocsr()
-        else:
-            X = np.asarray(X)
-
-        # ensure 2-D: (n,)  ->  (n,1)
-        if X.ndim == 1:
-            X = X.reshape(-1, 1)
-
-        # Sanity-check number of cells
-        if X.shape[0] != n_cells_ref:
-            raise ValueError(f"Modality {mod!r} has {X.shape[0]} cells, but MuData has {n_cells_ref}.")
-
-        matrices.append(X)
-        feat_counts.append(X.shape[1])
-        var_names.extend(mdata.mod[mod].var_names)
-
-    # --------------------------------------------------------------
-    # concatenate (sparse if any input was sparse, else dense)
-    # --------------------------------------------------------------
-    if any(sp.issparse(M) for M in matrices):
-        X_concat = sp.hstack(matrices, format="csr")
-    else:
-        X_concat = np.hstack(matrices)
-
-    adata = AnnData(X_concat, obs=mdata.obs.copy())
-    adata.var_names = var_names
-
-    return adata, feat_counts

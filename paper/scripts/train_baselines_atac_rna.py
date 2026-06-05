@@ -124,16 +124,12 @@ def load_data(data_path, n_top_rna, n_top_atac):
 
     # Filter to highly variable genes for RNA
     n_rna = min(n_top_rna, mdata.mod["rna"].n_vars)
-    sc.pp.highly_variable_genes(
-        mdata.mod["rna"], n_top_genes=n_rna, flavor="seurat_v3", layer="counts"
-    )
+    sc.pp.highly_variable_genes(mdata.mod["rna"], n_top_genes=n_rna, flavor="seurat_v3", layer="counts")
     mdata.mod["rna"] = mdata.mod["rna"][:, mdata.mod["rna"].var["highly_variable"]].copy()
 
     # Filter to highly variable peaks for ATAC
     n_atac = min(n_top_atac, mdata.mod["atac"].n_vars)
-    sc.pp.highly_variable_genes(
-        mdata.mod["atac"], n_top_genes=n_atac, flavor="seurat_v3", layer="counts"
-    )
+    sc.pp.highly_variable_genes(mdata.mod["atac"], n_top_genes=n_atac, flavor="seurat_v3", layer="counts")
     mdata.mod["atac"] = mdata.mod["atac"][:, mdata.mod["atac"].var["highly_variable"]].copy()
 
     # Sync MuData axes after feature filtering
@@ -393,21 +389,14 @@ def train_glue(mdata, n_latent, max_epochs, output_dir):
 
     try:
         guidance = scglue.genomics.rna_anchored_guidance_graph(rna, atac)
-        print(
-            f"Guidance graph: {guidance.number_of_nodes()} nodes, "
-            f"{guidance.number_of_edges()} edges"
-        )
+        print(f"Guidance graph: {guidance.number_of_nodes()} nodes, {guidance.number_of_edges()} edges")
     except Exception as exc:
         print(f"Could not build genomic guidance graph: {exc}")
         print("GLUE training skipped")
         return None, None
 
-    scglue.models.configure_dataset(
-        rna, "NB", use_highly_variable=False, use_layer="counts", use_rep="X_pca"
-    )
-    scglue.models.configure_dataset(
-        atac, "NB", use_highly_variable=False, use_layer="counts", use_rep="X_lsi"
-    )
+    scglue.models.configure_dataset(rna, "NB", use_highly_variable=False, use_layer="counts", use_rep="X_pca")
+    scglue.models.configure_dataset(atac, "NB", use_highly_variable=False, use_layer="counts", use_rep="X_lsi")
 
     print("Training GLUE model...")
     glue = scglue.models.fit_SCGLUE(
@@ -457,9 +446,7 @@ def main():
 
     if not args.skip_multivi:
         try:
-            latent, _ = train_multivi(
-                mdata, args.n_latent, args.max_epochs, args.output_dir
-            )
+            latent, _ = train_multivi(mdata, args.n_latent, args.max_epochs, args.output_dir)
             results["multivi"] = latent
         except Exception as exc:
             print(f"MultiVI training failed: {exc}")
@@ -469,9 +456,7 @@ def main():
 
     if not args.skip_multivi_linear:
         try:
-            latent, _ = train_multivi_linear(
-                mdata, args.n_latent, args.max_epochs, args.output_dir
-            )
+            latent, _ = train_multivi_linear(mdata, args.n_latent, args.max_epochs, args.output_dir)
             results["multivi_linear"] = latent
         except Exception as exc:
             print(f"Linear MultiVI training failed: {exc}")
@@ -491,9 +476,7 @@ def main():
 
     if not args.skip_glue:
         try:
-            latent, _ = train_glue(
-                mdata, args.n_latent, args.max_epochs, args.output_dir
-            )
+            latent, _ = train_glue(mdata, args.n_latent, args.max_epochs, args.output_dir)
             if latent is not None:
                 results["glue"] = latent
         except Exception as exc:
@@ -514,9 +497,7 @@ def main():
         "n_latent": [r.shape[1] for r in results.values()],
         "n_cells": [r.shape[0] for r in results.values()],
     }
-    pd.DataFrame(summary).to_csv(
-        os.path.join(args.output_dir, "training_summary.csv"), index=False
-    )
+    pd.DataFrame(summary).to_csv(os.path.join(args.output_dir, "training_summary.csv"), index=False)
 
 
 if __name__ == "__main__":

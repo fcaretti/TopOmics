@@ -31,7 +31,10 @@ release = info["Version"]
 
 bibtex_bibfiles = ["references.bib"]
 templates_path = ["_templates"]
-nitpicky = True  # Warn about broken links
+# Autodoc of the scvi/lightning-derived model classes pulls in many framework
+# cross-references that cannot be resolved; keep nitpicky off so those do not
+# drown out real issues. Intersphinx (below) still links the common types.
+nitpicky = False
 needs_sphinx = "4.0"
 
 html_context = {
@@ -96,12 +99,27 @@ intersphinx_mapping = {
     "anndata": ("https://anndata.readthedocs.io/en/stable/", None),
     "scanpy": ("https://scanpy.readthedocs.io/en/stable/", None),
     "numpy": ("https://numpy.org/doc/stable/", None),
+    "pandas": ("https://pandas.pydata.org/docs/", None),
+    "torch": ("https://pytorch.org/docs/stable/", None),
+    "mudata": ("https://mudata.readthedocs.io/en/latest/", None),
+    "scvi": ("https://docs.scvi-tools.org/en/stable/", None),
 }
 
 # List of patterns, relative to source directory, that match files and
 # directories to ignore when looking for source files.
 # This pattern also affects html_static_path and html_extra_path.
-exclude_patterns = ["_build", "Thumbs.db", ".DS_Store", "**.ipynb_checkpoints"]
+exclude_patterns = [
+    "_build",
+    "Thumbs.db",
+    ".DS_Store",
+    "**.ipynb_checkpoints",
+    # Keep the published site minimal: only the teaseq tutorial + reference pages.
+    "examples/old",
+    "notebooks",
+    "examples/atac_rna.ipynb",
+    "examples/tea_seq.ipynb",
+    "examples/scvelo_gastrulation_erythroid.ipynb",
+]
 
 
 # -- Options for HTML output -------------------------------------------------

@@ -14,7 +14,6 @@ Note: weight_mode is not applicable for unimodal datasets.
 import argparse
 import os
 import warnings
-from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -24,8 +23,8 @@ import squidpy as sq
 
 from topomics.models.amortizedLDA import MultimodalAmortizedLDA
 
-warnings.filterwarnings('ignore', message='.*was not registered in the param store.*')
-warnings.filterwarnings('ignore', message='.*Found plate statements in guide but not model.*')
+warnings.filterwarnings("ignore", message=".*was not registered in the param store.*")
+warnings.filterwarnings("ignore", message=".*Found plate statements in guide but not model.*")
 
 
 def parse_args():
@@ -35,72 +34,45 @@ def parse_args():
         type=str,
         default="logistic_normal",
         choices=["logistic_normal", "horseshoe"],
-        help="Feature prior type (default: logistic_normal)"
+        help="Feature prior type (default: logistic_normal)",
     )
     parser.add_argument(
-        "--gcn_n_layers",
-        type=int,
-        default=1,
-        help="Number of GCN layers for spatial encoder (default: 1)"
+        "--gcn_n_layers", type=int, default=1, help="Number of GCN layers for spatial encoder (default: 1)"
     )
     parser.add_argument(
         "--gcn_layers_type",
         type=str,
         default="GATv2Conv",
-        choices=["GATv2Conv","GCNConv"],
-        help="Type of Graph Convolution"
+        choices=["GATv2Conv", "GCNConv"],
+        help="Type of Graph Convolution",
     )
     parser.add_argument(
         "--gcn_alpha",
         type=float,
         default=0.2,
-        help="GCN alpha parameter for skip connection (default: 0.2). "
-             "0 = neighbors only, 1 = self only."
+        help="GCN alpha parameter for skip connection (default: 0.2). 0 = neighbors only, 1 = self only.",
+    )
+    parser.add_argument("--fixed_alpha", action="store_true", help="Fix alpha (don't learn it during training)")
+    parser.add_argument(
+        "--learnable_dispersion", action="store_true", help="Learn dispersion parameters (default: False)"
     )
     parser.add_argument(
-        "--fixed_alpha",
-        action="store_true",
-        help="Fix alpha (don't learn it during training)"
+        "--global_dispersion", action="store_true", help="Use global dispersion instead of per-gene (default: False)"
     )
-    parser.add_argument(
-        "--learnable_dispersion",
-        action="store_true",
-        help="Learn dispersion parameters (default: False)"
-    )
-    parser.add_argument(
-        "--global_dispersion",
-        action="store_true",
-        help="Use global dispersion instead of per-gene (default: False)"
-    )
-    parser.add_argument(
-        "--n_topics",
-        type=int,
-        default=10,
-        help="Number of topics (default: 10)"
-    )
-    parser.add_argument(
-        "--max_epochs",
-        type=int,
-        default=500,
-        help="Maximum training epochs (default: 200)"
-    )
-    parser.add_argument(
-        "--batch_size",
-        type=int,
-        default=256,
-        help="Batch size (default: 256)"
-    )
+    parser.add_argument("--n_topics", type=int, default=10, help="Number of topics (default: 10)")
+    parser.add_argument("--max_epochs", type=int, default=500, help="Maximum training epochs (default: 200)")
+    parser.add_argument("--batch_size", type=int, default=256, help="Batch size (default: 256)")
     parser.add_argument(
         "--train_size",
         type=float,
         default=0.8,
-        help="Fraction of data used for training (default: 0.8). Set to 1.0 to train on all cells."
+        help="Fraction of data used for training (default: 0.8). Set to 1.0 to train on all cells.",
     )
     parser.add_argument(
         "--output_dir",
         type=str,
         default="/data/topomics_models/sctm_comparison",
-        help="Output directory for model and plots"
+        help="Output directory for model and plots",
     )
     return parser.parse_args()
 
@@ -123,7 +95,7 @@ def create_model(adata, args):
         adata,
         n_topics=args.n_topics,
         likelihoods=["gamma_poisson"],
-        cell_topic_prior=1/args.n_topics,
+        cell_topic_prior=1 / args.n_topics,
         spatial_keys="spatial_connectivities",
         gcn_n_layers=args.gcn_n_layers,
         gcn_conv_type=args.gcn_layers_type,
@@ -173,33 +145,33 @@ def save_results(model, adata, output_dir):
     adata.obs["top_topic"] = theta.idxmax(axis=1)
 
     # Create topic-based clustering
-    sc.pp.neighbors(adata, metric='cosine', use_rep='X_topic', key_added='topic_neighbors')
-    sc.tl.leiden(adata, neighbors_key='topic_neighbors', key_added='topic_clusters')
-    sc.tl.umap(adata, neighbors_key='topic_neighbors')
+    sc.pp.neighbors(adata, metric="cosine", use_rep="X_topic", key_added="topic_neighbors")
+    sc.tl.leiden(adata, neighbors_key="topic_neighbors", key_added="topic_clusters")
+    sc.tl.umap(adata, neighbors_key="topic_neighbors")
 
     # Training curve (per-cell normalized)
     n_train = int(adata.n_obs * 0.8)
     n_val = adata.n_obs - n_train
     fig, ax = plt.subplots(figsize=(10, 6))
-    ax.plot(model.history['elbo_train'] / n_train, label='Train ELBO (per cell)')
-    ax.plot(model.history['elbo_val'] / n_val, label='Val ELBO (per cell)')
-    ax.set_xlabel('Epoch')
-    ax.set_ylabel('ELBO / cell')
-    ax.set_title('Training Curve')
+    ax.plot(model.history["elbo_train"] / n_train, label="Train ELBO (per cell)")
+    ax.plot(model.history["elbo_val"] / n_val, label="Val ELBO (per cell)")
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("ELBO / cell")
+    ax.set_title("Training Curve")
     ax.legend()
-    plt.savefig(os.path.join(output_dir, "training_curve.png"), dpi=150, bbox_inches='tight')
+    plt.savefig(os.path.join(output_dir, "training_curve.png"), dpi=150, bbox_inches="tight")
     plt.close()
 
     # UMAP colored by topic clusters
     fig, ax = plt.subplots(figsize=(10, 8))
     sc.pl.umap(adata, color="topic_clusters", frameon=False, ax=ax, show=False)
-    plt.savefig(os.path.join(output_dir, "umap_topic_clusters.png"), dpi=150, bbox_inches='tight')
+    plt.savefig(os.path.join(output_dir, "umap_topic_clusters.png"), dpi=150, bbox_inches="tight")
     plt.close()
 
     # Spatial plot colored by topic clusters
     fig, ax = plt.subplots(figsize=(10, 10))
     sq.pl.spatial_scatter(adata, color=["topic_clusters"], ax=ax)
-    plt.savefig(os.path.join(output_dir, "spatial_topic_clusters.png"), dpi=150, bbox_inches='tight')
+    plt.savefig(os.path.join(output_dir, "spatial_topic_clusters.png"), dpi=150, bbox_inches="tight")
     plt.close()
 
     # Topic distribution
@@ -212,14 +184,14 @@ def save_results(model, adata, output_dir):
     ax.set_ylabel("Topic proportion")
     ax.set_title("Global topic distribution (mean +/- std)")
     plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, "topic_distribution.png"), dpi=150, bbox_inches='tight')
+    plt.savefig(os.path.join(output_dir, "topic_distribution.png"), dpi=150, bbox_inches="tight")
     plt.close()
 
     # Metrics
     metrics = {}
-    metrics['perplexity'] = model.get_perplexity()
-    metrics['entropy'] = model.get_entropy(normalised=True)
-    metrics['diversity'] = model.get_topic_diversity()
+    metrics["perplexity"] = model.get_perplexity()
+    metrics["entropy"] = model.get_entropy(normalised=True)
+    metrics["diversity"] = model.get_topic_diversity()
 
     # Save metrics
     metrics_df = pd.DataFrame([metrics])
@@ -244,7 +216,7 @@ def main():
     if args.gcn_n_layers != 1:
         hyperparam_str += f"_gcn{args.gcn_n_layers}"
     if args.learnable_dispersion:
-        hyperparam_str += f"_learnable_disp"
+        hyperparam_str += "_learnable_disp"
         if args.global_dispersion:
             hyperparam_str += "_global"
         else:

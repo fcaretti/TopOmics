@@ -25,3 +25,5 @@ paper/.snakemake/*
 paper/plots/*
 *.csv
 *.npy
+# Tutorial config with private dataset/model paths (keep out of git)
+docs/examples/config.yml

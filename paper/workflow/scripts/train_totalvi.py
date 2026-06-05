@@ -1,7 +1,13 @@
 """Train totalVI baseline (RNA + Protein)."""
-import json, os, sys, warnings
+
+import json
+import os
+import sys
+import warnings
+
 import numpy as np
 import scipy.sparse as sp
+
 warnings.filterwarnings("ignore")
 
 sys.path.insert(0, os.path.dirname(__file__))

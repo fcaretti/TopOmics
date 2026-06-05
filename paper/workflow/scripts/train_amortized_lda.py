@@ -1,6 +1,12 @@
 """Train scvi-tools AmortizedLDA baseline on a single modality."""
-import json, os, sys, warnings
+
+import json
+import os
+import sys
+import warnings
+
 import numpy as np
+
 warnings.filterwarnings("ignore")
 
 sys.path.insert(0, os.path.dirname(__file__))
@@ -33,10 +39,16 @@ def main(snakemake):
     n_topics = bl["n_latent"]
     scvi.model.AmortizedLDA.setup_anndata(adata, layer=None)
     model = scvi.model.AmortizedLDA(
-        adata, n_topics=n_topics, n_hidden=bl["n_hidden"], cell_topic_prior=1 / n_topics,
+        adata,
+        n_topics=n_topics,
+        n_hidden=bl["n_hidden"],
+        cell_topic_prior=1 / n_topics,
     )
     model.train(
-        max_epochs=bl["max_epochs"], train_size=0.8, validation_size=0.2, batch_size=128,
+        max_epochs=bl["max_epochs"],
+        train_size=0.8,
+        validation_size=0.2,
+        batch_size=128,
     )
 
     theta = model.get_latent_representation()

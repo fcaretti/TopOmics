@@ -27,9 +27,7 @@ def test_elaborate_example_adata_only_simple(
     expected_len,
     expected_substring,
 ):
-    result = topomics.pp.elaborate_example(
-        items=[adata], transform=transform, layer_key=layer_key, max_items=max_items
-    )
+    result = topomics.pp.elaborate_example(items=[adata], transform=transform, layer_key=layer_key, max_items=max_items)
 
     assert len(result) == expected_len
     assert expected_substring in result[0]

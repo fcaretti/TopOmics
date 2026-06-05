@@ -19,7 +19,6 @@ import argparse
 import os
 import sys
 import warnings
-from pathlib import Path
 
 import numpy as np
 
@@ -48,9 +47,7 @@ ATAC_PATH = "/data/Data_SpatialGlue/Dataset10_Mouse_Brain_H3K27me3/adata_peaks_n
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Train baseline models on Mouse Brain Spatial Multiome dataset"
-    )
+    parser = argparse.ArgumentParser(description="Train baseline models on Mouse Brain Spatial Multiome dataset")
     parser.add_argument(
         "--n_latent",
         type=int,
@@ -146,9 +143,7 @@ def load_data():
 
     # Share spatial connectivities across modalities
     mdata.obsp["spatial_connectivities"] = mdata.mod["rna"].obsp["spatial_connectivities"]
-    mdata.mod["atac"].obsp["spatial_connectivities"] = mdata.mod["rna"].obsp[
-        "spatial_connectivities"
-    ]
+    mdata.mod["atac"].obsp["spatial_connectivities"] = mdata.mod["rna"].obsp["spatial_connectivities"]
     mdata.mod["atac"].obsp["spatial_distances"] = mdata.mod["rna"].obsp["spatial_distances"]
 
     print(f"  RNA: {mdata.mod['rna'].shape}")
@@ -180,7 +175,6 @@ def _save_history(history, path):
 def train_spatialglue(mdata, n_latent, output_dir, device):
     """Train SpatialGlue model."""
     from SpatialGlue.preprocess import (
-        clr_normalize_each_cell,
         construct_neighbor_graph,
         lsi,
         pca,
@@ -210,9 +204,7 @@ def train_spatialglue(mdata, n_latent, output_dir, device):
     adata_atac.obsm["feat"] = adata_atac.obsm["X_lsi"]
 
     # Construct neighbor graphs (spatial + feature graphs)
-    data = construct_neighbor_graph(
-        adata_rna, adata_atac, datatype="Spatial-epigenome-transcriptome", n_neighbors=6
-    )
+    data = construct_neighbor_graph(adata_rna, adata_atac, datatype="Spatial-epigenome-transcriptome", n_neighbors=6)
 
     # Initialize and train SpatialGlue
     model = Train_SpatialGlue(
@@ -267,9 +259,7 @@ def train_stamp(mdata, n_latent, max_epochs, output_dir, device):
 
     # Ensure spatial connectivities are available
     if "spatial_connectivities" not in adata_rna.obsp:
-        adata_rna.obsp["spatial_connectivities"] = mdata.mod["rna"].obsp[
-            "spatial_connectivities"
-        ]
+        adata_rna.obsp["spatial_connectivities"] = mdata.mod["rna"].obsp["spatial_connectivities"]
 
     # Initialize STAMP model
     model = STAMP(
@@ -550,9 +540,7 @@ def main():
     # Train SpatialGlue
     if not args.skip_spatialglue:
         try:
-            latent = train_spatialglue(
-                mdata, args.n_latent, args.output_dir, args.device
-            )
+            latent = train_spatialglue(mdata, args.n_latent, args.output_dir, args.device)
             results["spatialglue"] = latent
         except Exception as e:
             print(f"SpatialGlue training failed: {e}")
@@ -563,9 +551,7 @@ def main():
     # Train STAMP (RNA only)
     if not args.skip_stamp:
         try:
-            latent = train_stamp(
-                mdata, args.n_latent, args.max_epochs, args.output_dir, args.device
-            )
+            latent = train_stamp(mdata, args.n_latent, args.max_epochs, args.output_dir, args.device)
             results["stamp"] = latent
         except Exception as e:
             print(f"STAMP training failed: {e}")
@@ -598,9 +584,7 @@ def main():
     # Train COSMOS (RNA + ATAC)
     if not args.skip_cosmos:
         try:
-            latent = train_cosmos(
-                mdata, args.n_latent, args.output_dir, args.device
-            )
+            latent = train_cosmos(mdata, args.n_latent, args.output_dir, args.device)
             results["cosmos"] = latent
         except Exception as e:
             print(f"COSMOS training failed: {e}")
@@ -623,9 +607,7 @@ def main():
             "n_latent": [r.shape[1] for r in results.values()],
             "n_cells": [r.shape[0] for r in results.values()],
         }
-        pd.DataFrame(summary).to_csv(
-            os.path.join(args.output_dir, "training_summary.csv"), index=False
-        )
+        pd.DataFrame(summary).to_csv(os.path.join(args.output_dir, "training_summary.csv"), index=False)
 
 
 if __name__ == "__main__":

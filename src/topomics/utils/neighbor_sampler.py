@@ -51,9 +51,7 @@ class NeighborSampler:
         replace: bool = False,
     ) -> None:
         if edge_index.dim() != 2 or edge_index.size(0) != 2:
-            raise ValueError(
-                f"edge_index must have shape [2, n_edges], got {tuple(edge_index.shape)}"
-            )
+            raise ValueError(f"edge_index must have shape [2, n_edges], got {tuple(edge_index.shape)}")
         if not fan_out:
             raise ValueError("fan_out must be a non-empty list of ints")
 
@@ -71,14 +69,9 @@ class NeighborSampler:
         self._indptr = csr.indptr
         self._indices = csr.indices
 
-        logger.info(
-            f"NeighborSampler initialized: {num_nodes} nodes, "
-            f"{edge_index.shape[1]} edges, fan_out={fan_out}"
-        )
+        logger.info(f"NeighborSampler initialized: {num_nodes} nodes, {edge_index.shape[1]} edges, fan_out={fan_out}")
 
-    def sample(
-        self, seed_nodes: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def sample(self, seed_nodes: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Sample a multi-hop subgraph around ``seed_nodes``.
 
@@ -147,9 +140,7 @@ class NeighborSampler:
                 ta_starts = starts[take_all_mask]
                 ta_ends = ends[take_all_mask]
                 # Build flat index ranges for all take-all nodes
-                flat_indices = np.concatenate([
-                    np.arange(s, e) for s, e in zip(ta_starts, ta_ends)
-                ])
+                flat_indices = np.concatenate([np.arange(s, e) for s, e in zip(ta_starts, ta_ends, strict=False)])
                 ta_neighbors = indices[flat_indices]
                 sampled_neighbors_list.append(ta_neighbors)
                 # Build edge arrays: repeat each node by its degree
@@ -167,9 +158,7 @@ class NeighborSampler:
 
                 # Generate random offsets in [0, degree) for each node, fo samples each
                 # Shape: (n_ns, fo)
-                random_offsets = np.array([
-                    np.random.randint(0, d, size=fo) for d in ns_degrees
-                ])  # (n_ns, fo)
+                random_offsets = np.array([np.random.randint(0, d, size=fo) for d in ns_degrees])  # (n_ns, fo)
 
                 # Convert to flat indices into CSR indices array
                 flat_idx = (ns_starts[:, None] + random_offsets).ravel()
@@ -210,9 +199,7 @@ class NeighborSampler:
             all_dst = np.concatenate(all_dst_list)
             src_local = global_to_local[all_src]
             dst_local = global_to_local[all_dst]
-            sub_edge_index = torch.from_numpy(
-                np.stack([src_local, dst_local])
-            ).long()
+            sub_edge_index = torch.from_numpy(np.stack([src_local, dst_local])).long()
         else:
             sub_edge_index = torch.zeros(2, 0, dtype=torch.long)
 

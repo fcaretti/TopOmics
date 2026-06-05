@@ -4,6 +4,7 @@ Scaling benchmark: multimodal feature-fraction sweep on lymphoma RNA+ATAC.
 Trains MultiVI, TopOmics, and MOFA+ for increasing feature fractions
 of a fixed-size dataset and records wall-clock training time.
 """
+
 import json
 import os
 import time
@@ -32,10 +33,8 @@ def load_data(data_path, n_hvg_full, n_peaks_full):
         atac.X = (atac.X > 0).astype(np.float32)
     sc.pp.filter_genes(atac, min_cells=1)
 
-    sc.pp.highly_variable_genes(rna, n_top_genes=min(n_hvg_full, rna.n_vars),
-                                flavor="seurat_v3", subset=False)
-    sc.pp.highly_variable_genes(atac, n_top_genes=min(n_peaks_full, atac.n_vars),
-                                flavor="seurat_v3", subset=False)
+    sc.pp.highly_variable_genes(rna, n_top_genes=min(n_hvg_full, rna.n_vars), flavor="seurat_v3", subset=False)
+    sc.pp.highly_variable_genes(atac, n_top_genes=min(n_peaks_full, atac.n_vars), flavor="seurat_v3", subset=False)
     return mdata
 
 
@@ -63,8 +62,11 @@ def subsample_features(mdata_full, rna_frac, atac_frac, n_hvg_full, n_peaks_full
 
 def train_multivi(mdata, n_topics, max_epochs, batch_size):
     import scvi
+
     scvi.model.MULTIVI.setup_mudata(
-        mdata, rna_layer=None, atac_layer=None,
+        mdata,
+        rna_layer=None,
+        atac_layer=None,
         modalities={"rna_layer": "rna", "atac_layer": "atac"},
     )
     model = scvi.model.MULTIVI(mdata, n_latent=n_topics)
@@ -75,17 +77,23 @@ def train_multivi(mdata, n_topics, max_epochs, batch_size):
     return elapsed, n_epochs
 
 
-def train_topomics(mdata, n_topics, max_epochs, batch_size):
+def train_omics_topic(mdata, n_topics, max_epochs, batch_size):
     from topomics.models import MultimodalAmortizedLDA
+
     model = MultimodalAmortizedLDA.from_mudata(
-        mdata, layer_dict={"rna": None, "atac": None},
-        n_topics=n_topics, likelihoods=["gamma_poisson", "bernoulli"],
+        mdata,
+        layer_dict={"rna": None, "atac": None},
+        n_topics=n_topics,
+        likelihoods=["gamma_poisson", "bernoulli"],
     )
     t0 = time.perf_counter()
     model.train(
-        max_epochs=max_epochs, batch_size=batch_size,
-        early_stopping=True, early_stopping_monitor="elbo_val",
-        early_stopping_patience=10, early_stopping_min_delta=0.0,
+        max_epochs=max_epochs,
+        batch_size=batch_size,
+        early_stopping=True,
+        early_stopping_monitor="elbo_val",
+        early_stopping_patience=10,
+        early_stopping_min_delta=0.0,
     )
     elapsed = time.perf_counter() - t0
     n_epochs = len(model.history["elbo_train"])
@@ -103,8 +111,7 @@ def train_mofa(mdata, n_topics, seed):
         sc.pp.scale(mdata_mofa.mod[mod_name])
 
     t0 = time.perf_counter()
-    mu.tl.mofa(mdata_mofa, n_factors=n_topics, convergence_mode="fast",
-               seed=seed, use_obs="intersection")
+    mu.tl.mofa(mdata_mofa, n_factors=n_topics, convergence_mode="fast", seed=seed, use_obs="intersection")
     elapsed = time.perf_counter() - t0
     n_factors = mdata_mofa.obsm["X_mofa"].shape[1]
     return elapsed, n_factors
@@ -133,15 +140,21 @@ def main(snakemake):
     print(f"  RNA: {mdata_full.mod['rna'].shape}, ATAC: {mdata_full.mod['atac'].shape}")
 
     results = {
-        "feature_fractions": [], "n_rna_features": [], "n_atac_features": [],
-        "multivi_time": [], "multivi_epochs": [],
-        "topomics_time": [], "topomics_epochs": [],
-        "mofa_time": [], "mofa_factors": [],
-        "n_topics": n_topics, "max_epochs": max_epochs,
+        "feature_fractions": [],
+        "n_rna_features": [],
+        "n_atac_features": [],
+        "multivi_time": [],
+        "multivi_epochs": [],
+        "topomics_time": [],
+        "topomics_epochs": [],
+        "mofa_time": [],
+        "mofa_factors": [],
+        "n_topics": n_topics,
+        "max_epochs": max_epochs,
     }
 
     for frac in fractions:
-        print(f"\n{'='*60}\n  Feature fraction = {frac:.0%}\n{'='*60}")
+        print(f"\n{'=' * 60}\n  Feature fraction = {frac:.0%}\n{'=' * 60}")
 
         mdata = subsample_features(mdata_full, frac, frac, n_hvg_full, n_peaks_full, seed)
         n_rna = mdata.mod["rna"].n_vars
