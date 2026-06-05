@@ -66,6 +66,10 @@ extensions = [
 ]
 
 autosummary_generate = True
+# torch-geometric / pyg-lib live in the optional "spatial" extra and are not
+# installed in the RTD docs env (they need CUDA wheels). Mock them so autosummary
+# can import the package to build the API reference.
+autodoc_mock_imports = ["torch_geometric", "pyg_lib"]
 autodoc_member_order = "groupwise"
 default_role = "literal"
 napoleon_google_docstring = False
@@ -101,7 +105,6 @@ intersphinx_mapping = {
     "numpy": ("https://numpy.org/doc/stable/", None),
     "pandas": ("https://pandas.pydata.org/docs/", None),
     "torch": ("https://pytorch.org/docs/stable/", None),
-    "mudata": ("https://mudata.readthedocs.io/en/latest/", None),
     "scvi": ("https://docs.scvi-tools.org/en/stable/", None),
 }
 
