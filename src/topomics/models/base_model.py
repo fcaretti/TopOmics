@@ -197,7 +197,7 @@ class BaseTopicModel:
 
         Returns
         -------
-        P  : shape (|feat_a| , |feat_b|) – interaction score between every
+        P  : shape (n_feat_a, n_feat_b) – interaction score between every
             feature of `mod_a` and every feature of `mod_b`
         """
 

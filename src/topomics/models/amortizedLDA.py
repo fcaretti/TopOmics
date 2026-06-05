@@ -77,7 +77,6 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
     The Mixture-of-Experts architecture processes each modality through a
     separate encoder network, then combines their latent representations
     using learned or fixed weights.
-    ```
     """
 
     _module_cls = MultimodalAmortizedLDAPyroModule  # type: ignore
@@ -217,8 +216,8 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
             Weight for topic variance regularization (default: 0.0).
             When > 0, encourages different cells to use different topics, preventing
             cell collapse where all cells have identical topic distributions.
-            ``Objective = ELBO + topic_variance_weight * Σ_k Var(θ_:,k)``
-            where Var(θ_:,k) is the variance of topic k usage across cells in the batch.
+            ``Objective = ELBO + topic_variance_weight * Σ_k Var(θ[:, k])``
+            where Var(θ[:, k]) is the variance of topic k usage across cells in the batch.
         kl_weight
             Weight applied to KL terms in the ELBO (default: 1.0).
             This scales KL contributions in both the model and guide.
@@ -1901,7 +1900,7 @@ class MultimodalAmortizedLDA(PyroSviTrainMixin, BaseModelClass, BaseTopicModel):
         -------
         np.ndarray
             Per-topic variance values, shape (n_topics,)
-            Var(θ_:,k) = variance of topic k usage across all cells
+            Var(θ[:, k]) = variance of topic k usage across all cells
         """
         adata = self._validate_anndata(adata)
 

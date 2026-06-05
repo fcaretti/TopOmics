@@ -1,5 +1,7 @@
 # Contributing guide
 
+### What follows comes from the scverse repo template. Feel free to follow it if you have suggestions/corrections/improvements and you're already familiar with it, but also feel free to get in touch in the way you prefer!
+
 Scanpy provides extensive [developer documentation][scanpy developer guide], most of which applies to this project, too.
 This document will not reproduce the entire content from there.
 Instead, it aims at summarizing the most important information to get you started on contributing.
@@ -158,7 +160,7 @@ This project uses [sphinx][] with the following features:
 - [Numpy-style docstrings][numpydoc] (through the [napoloen][numpydoc-napoleon] extension).
 - Jupyter notebooks as tutorials through [myst-nb][] (See [Tutorials with myst-nb](#tutorials-with-myst-nb-and-jupyter-notebooks))
 - [sphinx-autodoc-typehints][], to automatically reference annotated input and output types
-- Citations (like {cite:p}`Virshup_2023`) can be included with [sphinxcontrib-bibtex](https://sphinxcontrib-bibtex.readthedocs.io/)
+- Citations can be included with [sphinxcontrib-bibtex](https://sphinxcontrib-bibtex.readthedocs.io/) via the `{cite:p}` role
 
 See scanpy’s {doc}`scanpy:dev/documentation` for more information on how to write your own.
 

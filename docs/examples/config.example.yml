@@ -1,0 +1,34 @@
+# Example configuration for the topomics tutorial notebooks.
+#
+# Copy this file to `config.yml` (same directory) and fill in the real paths to
+# your datasets and trained model directories. `config.yml` is git-ignored, so
+# your private paths are never committed or published with the rendered docs.
+#
+#   cp config.example.yml config.yml
+#   # then edit config.yml
+#
+# Each notebook reads only the keys it needs from `config.yml`.
+
+datasets:
+
+  # TEA-seq: tri-modal single-cell (RNA + ATAC + protein), non-spatial.
+  teaseq:
+    data: /path/to/teaseq.h5mu            # MuData with mods: rna, atac, prot
+    model: /path/to/teaseq/model_dir      # directory passed to MultimodalAmortizedLDA.save(...)
+    celltype_key: celltypist_label        # obs column for the per-cell-type analysis (optional)
+
+  # Spatial ATAC + RNA (mouse brain multiome). Two AnnData files combined into a MuData.
+  spatial_atac:
+    rna:  /path/to/adata_RNA.h5ad             # RNA AnnData (has obsm["spatial"])
+    atac: /path/to/adata_peaks_normalized.h5ad  # ATAC AnnData (peaks)
+    model: /path/to/mouse_brain/model_dir
+    n_neighbors: 5                            # spatial kNN graph size used at train time
+    celltype_key: null                        # set an obs column, or leave null to cluster topics (leiden)
+
+  # Visium HD: nucleus vs cytoplasm compartments as two modalities (spatial).
+  visiumhd:
+    nucleus:   /path/to/nucleus_adata.h5ad    # has obsm["spatial"]
+    cytoplasm: /path/to/cytoplasm_adata.h5ad
+    model:     /path/to/visiumhd/model_dir
+    n_neighbors: 6
+    celltype_key: null                        # set an obs column, or leave null to cluster topics (leiden)
