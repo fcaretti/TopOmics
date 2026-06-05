@@ -2,7 +2,7 @@
 Scaling benchmark: multimodal cell-count sweep on synthetic RNA+ATAC.
 
 Generates synthetic data from a SHARE-Topic model fitted on lymphoma B-cells,
-then benchmarks MultiVI, OmicsTopic, and MOFA+ for increasing cell counts.
+then benchmarks MultiVI, TopOmics, and MOFA+ for increasing cell counts.
 """
 import json
 import os
@@ -184,7 +184,7 @@ def main(snakemake):
     # Step 3: Benchmark
     results = {
         "n_cells": [], "run": [],
-        "multivi": [], "omics_topic": [], "mofa": [],
+        "multivi": [], "topomics": [], "mofa": [],
         "n_topics": n_topics, "max_epochs": max_epochs, "n_runs": n_runs,
     }
 
@@ -210,7 +210,7 @@ def main(snakemake):
             except Exception as e:
                 print(f"  Load failed: {e}")
                 results["multivi"].append(_empty())
-                results["omics_topic"].append(_empty())
+                results["topomics"].append(_empty())
                 results["mofa"].append(_empty())
                 continue
 
@@ -224,15 +224,15 @@ def main(snakemake):
                 print(f"FAILED: {e}")
                 results["multivi"].append(_empty())
 
-            # OmicsTopic
-            print("  OmicsTopic...", end=" ", flush=True)
+            # TopOmics
+            print("  TopOmics...", end=" ", flush=True)
             try:
-                r = train_omics_topic(mdata, n_topics, max_epochs, batch_size)
+                r = train_topomics(mdata, n_topics, max_epochs, batch_size)
                 print(f"{r['time']:.1f}s ({r['epochs']} ep)")
-                results["omics_topic"].append(r)
+                results["topomics"].append(r)
             except Exception as e:
                 print(f"FAILED: {e}")
-                results["omics_topic"].append(_empty())
+                results["topomics"].append(_empty())
 
             # MOFA+ (only up to MOFA_MAX_CELLS)
             if n_cells <= MOFA_MAX_CELLS:

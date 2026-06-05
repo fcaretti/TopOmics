@@ -121,8 +121,8 @@ datasets:
 
   colon_citeseq:
     data_paths:
-      rna: "omics_topic_datasets/mouse_colon_citeseq_dataset/GSM6578059_mousecolon_RNA.tsv.gz"
-      protein: "omics_topic_datasets/mouse_colon_citeseq_dataset/GSM6578068_mousecolon_protein.tsv.gz"
+      rna: "topomics_datasets/mouse_colon_citeseq_dataset/GSM6578059_mousecolon_RNA.tsv.gz"
+      protein: "topomics_datasets/mouse_colon_citeseq_dataset/GSM6578068_mousecolon_protein.tsv.gz"
     type: multimodal
     spatial: true
     modalities: ["rna", "prot"]
@@ -202,7 +202,7 @@ scaling:
     max_epochs: 500
     batch_size: 256
     seed: 42
-    models: [multivi, omics_topic, mofa]
+    models: [multivi, topomics, mofa]
 
   # Cell-count sweep on synthetic RNA+ATAC (generated from SHARE-Topic posterior)
   multimodal_cells:
@@ -214,7 +214,7 @@ scaling:
     max_epochs: 500
     batch_size: 256
     seed: 42
-    models: [multivi, omics_topic, mofa]
+    models: [multivi, topomics, mofa]
 
 # --- Baseline defaults ---
 baseline_defaults:

@@ -131,7 +131,7 @@ def parse_args():
     parser.add_argument(
         "--output_dir",
         type=str,
-        default="/data/omics_topic_models/mouse_brain_spatial",
+        default="/data/topomics_models/mouse_brain_spatial",
         help="Output directory for model and plots"
     )
     return parser.parse_args()

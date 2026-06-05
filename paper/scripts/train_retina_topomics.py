@@ -76,7 +76,7 @@ def prepare_retina_data(save_path: str = "/data/retina_dataset") -> AnnData:
     return adata
 
 
-def train_omics_topic(
+def train_topomics(
     adata: AnnData,
     encode_covariates: bool,
     batch_correction: bool = True,
@@ -167,9 +167,9 @@ def train_omics_topic(
     output_path.mkdir(parents=True, exist_ok=True)
 
     if batch_correction:
-        model_name = f"retina_omics_topic_encode_cov_{encode_covariates}"
+        model_name = f"retina_topomics_encode_cov_{encode_covariates}"
     else:
-        model_name = "retina_omics_topic_no_batch"
+        model_name = "retina_topomics_no_batch"
     save_path = output_path / model_name
     model.save(save_path, overwrite=True)
     logger.info(f"Model saved to {save_path}")
@@ -180,9 +180,9 @@ def train_omics_topic(
 
     # Add to adata (theta is already (n_cells, n_topics), directly assign it)
     if batch_correction:
-        adata.obsm[f"X_omics_topic_encode_{encode_covariates}"] = theta
+        adata.obsm[f"X_topomics_encode_{encode_covariates}"] = theta
     else:
-        adata.obsm["X_omics_topic_no_batch"] = theta
+        adata.obsm["X_topomics_no_batch"] = theta
 
     logger.info(f"Latent representation shape: {theta.shape}")
 
@@ -200,7 +200,7 @@ def main():
     parser.add_argument(
         "--output_dir",
         type=str,
-        default="/data/omics_topic_models/retina",
+        default="/data/topomics_models/retina",
         help="Directory to save trained models"
     )
     parser.add_argument(
@@ -259,7 +259,7 @@ def main():
         logger.info("\n" + "="*80)
         logger.info("Training topomics with encode_covariates=True")
         logger.info("="*80 + "\n")
-        model_true = train_omics_topic(
+        model_true = train_topomics(
             adata,
             encode_covariates=True,
             n_topics=args.n_topics,
@@ -273,7 +273,7 @@ def main():
         logger.info("\n" + "="*80)
         logger.info("Training topomics with encode_covariates=False")
         logger.info("="*80 + "\n")
-        model_false = train_omics_topic(
+        model_false = train_topomics(
             adata,
             encode_covariates=False,
             n_topics=args.n_topics,
@@ -287,7 +287,7 @@ def main():
         logger.info("\n" + "="*80)
         logger.info("Training topomics without batch correction")
         logger.info("="*80 + "\n")
-        model_no_batch = train_omics_topic(
+        model_no_batch = train_topomics(
             adata,
             encode_covariates=False,
             batch_correction=False,
@@ -300,9 +300,9 @@ def main():
 
     # Save final adata with all representations to /data
     if args.encode_covariates == "none":
-        out_file = "retina_with_omics_topic_no_batch.h5ad"
+        out_file = "retina_with_topomics_no_batch.h5ad"
     else:
-        out_file = "retina_with_omics_topic.h5ad"
+        out_file = "retina_with_topomics.h5ad"
     adata.write(data_path / out_file)
     logger.info(f"Final adata saved to {data_path / out_file}")
 

@@ -46,7 +46,7 @@ def parse_args():
     parser.add_argument(
         "--output_dir",
         type=str,
-        default="/data/omics_topic_models/atac_rna/baselines",
+        default="/data/topomics_models/atac_rna/baselines",
         help="Output directory for models",
     )
     parser.add_argument(

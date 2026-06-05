@@ -102,7 +102,7 @@ def parse_args():
     parser.add_argument(
         "--output_dir",
         type=str,
-        default="/data/omics_topic_models/teaseq",
+        default="/data/topomics_models/teaseq",
         help="Output directory for model and plots"
     )
     return parser.parse_args()

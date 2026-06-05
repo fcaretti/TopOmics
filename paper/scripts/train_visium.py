@@ -99,7 +99,7 @@ def parse_args():
     parser.add_argument(
         "--output_dir",
         type=str,
-        default="/data/omics_topic_models/sctm_comparison",
+        default="/data/topomics_models/sctm_comparison",
         help="Output directory for model and plots"
     )
     return parser.parse_args()

@@ -94,7 +94,7 @@ def parse_args():
     parser.add_argument(
         "--output_dir",
         type=str,
-        default="/data/omics_topic_models/gastrulation",
+        default="/data/topomics_models/gastrulation",
         help="Output directory for model and plots"
     )
     return parser.parse_args()

@@ -1,4 +1,4 @@
-# Omics-Topic
+# TopOmics
 
 The basic idea of the package is to be able to run topic modeling on any kind of (optionally spatial) multiomics data.
 In an analogy with standard topic models, cells/spots are documents, genes/proteins/chromatin accessibility areas are words, different modalities correspond to different "chapters" and the spatial information can be converted to a neighborhood graph, equivalent (although with very different statistics) to a citation network.

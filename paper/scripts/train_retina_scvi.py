@@ -137,7 +137,7 @@ def main():
     parser.add_argument(
         "--output_dir",
         type=str,
-        default="/data/omics_topic_models/retina",
+        default="/data/topomics_models/retina",
         help="Directory to save trained model"
     )
     parser.add_argument(
